@@ -120,7 +120,7 @@ impl Collider {
         self.coll_type = *coll_type;
         self.shape = shape.clone();
         self.mprops = mprops.clone();
-        self.material = *material;
+        self.material = material.clone();
         self.contact_force_event_threshold = *contact_force_event_threshold;
         self.user_data = *user_data;
         self.flags = *flags;
@@ -170,6 +170,16 @@ impl Collider {
     /// See the documentation of [`ColliderBuilder::contact_skin`] for details.
     pub fn set_contact_skin(&mut self, skin_thickness: Real) {
         self.contact_skin = skin_thickness;
+    }
+
+    /// The user-data of this collider.
+    pub fn material_name(&self) -> &str {
+        &self.material.name
+    }
+
+    /// The name of the material of this collider.
+    pub fn set_material_name(&mut self, material_name: String) {
+        self.material.name = material_name
     }
 
     /// The friction coefficient of this collider.
@@ -495,6 +505,8 @@ pub struct ColliderBuilder {
     pub shape: SharedShape,
     /// Controls the way the collider’s mass-properties are computed.
     pub mass_properties: ColliderMassProps,
+    /// The name of the material of the collider to be built.
+    pub material_name: String,
     /// The friction coefficient of the collider to be built.
     pub friction: Real,
     /// The rule used to combine two friction coefficients.
@@ -539,6 +551,7 @@ impl ColliderBuilder {
         Self {
             shape,
             mass_properties: ColliderMassProps::default(),
+            material_name: String::new(),
             friction: Self::default_friction(),
             restitution: 0.0,
             position: Isometry::identity(),
@@ -931,6 +944,12 @@ impl ColliderBuilder {
         self
     }
 
+    /// Sets the name of the material of the collider this builder will build.
+    pub fn material_name(mut self, name: String) -> Self {
+        self.material_name = name;
+        self
+    }
+
     /// Sets the friction coefficient of the collider this builder will build.
     pub fn friction(mut self, friction: Real) -> Self {
         self.friction = friction;
@@ -1060,6 +1079,7 @@ impl ColliderBuilder {
     pub fn build(&self) -> Collider {
         let shape = self.shape.clone();
         let material = ColliderMaterial {
+            name: self.material_name.clone(),
             friction: self.friction,
             restitution: self.restitution,
             friction_combine_rule: self.friction_combine_rule,

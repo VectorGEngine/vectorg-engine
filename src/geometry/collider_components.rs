@@ -257,10 +257,14 @@ where
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+
+
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 /// The constraints solver-related properties of this collider (friction, restitution, etc.)
 pub struct ColliderMaterial {
+    /// The name of this collider material.
+    pub name: String,
     /// The friction coefficient of this collider.
     ///
     /// The greater the value, the stronger the friction forces will be.
@@ -292,6 +296,7 @@ impl ColliderMaterial {
 impl Default for ColliderMaterial {
     fn default() -> Self {
         Self {
+            name: String::new(),
             friction: 1.0,
             restitution: 0.0,
             friction_combine_rule: CoefficientCombineRule::default(),
