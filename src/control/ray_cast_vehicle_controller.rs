@@ -164,6 +164,8 @@ pub struct Wheel {
     pub forward_impulse: Real,
     /// The side impulses applied by the wheel on the chassis.
     pub side_impulse: Real,
+    /// The braking impulse applied by this wheel on the chassis.
+    pub brake_impulse: Real,
 
     /// The steering angle for this wheel.
     pub steering: Real,
@@ -181,6 +183,14 @@ pub struct Wheel {
     pub traction_control: Real,
     /// The impulse applied from tire to engine
     pub engine_force_feedback: Real,
+    /// The side factor for the wheel, used to calculate the side impulse.
+    pub side_factor: Real,
+    /// The forward factor for the wheel, used to calculate the forward impulse.
+    pub fwd_factor: Real,
+    /// The brake factor for the wheel, used to calculate the brake impulse.
+    pub brake_factor: Real,
+    /// The damping applied to the contact point of the wheel.
+    pub contact_damping: Real,
     lock: bool,
 
     clipped_inv_contact_dot_suspension: Real,
@@ -234,12 +244,17 @@ impl Wheel {
             skid_info: 0.0,
             last_skid_info: 0.0,
             side_impulse: 0.0,
+            brake_impulse: 0.0,
             forward_impulse: 0.0,
             side_friction_stiffness: info.side_friction_stiffness,
             lock: false,
             tire_type: info.tire_type,
             suspension_compression_rate: 0.0,
             ground_friction: 1.0,
+            side_factor: 1.0,
+            fwd_factor: 1.0,
+            brake_factor: 1.0,
+            contact_damping: 0.2, // This is a default value, can be adjusted later
         }
     }
 
@@ -667,6 +682,7 @@ impl DynamicRayCastVehicleController {
                 num_wheels_on_ground += 1;
             }
 
+            wheel.brake_impulse = 0.0;
             wheel.side_impulse = 0.0;
             wheel.forward_impulse = 0.0;
             wheel.is_anti_lock_brake = false;
@@ -706,12 +722,14 @@ impl DynamicRayCastVehicleController {
                             ground_body,
                             &wheel.raycast_info.contact_point_ws,
                             &self.axle[i],
+                            wheel.contact_damping,
                         );
                     } else {
                         wheel.side_impulse = resolve_single_unilateral(
                             &bodies[self.chassis],
                             &wheel.raycast_info.contact_point_ws,
                             &self.axle[i],
+                            wheel.contact_damping,
                         );
                     }
 
@@ -720,16 +738,11 @@ impl DynamicRayCastVehicleController {
             }
         }
 
-        let side_factor = 0.9;
-        let fwd_factor = 1.6;
-
         let mut sliding = false;
         {
             for wheel_id in 0..num_wheels {
                 let wheel = &mut self.wheels[wheel_id];
                 let ground_object = wheel.raycast_info.ground_object;
-
-                let mut rolling_friction = 0.0;
 
                 if ground_object.is_some() {
                     // let default_rolling_friction_impulse = 0.0;
@@ -751,28 +764,30 @@ impl DynamicRayCastVehicleController {
                     // rolling_friction = contact_pt.calc_rolling_friction(num_wheels_on_ground);
 
                     assert!(num_wheels_on_ground > 0);
-                    if let Some(ground_body) = ground_object
+                    let rolling_friction = if let Some(ground_body) = ground_object
                         .and_then(|h| colliders[h].parent())
                         .map(|h| &bodies[h])
                         .filter(|b| b.is_dynamic())
-                    {
-                        rolling_friction = resolve_single_bilateral(
-                            &bodies[self.chassis],
-                            &wheel.raycast_info.contact_point_ws,
-                            ground_body,
-                            &wheel.raycast_info.contact_point_ws,
-                            &self.forward_ws[wheel_id],
-                        )
-                    } else {
-                        rolling_friction = resolve_single_unilateral(
-                            &bodies[self.chassis],
-                            &wheel.raycast_info.contact_point_ws,
-                            &self.forward_ws[wheel_id],
-                        )
-                    }
+                        {
+                            resolve_single_bilateral(
+                                &bodies[self.chassis],
+                                &wheel.raycast_info.contact_point_ws,
+                                ground_body,
+                                &wheel.raycast_info.contact_point_ws,
+                                &self.forward_ws[wheel_id],
+                                wheel.contact_damping,
+                            )
+                        } else {
+                            resolve_single_unilateral(
+                                &bodies[self.chassis],
+                                &wheel.raycast_info.contact_point_ws,
+                                &self.forward_ws[wheel_id],
+                                wheel.contact_damping,
+                            )
+                        };
                     wheel.engine_force_feedback = rolling_friction;
 
-                    let engine_force = if wheel.last_skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
+                    wheel.forward_impulse = if wheel.last_skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
                         let mut speed_factor = 0.0;
                         if self.current_vehicle_speed.abs() > 1.0 {
                             speed_factor = (self.current_vehicle_speed.abs() / 20.0).powi(2);
@@ -785,39 +800,36 @@ impl DynamicRayCastVehicleController {
                         wheel.engine_force * dt
                     };
 
-                    let mut brake_friction = rolling_friction - engine_force;
+                    wheel.brake_impulse = rolling_friction - wheel.forward_impulse;
                     let mut max_impulse = wheel.max_brake_force * wheel.brake;
 
-                    if wheel.last_skid_info < 0.2 && max_impulse.abs() > 0.0 {
-                        wheel.lock = true;
-                        if wheel.last_skid_info < wheel.anti_lock_brake * 0.2 && self.current_vehicle_speed.abs() > 1.0 {
-                            if self.timer % (dt * 4.0) < dt * 2.0 {
-                                max_impulse = 0.0;
-                                wheel.lock = false;
-                                wheel.is_anti_lock_brake = true;
-                            }
+                    if max_impulse.abs() > 0.0 {
+                        if wheel.last_skid_info < 0.2 {
+                            wheel.lock = true;
+                        }
+                        if wheel.last_skid_info < wheel.anti_lock_brake * 0.98 && self.current_vehicle_speed.abs() > 1.0 {
+                            max_impulse = 0.0;
+                            wheel.lock = false;
+                            wheel.is_anti_lock_brake = true;
                         }
                     }
 
-                    if max_impulse < brake_friction {
-                        brake_friction = max_impulse;
+                    if max_impulse < wheel.brake_impulse {
+                        wheel.brake_impulse = max_impulse;
                     }
-                    if -max_impulse > brake_friction {
-                        brake_friction = -max_impulse;
+                    if -max_impulse > wheel.brake_impulse {
+                        wheel.brake_impulse = -max_impulse;
                     }
 
-                    brake_friction += engine_force;
-
-                    // wheel.lock = wheel.brake != 0.0 && brake_friction.abs() > rolling_friction.abs() * 0.5;
+                    // wheel.lock = wheel.brake != 0.0 && brake_impulse.abs() > rolling_friction.abs() * 0.5;
 
                     // if wheel.lock && wheel.anti_lock_brake > 0.0 && self.current_vehicle_speed.abs() > 1.0 {
                     //     if self.timer % (dt * 4.0) < dt * 3.0 {
-                    //         brake_friction *= 1.0 - wheel.anti_lock_brake;
+                    //         brake_impulse *= 1.0 - wheel.anti_lock_brake;
                     //         wheel.lock = false;
                     //         wheel.is_anti_lock_brake = true;
                     //     }
                     // }
-                    rolling_friction = brake_friction;
                 }
 
                 //switch between active rolling (throttle), braking and non-active rolling friction (no throttle/break)
@@ -839,10 +851,8 @@ impl DynamicRayCastVehicleController {
                     let max_imp_squared = max_imp * max_imp_side;
                     assert!(max_imp_squared >= 0.0);
 
-                    wheel.forward_impulse = rolling_friction;
-
-                    let x = wheel.forward_impulse * fwd_factor;
-                    let y = wheel.side_impulse * side_factor;
+                    let x = wheel.forward_impulse * wheel.fwd_factor + wheel.brake_impulse * wheel.brake_factor;
+                    let y = wheel.side_impulse * wheel.side_factor;
 
                     let impulse_squared = x * x + y * y;
 
@@ -853,7 +863,8 @@ impl DynamicRayCastVehicleController {
                         wheel.skid_info *= factor;
                     }
                 }
-                 wheel.last_skid_info = wheel.skid_info;
+                wheel.last_skid_info = wheel.skid_info;
+                wheel.forward_impulse += wheel.brake_impulse;
             }
         }
 
@@ -975,6 +986,7 @@ fn resolve_single_bilateral(
     body2: &RigidBody,
     pt2: &Point<Real>,
     normal: &Vector<Real>,
+    contact_damping: Real,
 ) -> Real {
     let vel1 = body1.velocity_at_point(pt1);
     let vel2 = body2.velocity_at_point(pt2);
@@ -996,11 +1008,10 @@ fn resolve_single_bilateral(
     let rel_vel = normal.dot(&dvel);
 
     //todo: move this into proper structure
-    let contact_damping = 0.6;
     -contact_damping * rel_vel * jac_diag_ab_inv
 }
 
-fn resolve_single_unilateral(body1: &RigidBody, pt1: &Point<Real>, normal: &Vector<Real>) -> Real {
+fn resolve_single_unilateral(body1: &RigidBody, pt1: &Point<Real>, normal: &Vector<Real>, contact_damping: Real,) -> Real {
     let vel1 = body1.velocity_at_point(pt1);
     let dvel = vel1;
     let dpt1 = pt1 - body1.center_of_mass();
@@ -1014,7 +1025,6 @@ fn resolve_single_unilateral(body1: &RigidBody, pt1: &Point<Real>, normal: &Vect
     let rel_vel = normal.dot(&dvel);
 
     //todo: move this into proper structure
-    let contact_damping = 0.6;
     -contact_damping * rel_vel * jac_diag_ab_inv
 }
 
