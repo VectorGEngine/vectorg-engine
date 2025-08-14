@@ -202,6 +202,8 @@ pub struct Wheel {
     last_skid_info: Real,
     /// The ground friction multiplier for this wheel.
     pub ground_friction: Real,
+    /// The type of ground this wheel is currently on.
+    pub ground_type: String,
     /// The suspension compression ratio, where 1.0 means the suspension is at its rest length.
     pub suspension_compression_rate: Real,
     /// The type of tire for friction calculations
@@ -251,6 +253,7 @@ impl Wheel {
             tire_type: info.tire_type,
             suspension_compression_rate: 0.0,
             ground_friction: 1.0,
+            ground_type: String::new(),
             side_factor: 1.0,
             fwd_factor: 1.0,
             brake_factor: 1.0,
@@ -687,6 +690,7 @@ impl DynamicRayCastVehicleController {
             wheel.forward_impulse = 0.0;
             wheel.is_anti_lock_brake = false;
             wheel.ground_friction = 1.0;
+            wheel.ground_type = String::new();
             wheel.lock = false;
             wheel.skid_info = 0.0;
             wheel.engine_force_feedback = 0.0;
@@ -837,6 +841,7 @@ impl DynamicRayCastVehicleController {
                 if ground_object.is_some() {
                     wheel.skid_info = 1.0;
                     // Get ground friction from collider material name
+                    wheel.ground_type = colliders[ground_object.unwrap()].material.name.clone();
                     wheel.ground_friction = ground_object
                         .map(|h| &colliders[h])
                         .and_then(|collider| {
