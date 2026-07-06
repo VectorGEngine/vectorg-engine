@@ -593,7 +593,7 @@ impl DynamicRayCastVehicleController {
                     if wheel.skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
                         let mut speed_factor = 0.0;
                         if self.current_vehicle_speed.abs() > 1.0 {
-                            speed_factor = (self.current_vehicle_speed.abs() / 10.0).powi(2);
+                            speed_factor = (self.current_vehicle_speed.abs() / 1.0).powi(2);
                             if speed_factor > 1.0 {
                                 speed_factor = 1.0;
                             }
@@ -794,7 +794,7 @@ impl DynamicRayCastVehicleController {
                     wheel.forward_impulse = if wheel.last_skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
                         let mut speed_factor = 0.0;
                         if self.current_vehicle_speed.abs() > 1.0 {
-                            speed_factor = (self.current_vehicle_speed.abs() / 10.0).powi(2);
+                            speed_factor = (self.current_vehicle_speed.abs() / 1.0).powi(2);
                             if speed_factor > 1.0 {
                                 speed_factor = 1.0;
                             }
