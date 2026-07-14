@@ -1,7 +1,7 @@
 
 use crate::dynamics::{RigidBody, RigidBodyHandle, RigidBodySet};
 use crate::geometry::{ColliderHandle, ColliderSet, Ray};
-use crate::math::{Point, Real, Rotation, Vector};
+use crate::math::{Point, Real, Rotation, Vector, DIM};
 use crate::pipeline::{QueryFilter, QueryPipeline};
 use crate::utils::{SimdCross, SimdDot};
 use std::collections::HashMap;
@@ -13,6 +13,8 @@ pub struct DynamicRayCastVehicleController {
     axle: Vec<Vector<Real>>,
     /// The current forward speed of the vehicle.
     pub current_vehicle_speed: Real,
+    /// Electronic stability control strength (`0.0` = off, `1.0` = full strength).
+    pub esc: Real,
 
     /// Handle of the vehicle’s chassis.
     pub chassis: RigidBodyHandle,
@@ -316,6 +318,7 @@ impl DynamicRayCastVehicleController {
             forward_ws: vec![],
             axle: vec![],
             current_vehicle_speed: 0.0,
+            esc: 0.0,
             chassis,
             index_up_axis: 1,
             index_forward_axis: 0,
@@ -356,6 +359,77 @@ impl DynamicRayCastVehicleController {
     /// Gets all available tire type names
     pub fn get_tire_type_names(&self) -> Vec<&String> {
         self.tire_types.keys().collect()
+    }
+
+    fn side_axis(&self) -> usize {
+        for axis in 0..DIM {
+            if axis != self.index_forward_axis && axis != self.index_up_axis {
+                return axis;
+            }
+        }
+
+        for axis in 0..DIM {
+            if axis != self.index_forward_axis {
+                return axis;
+            }
+        }
+
+        self.index_forward_axis
+    }
+
+    fn chassis_yaw_rate(&self, chassis: &RigidBody) -> Real {
+        let up = chassis.position().rotation * Vector::ith(self.index_up_axis, 1.0);
+        chassis.angvel().dot(&up)
+    }
+
+    fn esc_intervention(&self, chassis: &RigidBody) -> (Real, Real, Real) {
+        let esc = self.esc.clamp(0.0, 1.0);
+        let speed = self.current_vehicle_speed;
+
+        if esc == 0.0 || speed.abs() <= 1.0 {
+            return (0.0, 0.0, 0.0);
+        }
+
+        let mut steering = 0.0;
+        let mut num_steered_wheels = 0;
+        let mut min_forward = Real::MAX;
+        let mut max_forward = -Real::MAX;
+
+        for wheel in &self.wheels {
+            if wheel.steering.abs() > Real::EPSILON {
+                steering += wheel.steering;
+                num_steered_wheels += 1;
+            }
+
+            let forward = wheel.chassis_connection_point_cs.coords[self.index_forward_axis];
+            min_forward = min_forward.min(forward);
+            max_forward = max_forward.max(forward);
+        }
+
+        if num_steered_wheels == 0 {
+            return (0.0, 0.0, 0.0);
+        }
+
+        steering /= num_steered_wheels as Real;
+
+        let wheelbase = (max_forward - min_forward).abs().max(1.0);
+        let desired_yaw_rate = speed * steering.tan() / wheelbase;
+        let yaw_error = desired_yaw_rate - self.chassis_yaw_rate(chassis);
+        let yaw_error_abs = yaw_error.abs();
+        let yaw_factor = ((yaw_error_abs - 0.1) / 0.65).clamp(0.0, 1.0);
+        let steering_factor = (steering.abs() / 0.55).clamp(0.0, 1.0);
+        let speed_factor = ((speed.abs() - 2.0) / 10.0).clamp(0.0, 1.0);
+        let strength = esc * yaw_factor * steering_factor * speed_factor;
+
+        if strength == 0.0 {
+            return (0.0, 0.0, 0.0);
+        }
+
+        let engine_cut = strength * 0.5;
+        let brake_strength = strength * 0.5;
+        let brake_side = -yaw_error.signum();
+
+        (engine_cut, brake_strength, brake_side)
     }
 
     /// Adds a surface to an existing tire type
@@ -679,6 +753,12 @@ impl DynamicRayCastVehicleController {
         self.forward_ws.resize(num_wheels, Default::default());
         self.axle.resize(num_wheels, Default::default());
 
+        let (esc_engine_cut, esc_brake_strength, esc_brake_side, esc_side_axis) = {
+            let chassis = &bodies[self.chassis];
+            let (engine_cut, brake_strength, brake_side) = self.esc_intervention(chassis);
+            (engine_cut, brake_strength, brake_side, self.side_axis())
+        };
+
         let mut num_wheels_on_ground = 0;
 
         //TODO: collapse all those loops into one!
@@ -804,9 +884,32 @@ impl DynamicRayCastVehicleController {
                     } else {
                         wheel.engine_force * dt
                     };
+                    wheel.forward_impulse *= 1.0 - esc_engine_cut;
 
                     wheel.brake_impulse = rolling_friction - wheel.forward_impulse;
-                    let mut max_impulse = wheel.max_brake_force * wheel.brake;
+                    let esc_brake = if esc_brake_strength > 0.0 {
+                        let side = wheel.chassis_connection_point_cs.coords[esc_side_axis];
+                        let wheel_side = if side > 0.0 {
+                            1.0
+                        } else if side < 0.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        };
+
+                        if wheel.steering.abs() > Real::EPSILON
+                            && wheel_side != 0.0
+                            && wheel_side == esc_brake_side
+                        {
+                            esc_brake_strength
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    let brake = (wheel.brake + esc_brake).clamp(0.0, 1.0);
+                    let mut max_impulse = wheel.max_brake_force * brake;
 
                     if max_impulse.abs() > 0.0 {
                         if wheel.brake >= 1.0 && max_impulse >= wheel.brake_impulse.abs() {
