@@ -303,6 +303,31 @@ pub struct RayCastInfo {
     pub ground_object: Option<ColliderHandle>,
 }
 
+#[derive(Clone)]
+struct WheelContactState {
+    is_grounded: bool,
+    ground_object: Option<ColliderHandle>,
+    forward_dir: Vector<Real>,
+    side_dir: Vector<Real>,
+    forward_speed: Real,
+    side_speed: Real,
+    friction_limit: Real,
+}
+
+impl Default for WheelContactState {
+    fn default() -> Self {
+        Self {
+            is_grounded: false,
+            ground_object: None,
+            forward_dir: Vector::zeros(),
+            side_dir: Vector::zeros(),
+            forward_speed: 0.0,
+            side_speed: 0.0,
+            friction_limit: 0.0,
+        }
+    }
+}
+
 impl DynamicRayCastVehicleController {
     /// Creates a new vehicle represented by the given rigid-body.
     ///
@@ -416,7 +441,7 @@ impl DynamicRayCastVehicleController {
         let desired_yaw_rate = speed * steering.tan() / wheelbase;
         let yaw_error = desired_yaw_rate - self.chassis_yaw_rate(chassis);
         let yaw_error_abs = yaw_error.abs();
-        let yaw_factor = ((yaw_error_abs - 0.1) / 0.65).clamp(0.0, 1.0);
+        let yaw_factor = ((yaw_error_abs - 0.14) / 0.75).clamp(0.0, 1.0);
         let steering_factor = (steering.abs() / 0.55).clamp(0.0, 1.0);
         let speed_factor = ((speed.abs() - 2.0) / 10.0).clamp(0.0, 1.0);
         let strength = esc * yaw_factor * steering_factor * speed_factor;
@@ -425,8 +450,8 @@ impl DynamicRayCastVehicleController {
             return (0.0, 0.0, 0.0);
         }
 
-        let engine_cut = strength * 0.5;
-        let brake_strength = strength * 0.5;
+        let engine_cut = strength * 0.45;
+        let brake_strength = strength * 0.45;
         let brake_side = -yaw_error.signum();
 
         (engine_cut, brake_strength, brake_side)
@@ -667,7 +692,9 @@ impl DynamicRayCastVehicleController {
                     } else {
                         0.0
                     };
-                    if wheel.skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
+                    let allow_drive_spin =
+                        self.current_vehicle_speed.abs() >= 0.5 || wheel.skid_info < 0.5;
+                    if wheel.skid_info < 0.8 && wheel.engine_force.abs() > 0.0 && allow_drive_spin {
                         let traction_control = wheel.traction_control.clamp(0.0, 1.0);
                         let slip = ((0.8 - wheel.skid_info) / 0.8).clamp(0.0, 1.0);
                         let speed_factor = (self.current_vehicle_speed.abs() / 5.0).clamp(0.0, 1.0);
@@ -752,6 +779,7 @@ impl DynamicRayCastVehicleController {
 
         self.forward_ws.resize(num_wheels, Default::default());
         self.axle.resize(num_wheels, Default::default());
+        let mut contacts = vec![WheelContactState::default(); num_wheels];
 
         let (esc_engine_cut, esc_brake_strength, esc_brake_side, esc_side_axis) = {
             let chassis = &bodies[self.chassis];
@@ -759,16 +787,7 @@ impl DynamicRayCastVehicleController {
             (engine_cut, brake_strength, brake_side, self.side_axis())
         };
 
-        let mut num_wheels_on_ground = 0;
-
-        //TODO: collapse all those loops into one!
         for wheel in &mut self.wheels {
-            let ground_object = wheel.raycast_info.ground_object;
-
-            if ground_object.is_some() {
-                num_wheels_on_ground += 1;
-            }
-
             wheel.brake_impulse = 0.0;
             wheel.side_impulse = 0.0;
             wheel.forward_impulse = 0.0;
@@ -780,221 +799,211 @@ impl DynamicRayCastVehicleController {
             wheel.engine_force_feedback = 0.0;
         }
 
-        {
-            for i in 0..num_wheels {
-                let wheel = &mut self.wheels[i];
-                let ground_object = wheel.raycast_info.ground_object;
-
-                if ground_object.is_some() {
-                    self.axle[i] = wheel.wheel_axle_ws;
-
-                    let surf_normal_ws = wheel.raycast_info.contact_normal_ws;
-                    let proj = self.axle[i].dot(&surf_normal_ws);
-                    self.axle[i] -= surf_normal_ws * proj;
-                    self.axle[i] = self.axle[i]
-                        .try_normalize(1.0e-5)
-                        .unwrap_or_else(Vector::zeros);
-                    self.forward_ws[i] = surf_normal_ws
-                        .cross(&self.axle[i])
-                        .try_normalize(1.0e-5)
-                        .unwrap_or_else(Vector::zeros);
-
-                    if let Some(ground_body) = ground_object
-                        .and_then(|h| colliders[h].parent())
-                        .map(|h| &bodies[h])
-                        .filter(|b| b.is_dynamic())
-                    {
-                        wheel.side_impulse = resolve_single_bilateral(
-                            &bodies[self.chassis],
-                            &wheel.raycast_info.contact_point_ws,
-                            ground_body,
-                            &wheel.raycast_info.contact_point_ws,
-                            &self.axle[i],
-                            wheel.contact_damping,
-                        );
-                    } else {
-                        wheel.side_impulse = resolve_single_unilateral(
-                            &bodies[self.chassis],
-                            &wheel.raycast_info.contact_point_ws,
-                            &self.axle[i],
-                            wheel.contact_damping,
-                        );
-                    }
-
-                    wheel.side_impulse *= wheel.side_friction_stiffness;
-                }
-            }
-        }
-
-        let mut sliding = false;
-        {
-            for wheel_id in 0..num_wheels {
-                let wheel = &mut self.wheels[wheel_id];
-                let ground_object = wheel.raycast_info.ground_object;
-
-                if ground_object.is_some() {
-                    // let default_rolling_friction_impulse = 0.0;
-                    // let max_impulse = if wheel.brake != 0.0 {
-                    //     wheel.brake * wheel.max_brake_force
-                    // } else {
-                    //     default_rolling_friction_impulse
-                    // };
-                    // let contact_pt = WheelContactPoint::new(
-                    //     &bodies[self.chassis],
-                    //     ground_object
-                    //         .and_then(|h| colliders[h].parent())
-                    //         .map(|h| &bodies[h]),
-                    //     wheel.raycast_info.contact_point_ws,
-                    //     self.forward_ws[wheel_id],
-                    //     max_impulse,
-                    // );
-                    // assert!(num_wheels_on_ground > 0);
-                    // rolling_friction = contact_pt.calc_rolling_friction(num_wheels_on_ground);
-
-                    assert!(num_wheels_on_ground > 0);
-                    let rolling_friction = if let Some(ground_body) = ground_object
-                        .and_then(|h| colliders[h].parent())
-                        .map(|h| &bodies[h])
-                        .filter(|b| b.is_dynamic())
-                        {
-                            resolve_single_bilateral(
-                                &bodies[self.chassis],
-                                &wheel.raycast_info.contact_point_ws,
-                                ground_body,
-                                &wheel.raycast_info.contact_point_ws,
-                                &self.forward_ws[wheel_id],
-                                wheel.contact_damping,
-                            )
-                        } else {
-                            resolve_single_unilateral(
-                                &bodies[self.chassis],
-                                &wheel.raycast_info.contact_point_ws,
-                                &self.forward_ws[wheel_id],
-                                wheel.contact_damping,
-                            )
-                        };
-                    wheel.engine_force_feedback = rolling_friction;
-
-                    wheel.forward_impulse = if wheel.last_skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
-                        let traction_control = wheel.traction_control.clamp(0.0, 1.0);
-                        let slip = ((0.8 - wheel.last_skid_info) / 0.8).clamp(0.0, 1.0);
-                        let speed_factor = (self.current_vehicle_speed.abs() / 5.0).clamp(0.0, 1.0);
-                        let traction_control_factor = traction_control * slip * speed_factor;
-                        wheel.engine_force * dt * (1.0 - traction_control_factor)
-                    } else {
-                        wheel.engine_force * dt
-                    };
-                    wheel.forward_impulse *= 1.0 - esc_engine_cut;
-
-                    wheel.brake_impulse = rolling_friction - wheel.forward_impulse;
-                    let esc_brake = if esc_brake_strength > 0.0 {
-                        let side = wheel.chassis_connection_point_cs.coords[esc_side_axis];
-                        let wheel_side = if side > 0.0 {
-                            1.0
-                        } else if side < 0.0 {
-                            -1.0
-                        } else {
-                            0.0
-                        };
-
-                        if wheel.steering.abs() > Real::EPSILON
-                            && wheel_side != 0.0
-                            && wheel_side == esc_brake_side
-                        {
-                            esc_brake_strength
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.0
-                    };
-                    let brake = (wheel.brake + esc_brake).clamp(0.0, 1.0);
-                    let mut max_impulse = wheel.max_brake_force * brake;
-
-                    if max_impulse.abs() > 0.0 {
-                        if wheel.brake >= 1.0 && max_impulse >= wheel.brake_impulse.abs() {
-                            wheel.lock = true;
-                        }
-                        if wheel.last_skid_info < 0.2 {
-                            wheel.lock = true;
-                        }
-                        let anti_lock_brake = wheel.anti_lock_brake.clamp(0.0, 1.0);
-                        if anti_lock_brake > 0.0 && self.current_vehicle_speed.abs() > 1.0 {
-                            let slip = ((0.98 - wheel.last_skid_info) / 0.98).clamp(0.0, 1.0);
-                            let speed_factor =
-                                ((self.current_vehicle_speed.abs() - 1.0) / 4.0).clamp(0.0, 1.0);
-                            let brake_release = anti_lock_brake * slip * speed_factor;
-                            max_impulse *= 1.0 - brake_release;
-                            if brake_release > 0.0 {
-                                wheel.lock = false;
-                                wheel.is_anti_lock_brake = true;
-                            }
-                        }
-                    }
-
-                    if max_impulse < wheel.brake_impulse {
-                        wheel.brake_impulse = max_impulse;
-                    }
-                    if -max_impulse > wheel.brake_impulse {
-                        wheel.brake_impulse = -max_impulse;
-                    }
-
-                    // wheel.lock = wheel.brake != 0.0 && brake_impulse.abs() > rolling_friction.abs() * 0.5;
-
-                    // if wheel.lock && wheel.anti_lock_brake > 0.0 && self.current_vehicle_speed.abs() > 1.0 {
-                    //     if self.timer % (dt * 4.0) < dt * 3.0 {
-                    //         brake_impulse *= 1.0 - wheel.anti_lock_brake;
-                    //         wheel.lock = false;
-                    //         wheel.is_anti_lock_brake = true;
-                    //     }
-                    // }
-                }
-
-                //switch between active rolling (throttle), braking and non-active rolling friction (no throttle/break)
-
-                if ground_object.is_some() {
-                    wheel.skid_info = 1.0;
-                    // Get ground friction from collider material name
-                    wheel.ground_type = colliders[ground_object.unwrap()].material.name.clone();
-                    wheel.ground_friction = ground_object
-                        .map(|h| &colliders[h])
-                        .and_then(|collider| {
-                            // Get tire type and calculate friction
-                            self.tire_types.get(&wheel.tire_type)
-                                .map(|tire_type| tire_type.get_friction(&collider.material.name))
-                        })
-                        .unwrap_or(wheel.friction_slip); // Default friction if no tire type or unknown material
-
-                    let max_imp = wheel.wheel_suspension_force * dt * wheel.ground_friction * wheel.friction_slip;
-                    let max_imp_side = max_imp;
-                    let max_imp_squared = max_imp * max_imp_side;
-                    assert!(max_imp_squared >= 0.0);
-
-                    let x = wheel.forward_impulse * wheel.fwd_factor + wheel.brake_impulse * wheel.brake_factor;
-                    let y = wheel.side_impulse * wheel.side_factor;
-
-                    let impulse_squared = x * x + y * y;
-
-                    if impulse_squared > max_imp_squared {
-                        sliding = true;
-
-                        let factor = max_imp * crate::utils::inv((impulse_squared).sqrt());
-                        wheel.skid_info *= factor;
-                    }
-                }
+        for wheel_id in 0..num_wheels {
+            let wheel = &mut self.wheels[wheel_id];
+            let Some(ground_object) = wheel.raycast_info.ground_object else {
                 wheel.last_skid_info = wheel.skid_info;
-                wheel.forward_impulse += wheel.brake_impulse;
-            }
+                continue;
+            };
+
+            let contact_normal = wheel.raycast_info.contact_normal_ws;
+            let axle = wheel.wheel_axle_ws - contact_normal * wheel.wheel_axle_ws.dot(&contact_normal);
+            let side_dir = axle.try_normalize(1.0e-5).unwrap_or_else(Vector::zeros);
+            let forward_dir = contact_normal
+                .cross(&side_dir)
+                .try_normalize(1.0e-5)
+                .unwrap_or_else(Vector::zeros);
+            let contact_velocity = relative_velocity_at_contact(
+                bodies,
+                colliders,
+                self.chassis,
+                Some(ground_object),
+                &wheel.raycast_info.contact_point_ws,
+            );
+
+            self.axle[wheel_id] = side_dir;
+            self.forward_ws[wheel_id] = forward_dir;
+
+            wheel.ground_type = colliders[ground_object].material.name.clone();
+            wheel.ground_friction = self
+                .tire_types
+                .get(&wheel.tire_type)
+                .map(|tire_type| tire_type.get_friction(&colliders[ground_object].material.name))
+                .unwrap_or(wheel.friction_slip);
+
+            contacts[wheel_id] = WheelContactState {
+                is_grounded: true,
+                ground_object: Some(ground_object),
+                forward_dir,
+                side_dir,
+                forward_speed: forward_dir.dot(&contact_velocity),
+                side_speed: side_dir.dot(&contact_velocity),
+                friction_limit: wheel.wheel_suspension_force
+                    * dt
+                    * wheel.ground_friction
+                    * wheel.friction_slip,
+            };
         }
 
-        if sliding {
-            for wheel in &mut self.wheels {
-                if wheel.skid_info < 1.0 {
-                    wheel.forward_impulse *= wheel.skid_info;
-                    wheel.side_impulse *= wheel.skid_info;
-                    wheel.engine_force_feedback *= wheel.skid_info;
+        for wheel_id in 0..num_wheels {
+            let contact = &contacts[wheel_id];
+            let wheel = &mut self.wheels[wheel_id];
+
+            if !contact.is_grounded {
+                wheel.last_skid_info = wheel.skid_info;
+                continue;
+            }
+
+            let rolling_friction = resolve_ground_impulse(
+                bodies,
+                colliders,
+                self.chassis,
+                contact.ground_object,
+                &wheel.raycast_info.contact_point_ws,
+                &contact.forward_dir,
+                wheel.contact_damping,
+            );
+            wheel.engine_force_feedback = rolling_friction;
+
+            let traction_control = wheel.traction_control.clamp(0.0, 1.0);
+            let traction_slip = ((0.8 - wheel.last_skid_info) / 0.8).clamp(0.0, 1.0);
+            let traction_speed = (self.current_vehicle_speed.abs() / 5.0).clamp(0.0, 1.0);
+            let traction_cut = if wheel.last_skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
+                traction_control * traction_slip * traction_speed
+            } else {
+                0.0
+            };
+
+            wheel.forward_impulse = wheel.engine_force * dt * (1.0 - traction_cut);
+            wheel.forward_impulse *= 1.0 - esc_engine_cut;
+
+            let esc_brake = if esc_brake_strength > 0.0 {
+                let side = wheel.chassis_connection_point_cs.coords[esc_side_axis];
+                let wheel_side = if side > 0.0 {
+                    1.0
+                } else if side < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+
+                if wheel.steering.abs() > Real::EPSILON
+                    && wheel_side != 0.0
+                    && wheel_side == esc_brake_side
+                {
+                    esc_brake_strength
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let brake = (wheel.brake + esc_brake).clamp(0.0, 1.0);
+
+            wheel.brake_impulse = rolling_friction - wheel.forward_impulse;
+            if brake > 0.0 && contact.forward_speed.abs() < 1.0 {
+                let hold_friction = resolve_ground_impulse(
+                    bodies,
+                    colliders,
+                    self.chassis,
+                    contact.ground_object,
+                    &wheel.raycast_info.contact_point_ws,
+                    &contact.forward_dir,
+                    1.0,
+                );
+                wheel.brake_impulse = hold_friction - wheel.forward_impulse;
+            }
+
+            let mut max_brake_impulse = wheel.max_brake_force * brake;
+            if max_brake_impulse > 0.0 {
+                if wheel.brake >= 1.0 && max_brake_impulse >= wheel.brake_impulse.abs() {
+                    wheel.lock = true;
+                }
+                if wheel.last_skid_info < 0.2 {
+                    wheel.lock = true;
+                }
+
+                let anti_lock_brake = wheel.anti_lock_brake.clamp(0.0, 1.0);
+                if anti_lock_brake > 0.0 && self.current_vehicle_speed.abs() > 1.0 {
+                    let slip = ((0.98 - wheel.last_skid_info) / 0.98).clamp(0.0, 1.0);
+                    let speed_factor =
+                        ((self.current_vehicle_speed.abs() - 1.0) / 4.0).clamp(0.0, 1.0);
+                    let slip_release = anti_lock_brake * slip * speed_factor * 1.15;
+                    let steering_factor = (wheel.steering.abs() / 0.55).clamp(0.0, 1.0);
+                    let lateral_factor = (contact.side_speed.abs() / 3.0).clamp(0.0, 1.0);
+                    let lateral_release = anti_lock_brake
+                        * brake
+                        * speed_factor
+                        * steering_factor.max(lateral_factor)
+                        * 0.55;
+                    let brake_release = (slip_release + lateral_release).clamp(0.0, 0.92);
+                    max_brake_impulse *= 1.0 - brake_release;
+
+                    if brake_release > 0.0 {
+                        wheel.lock = false;
+                        wheel.is_anti_lock_brake = true;
+                    }
                 }
             }
+
+            wheel.brake_impulse = wheel
+                .brake_impulse
+                .clamp(-max_brake_impulse, max_brake_impulse);
+
+            if brake > 0.0
+                && self.current_vehicle_speed.abs() < 1.0
+                && max_brake_impulse >= wheel.brake_impulse.abs()
+            {
+                wheel.lock = true;
+            }
+
+            wheel.side_impulse = resolve_ground_impulse(
+                bodies,
+                colliders,
+                self.chassis,
+                contact.ground_object,
+                &wheel.raycast_info.contact_point_ws,
+                &contact.side_dir,
+                wheel.contact_damping,
+            );
+
+            if contact.side_speed.abs() < 1.0 {
+                let side_hold = resolve_ground_impulse(
+                    bodies,
+                    colliders,
+                    self.chassis,
+                    contact.ground_object,
+                    &wheel.raycast_info.contact_point_ws,
+                    &contact.side_dir,
+                    1.0,
+                );
+
+                if side_hold.abs() > wheel.side_impulse.abs() {
+                    wheel.side_impulse = side_hold;
+                }
+            }
+
+            wheel.side_impulse *= wheel.side_friction_stiffness;
+
+            let forward_total =
+                wheel.forward_impulse * wheel.fwd_factor + wheel.brake_impulse * wheel.brake_factor;
+            let side_total = wheel.side_impulse * wheel.side_factor;
+            let impulse_squared = forward_total * forward_total + side_total * side_total;
+            let limit_squared = contact.friction_limit * contact.friction_limit;
+
+            wheel.skid_info = 1.0;
+
+            if impulse_squared > limit_squared && impulse_squared > 0.0 {
+                let factor = contact.friction_limit * crate::utils::inv(impulse_squared.sqrt());
+                wheel.skid_info = factor;
+                wheel.forward_impulse *= factor;
+                wheel.brake_impulse *= factor;
+                wheel.side_impulse *= factor;
+                wheel.engine_force_feedback *= factor;
+            }
+
+            wheel.last_skid_info = wheel.skid_info;
+            wheel.forward_impulse += wheel.brake_impulse;
         }
 
         // apply the impulses
@@ -1128,6 +1137,51 @@ fn resolve_single_bilateral(
 
     //todo: move this into proper structure
     -contact_damping * rel_vel * jac_diag_ab_inv
+}
+
+fn relative_velocity_at_contact(
+    bodies: &RigidBodySet,
+    colliders: &ColliderSet,
+    chassis: RigidBodyHandle,
+    ground_object: Option<ColliderHandle>,
+    point: &Point<Real>,
+) -> Vector<Real> {
+    let chassis_velocity = bodies[chassis].velocity_at_point(point);
+    let ground_velocity = ground_object
+        .and_then(|h| colliders[h].parent())
+        .map(|h| &bodies[h])
+        .filter(|b| b.is_dynamic())
+        .map(|b| b.velocity_at_point(point))
+        .unwrap_or_else(Vector::zeros);
+
+    chassis_velocity - ground_velocity
+}
+
+fn resolve_ground_impulse(
+    bodies: &RigidBodySet,
+    colliders: &ColliderSet,
+    chassis: RigidBodyHandle,
+    ground_object: Option<ColliderHandle>,
+    point: &Point<Real>,
+    direction: &Vector<Real>,
+    contact_damping: Real,
+) -> Real {
+    if let Some(ground_body) = ground_object
+        .and_then(|h| colliders[h].parent())
+        .map(|h| &bodies[h])
+        .filter(|b| b.is_dynamic())
+    {
+        resolve_single_bilateral(
+            &bodies[chassis],
+            point,
+            ground_body,
+            point,
+            direction,
+            contact_damping,
+        )
+    } else {
+        resolve_single_unilateral(&bodies[chassis], point, direction, contact_damping)
+    }
 }
 
 fn resolve_single_unilateral(body1: &RigidBody, pt1: &Point<Real>, normal: &Vector<Real>, contact_damping: Real,) -> Real {
