@@ -594,15 +594,16 @@ impl DynamicRayCastVehicleController {
                         0.0
                     };
                     if wheel.skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
-                        let mut speed_factor = 0.0;
-                        if self.current_vehicle_speed.abs() > 1.0 {
-                            speed_factor = (self.current_vehicle_speed.abs() / 1.0).powi(2);
-                            if speed_factor > 1.0 {
-                                speed_factor = 1.0;
-                            }
-                        }
+                        let traction_control = wheel.traction_control.clamp(0.0, 1.0);
+                        let slip = ((0.8 - wheel.skid_info) / 0.8).clamp(0.0, 1.0);
+                        let speed_factor = (self.current_vehicle_speed.abs() / 5.0).clamp(0.0, 1.0);
+                        let traction_control_factor = traction_control * slip * speed_factor;
                         // Apply custom rotation when accelerating and sliding
-                        wheel.delta_rotation = wheel.delta_rotation * wheel.traction_control * speed_factor + (wheel.delta_rotation + ((target_rotation - wheel.delta_rotation) * (1.0 - wheel.skid_info.powi(2)))) * (1.0 - wheel.traction_control * speed_factor);
+                        wheel.delta_rotation = wheel.delta_rotation * traction_control_factor
+                            + (wheel.delta_rotation
+                                + ((target_rotation - wheel.delta_rotation)
+                                    * (1.0 - wheel.skid_info.powi(2))))
+                                * (1.0 - traction_control_factor);
                     }
                 } else {
                     if wheel.engine_force.abs() > 0.0 && target_rotation != 0.0 {
@@ -795,14 +796,11 @@ impl DynamicRayCastVehicleController {
                     wheel.engine_force_feedback = rolling_friction;
 
                     wheel.forward_impulse = if wheel.last_skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
-                        let mut speed_factor = 0.0;
-                        if self.current_vehicle_speed.abs() > 1.0 {
-                            speed_factor = (self.current_vehicle_speed.abs() / 1.0).powi(2);
-                            if speed_factor > 1.0 {
-                                speed_factor = 1.0;
-                            }
-                        }
-                        wheel.engine_force * dt * (1.0 - wheel.traction_control * speed_factor)
+                        let traction_control = wheel.traction_control.clamp(0.0, 1.0);
+                        let slip = ((0.8 - wheel.last_skid_info) / 0.8).clamp(0.0, 1.0);
+                        let speed_factor = (self.current_vehicle_speed.abs() / 5.0).clamp(0.0, 1.0);
+                        let traction_control_factor = traction_control * slip * speed_factor;
+                        wheel.engine_force * dt * (1.0 - traction_control_factor)
                     } else {
                         wheel.engine_force * dt
                     };
