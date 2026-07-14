@@ -808,6 +808,9 @@ impl DynamicRayCastVehicleController {
                     let mut max_impulse = wheel.max_brake_force * wheel.brake;
 
                     if max_impulse.abs() > 0.0 {
+                        if wheel.brake >= 1.0 && max_impulse >= wheel.forward_impulse.abs() {
+                            wheel.lock = true;
+                        }
                         if wheel.last_skid_info < 0.2 {
                             wheel.lock = true;
                         }
