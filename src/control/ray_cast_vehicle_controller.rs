@@ -153,7 +153,7 @@ pub struct Wheel {
     pub rotation: Real,
     /// The change in rotation since the last update.
     pub delta_rotation: Real,
-    /// The target rotation of the wheel.
+    /// The target angular velocity of the wheel.
     pub target_rotation: Real,
     /// The influence of the roll on the wheel’s suspension.
     pub anti_roll: Real,
@@ -577,7 +577,7 @@ impl DynamicRayCastVehicleController {
             .unwrap();
 
         for wheel in &mut self.wheels {
-            let vel = chassis.velocity_at_point(&wheel.raycast_info.hard_point_ws);
+            let vel = chassis.velocity_at_point(&wheel.center);
             let target_rotation = wheel.target_rotation * dt;
             if wheel.lock {
                 wheel.delta_rotation = 0.0;
@@ -588,8 +588,11 @@ impl DynamicRayCastVehicleController {
                     let proj = fwd.dot(&wheel.raycast_info.contact_normal_ws);
                     fwd -= wheel.raycast_info.contact_normal_ws * proj;
 
-                    let proj2 = fwd.dot(&vel);
-                    wheel.delta_rotation = (proj2 * dt) / (wheel.radius);
+                    wheel.delta_rotation = if let Some(fwd) = fwd.try_normalize(Real::EPSILON) {
+                        (fwd.dot(&vel) * dt) / wheel.radius.max(Real::EPSILON)
+                    } else {
+                        0.0
+                    };
                     if wheel.skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
                         let mut speed_factor = 0.0;
                         if self.current_vehicle_speed.abs() > 1.0 {
@@ -605,7 +608,7 @@ impl DynamicRayCastVehicleController {
                     if wheel.engine_force.abs() > 0.0 && target_rotation != 0.0 {
                         wheel.delta_rotation = target_rotation;
                     }
-                    wheel.delta_rotation *= 1.0 - wheel.brake; // Apply brake
+                    wheel.delta_rotation *= 1.0 - wheel.brake.clamp(0.0, 1.0); // Apply brake
                 }
             }
 
