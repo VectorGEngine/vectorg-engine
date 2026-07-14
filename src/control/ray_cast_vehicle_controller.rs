@@ -175,7 +175,7 @@ pub struct Wheel {
     pub brake: Real,
     /// The maximum amount of braking impulse applied to slow down the vehicle.
     pub max_brake_force: Real,
-    /// The anti-lock braking system force applied to this wheel.
+    /// The anti-lock braking system strength applied to this wheel.
     pub anti_lock_brake: Real,
     /// traction control system force applied to this wheel.
     pub is_anti_lock_brake: bool,
@@ -815,10 +815,17 @@ impl DynamicRayCastVehicleController {
                         if wheel.last_skid_info < 0.2 {
                             wheel.lock = true;
                         }
-                        if wheel.last_skid_info < wheel.anti_lock_brake * 0.98 && self.current_vehicle_speed.abs() > 1.0 {
-                            max_impulse = 0.0;
-                            wheel.lock = false;
-                            wheel.is_anti_lock_brake = true;
+                        let anti_lock_brake = wheel.anti_lock_brake.clamp(0.0, 1.0);
+                        if anti_lock_brake > 0.0 && self.current_vehicle_speed.abs() > 1.0 {
+                            let slip = ((0.98 - wheel.last_skid_info) / 0.98).clamp(0.0, 1.0);
+                            let speed_factor =
+                                ((self.current_vehicle_speed.abs() - 1.0) / 4.0).clamp(0.0, 1.0);
+                            let brake_release = anti_lock_brake * slip * speed_factor;
+                            max_impulse *= 1.0 - brake_release;
+                            if brake_release > 0.0 {
+                                wheel.lock = false;
+                                wheel.is_anti_lock_brake = true;
+                            }
                         }
                     }
 
