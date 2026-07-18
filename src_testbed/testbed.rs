@@ -28,7 +28,10 @@ use rapier::geometry::{ColliderHandle, ColliderSet, NarrowPhase};
 use rapier::math::{Real, Vector};
 use rapier::pipeline::{PhysicsHooks, QueryPipeline};
 #[cfg(feature = "dim3")]
-use rapier::{control::DynamicRayCastVehicleController, prelude::QueryFilter};
+use rapier::{
+    control::{DynamicRayCastVehicleController, VehicleInput},
+    prelude::QueryFilter,
+};
 
 #[cfg(all(feature = "dim2", feature = "other-backends"))]
 use crate::box2d_backend::Box2dWorld;
@@ -779,32 +782,39 @@ impl Testbed<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_> {
         }
 
         if let Some(vehicle) = &mut self.state.vehicle_controller {
-            let mut engine_force = 0.0;
-            let mut steering_angle = 0.0;
-
-            for key in events.get_pressed() {
-                match *key {
-                    KeyCode::ArrowRight => {
-                        steering_angle += -0.7;
-                    }
-                    KeyCode::ArrowLeft => {
-                        steering_angle += 0.7;
-                    }
-                    KeyCode::ArrowUp => {
-                        engine_force += 30.0;
-                    }
-                    KeyCode::ArrowDown => {
-                        engine_force += -30.0;
-                    }
-                    _ => {}
+            let pressed = |key| {
+                if events.pressed(key) {
+                    1.0
+                } else {
+                    0.0
                 }
-            }
+            };
+            vehicle.set_input(VehicleInput {
+                throttle: pressed(KeyCode::ArrowUp),
+                brake: pressed(KeyCode::ArrowDown),
+                clutch: pressed(KeyCode::ShiftLeft),
+                handbrake: pressed(KeyCode::Space),
+                steering: pressed(KeyCode::ArrowLeft) - pressed(KeyCode::ArrowRight),
+            });
 
-            let wheels = vehicle.wheels_mut();
-            wheels[0].engine_force = engine_force;
-            wheels[0].steering = steering_angle;
-            wheels[1].engine_force = engine_force;
-            wheels[1].steering = steering_angle;
+            if events.just_pressed(KeyCode::KeyX) {
+                vehicle.shift_up();
+            }
+            if events.just_pressed(KeyCode::KeyZ) {
+                vehicle.shift_down();
+            }
+            if events.just_pressed(KeyCode::KeyI) {
+                let state = vehicle.state();
+                println!(
+                    "gear={} rpm={:.0} speed={:.2}m/s wheels={} abs={:.2} tc={:.2}",
+                    state.current_gear,
+                    state.engine_rpm,
+                    state.vehicle_speed,
+                    state.wheels_in_contact,
+                    state.abs_activity,
+                    state.traction_control_activity,
+                );
+            }
 
             vehicle.update_vehicle(
                 self.harness.physics.integration_parameters.dt,

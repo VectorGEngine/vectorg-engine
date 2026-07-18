@@ -1,4 +1,6 @@
-use rapier3d::control::{DynamicRayCastVehicleController, WheelTuning};
+use rapier3d::control::{
+    DynamicRayCastVehicleController, VehicleControllerConfig, WheelAxle, WheelRole, WheelTuning,
+};
 use rapier3d::prelude::*;
 use rapier_testbed3d::Testbed;
 
@@ -37,7 +39,9 @@ pub fn init_world(testbed: &mut Testbed) {
         suspension_damping: 10.0,
         ..WheelTuning::default()
     };
-    let mut vehicle = DynamicRayCastVehicleController::new(vehicle_handle);
+    let mut config = VehicleControllerConfig::default();
+    config.engine.force_scale = 0.02;
+    let mut vehicle = DynamicRayCastVehicleController::new(vehicle_handle, config);
     let wheel_positions = [
         point![hw * 1.5, -hh, hw],
         point![hw * 1.5, -hh, -hw],
@@ -45,8 +49,22 @@ pub fn init_world(testbed: &mut Testbed) {
         point![-hw * 1.5, -hh, -hw],
     ];
 
-    for pos in wheel_positions {
-        vehicle.add_wheel(pos, -Vector::y(), Vector::z(), hh, hh / 4.0, &tuning);
+    for (wheel_id, pos) in wheel_positions.into_iter().enumerate() {
+        let front = wheel_id < 2;
+        let axle = if front {
+            WheelAxle::Front
+        } else {
+            WheelAxle::Rear
+        };
+        vehicle.add_wheel(
+            pos,
+            -Vector::y(),
+            Vector::z(),
+            hh,
+            hh / 4.0,
+            &tuning,
+            WheelRole::new(axle, front, front),
+        );
     }
 
     /*

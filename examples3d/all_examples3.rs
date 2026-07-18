@@ -50,6 +50,7 @@ mod locked_rotations3;
 mod newton_cradle3;
 mod one_way_platforms3;
 mod platform3;
+mod powertrain_vehicle3;
 mod primitives3;
 mod restitution3;
 mod rope_joints3;
@@ -83,6 +84,7 @@ pub fn main() {
         ("Locked rotations", locked_rotations3::init_world),
         ("One-way platforms", one_way_platforms3::init_world),
         ("Platform", platform3::init_world),
+        ("Powertrain vehicle", powertrain_vehicle3::init_world),
         ("Restitution", restitution3::init_world),
         ("Rope Joints", rope_joints3::init_world),
         ("Sensor", sensor3::init_world),
