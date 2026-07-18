@@ -692,19 +692,31 @@ impl DynamicRayCastVehicleController {
                     } else {
                         0.0
                     };
-                    let allow_drive_spin =
-                        self.current_vehicle_speed.abs() >= 0.5 || wheel.skid_info < 0.5;
-                    if wheel.skid_info < 0.8 && wheel.engine_force.abs() > 0.0 && allow_drive_spin {
-                        let traction_control = wheel.traction_control.clamp(0.0, 1.0);
-                        let slip = ((0.8 - wheel.skid_info) / 0.8).clamp(0.0, 1.0);
-                        let speed_factor = (self.current_vehicle_speed.abs() / 5.0).clamp(0.0, 1.0);
-                        let traction_control_factor = traction_control * slip * speed_factor;
-                        // Apply custom rotation when accelerating and sliding
-                        wheel.delta_rotation = wheel.delta_rotation * traction_control_factor
-                            + (wheel.delta_rotation
-                                + ((target_rotation - wheel.delta_rotation)
-                                    * (1.0 - wheel.skid_info.powi(2))))
-                                * (1.0 - traction_control_factor);
+                    let powered_against_motion = wheel.engine_force * target_rotation < 0.0
+                        && wheel.delta_rotation * target_rotation < 0.0;
+                    if powered_against_motion {
+                        // A ray-cast wheel has no angular body of its own. Drive it at the
+                        // powered target while the chassis is still moving the other way.
+                        wheel.delta_rotation = target_rotation;
+                    } else {
+                        let allow_drive_spin =
+                            self.current_vehicle_speed.abs() >= 0.5 || wheel.skid_info < 0.5;
+                        if wheel.skid_info < 0.8
+                            && wheel.engine_force.abs() > 0.0
+                            && allow_drive_spin
+                        {
+                            let traction_control = wheel.traction_control.clamp(0.0, 1.0);
+                            let slip = ((0.8 - wheel.skid_info) / 0.8).clamp(0.0, 1.0);
+                            let speed_factor =
+                                (self.current_vehicle_speed.abs() / 5.0).clamp(0.0, 1.0);
+                            let traction_control_factor = traction_control * slip * speed_factor;
+                            // Apply custom rotation when accelerating and sliding
+                            wheel.delta_rotation = wheel.delta_rotation * traction_control_factor
+                                + (wheel.delta_rotation
+                                    + ((target_rotation - wheel.delta_rotation)
+                                        * (1.0 - wheel.skid_info.powi(2))))
+                                    * (1.0 - traction_control_factor);
+                        }
                     }
                 } else {
                     if wheel.engine_force.abs() > 0.0 && target_rotation != 0.0 {
