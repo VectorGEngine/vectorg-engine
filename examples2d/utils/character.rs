@@ -1,9 +1,9 @@
-use rapier2d::{
+use vectorg_engine_2d::{
     control::{CharacterLength, KinematicCharacterController, PidController},
     prelude::*,
 };
-use rapier_testbed2d::ui::egui::Align2;
-use rapier_testbed2d::{
+use vectorg_engine_testbed_2d::ui::egui::Align2;
+use vectorg_engine_testbed_2d::{
     ui::egui::{ComboBox, Slider, Ui, Window},
     KeyCode, PhysicsState, TestbedGraphics,
 };

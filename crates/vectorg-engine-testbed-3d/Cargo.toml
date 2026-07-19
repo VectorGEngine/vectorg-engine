@@ -1,0 +1,104 @@
+[package]
+name = "vectorg-engine-testbed-3d"
+version = "0.26.0"
+authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
+description = "Real-time vehicle dynamics engine for realistic driving simulation."
+homepage = "https://github.com/VectorGEngine/vectorg-engine"
+documentation = "https://docs.rs/vectorg-engine-testbed-3d"
+repository = "https://github.com/VectorGEngine/vectorg-engine"
+categories = [
+    "science",
+    "game-development",
+    "mathematics",
+    "simulation",
+    "wasm",
+]
+keywords = ["physics", "dynamics", "rigid", "real-time", "impulse_joints"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.82"
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[lib]
+name = "vectorg_engine_testbed_3d"
+path = "../../src_testbed/lib.rs"
+required-features = ["dim3"]
+
+[lints]
+rust.unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("dim2", "f64"))',
+] }
+clippy = { needless_lifetimes = "allow" }
+
+[features]
+default = ["dim3"]
+dim3 = []
+parallel = ["engine/parallel", "num_cpus"]
+other-backends = ["physx", "physx-sys", "glam"]
+profiler_ui = ["dep:puffin_egui", "profiling/profile-with-puffin"]
+# See https://github.com/dimforge/rapier/issues/760.
+unstable-puffin-pr-235 = []
+
+[package.metadata.docs.rs]
+features = ["parallel", "other-backends", "profiler_ui"]
+
+[dependencies]
+nalgebra = { version = "0.33", features = ["rand", "glam029"] }
+rand = "0.8"
+rand_pcg = "0.3"
+web-time = { version = "1.1" }
+bitflags = "2"
+glam = { version = "0.27", optional = true } # For Physx
+num_cpus = { version = "1", optional = true }
+physx = { version = "0.19", features = ["glam"], optional = true }
+physx-sys = { version = "0.11", optional = true }
+crossbeam = "0.8"
+bincode = "1"
+md5 = "0.7"
+Inflector = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bevy_egui = "0.31"
+bevy_ecs = "0.15"
+bevy_core_pipeline = "0.15"
+bevy_pbr = "0.15"
+bevy_sprite = "0.15"
+profiling = "1.0"
+puffin_egui = { version = "0.29", optional = true }
+indexmap = { version = "2", features = ["serde"] }
+
+# Dependencies for native only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { version = "0.15", default-features = false, features = [
+    "bevy_winit",
+    "bevy_window",
+    "x11",
+    "tonemapping_luts",
+    "ktx2",
+    "zstd",
+    "bevy_render",
+    "bevy_pbr",
+    "bevy_gizmos",
+    "serialize"
+] }
+
+# Dependencies for WASM only.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { version = "0.15", default-features = false, features = [
+    "bevy_winit",
+    "tonemapping_luts",
+    "ktx2",
+    "zstd",
+    "bevy_render",
+    "bevy_pbr",
+    "bevy_gizmos",
+] }
+#bevy_webgl2 = "0.5"
+
+[dependencies.engine]
+package = "vectorg-engine"
+path = "../vectorg-engine"
+version = "0.26.0"
+features = ["serde-serialize", "debug-render", "profiler"]

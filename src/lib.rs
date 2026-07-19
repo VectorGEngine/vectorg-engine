@@ -1,14 +1,11 @@
-//! # Rapier
+//! # VectorG Engine
 //!
-//! Rapier is a set of two Rust crates `rapier2d` and `rapier3d` for efficient cross-platform
-//! physics simulation. It target application include video games, animation, robotics, etc.
+//! VectorG Engine is a real-time vehicle dynamics engine for realistic driving simulation.
+//! It powers the VectorG driving simulator and includes tire, suspension, drivetrain,
+//! differential, vehicle-controller, and racing-simulation systems.
 //!
-//! Rapier has some unique features for collaborative applications:
-//! - The ability to snapshot the state of the physics engine, and restore it later.
-//! - The ability to run a perfectly deterministic simulation on different machine, as long as they
-//!   are compliant with the IEEE 754-2008 floating point standard.
-//!
-//! User documentation for Rapier is on [the official Rapier site](https://rapier.rs/docs/).
+//! VectorG Engine originated from Rapier and preserves the original license and attribution,
+//! but is no longer API compatible with upstream Rapier.
 
 #![deny(bare_trait_objects)]
 #![warn(missing_docs)]
@@ -128,7 +125,7 @@ macro_rules! try_ret {
 pub(crate) const INVALID_U32: u32 = u32::MAX;
 pub(crate) const INVALID_USIZE: usize = INVALID_U32 as usize;
 
-/// The string version of Rapier.
+/// The string version of VectorG Engine.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod control;
@@ -210,7 +207,7 @@ pub mod math {
     pub const ANG_DIM: usize = 3;
 }
 
-/// Prelude containing the common types defined by Rapier.
+/// Prelude containing the common types defined by VectorG Engine.
 pub mod prelude {
     pub use crate::dynamics::*;
     pub use crate::geometry::*;

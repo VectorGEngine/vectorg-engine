@@ -3,8 +3,8 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-use rapier_testbed2d::{Testbed, TestbedApp};
 use std::cmp::Ordering;
+use vectorg_engine_testbed_2d::{Testbed, TestbedApp};
 
 mod balls2;
 mod boxes2;

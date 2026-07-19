@@ -3,7 +3,7 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-use rapier_testbed3d::{Testbed, TestbedApp};
+use vectorg_engine_testbed_3d::{Testbed, TestbedApp};
 use std::cmp::Ordering;
 
 mod ccd3;

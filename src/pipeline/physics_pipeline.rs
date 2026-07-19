@@ -24,7 +24,7 @@ use {crate::dynamics::RigidBodySet, crate::geometry::ColliderSet};
 /// copy at any time. For performance reasons it is recommended to reuse the same physics pipeline
 /// instance to benefit from the cached data.
 ///
-/// Rapier relies on a time-stepping scheme. Its force computations
+/// VectorG Engine relies on a time-stepping scheme. Its force computations
 /// uses two solvers:
 /// - A velocity based solver based on PGS which computes forces for contact and joint constraints.
 /// - A position based solver based on non-linear PGS which performs constraint stabilization (i.e. correction of errors like penetrations).

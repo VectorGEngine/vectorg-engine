@@ -1,5 +1,5 @@
-use rapier3d::prelude::*;
-use rapier_testbed3d::{KeyCode, Testbed};
+use vectorg_engine::prelude::*;
+use vectorg_engine_testbed_3d::{KeyCode, Testbed};
 
 pub fn init_world(testbed: &mut Testbed) {
     /*

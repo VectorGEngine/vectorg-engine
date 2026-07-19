@@ -1,25 +1,26 @@
 [package]
-name = "rapier-benchmarks-2d"
+name = "vectorg-engine-benchmarks-2d"
 version = "0.1.0"
 authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
 edition = "2021"
+rust-version = "1.82"
 
 [features]
-parallel = ["rapier2d/parallel", "rapier_testbed2d/parallel"]
-simd-stable = ["rapier2d/simd-stable"]
-simd-nightly = ["rapier2d/simd-nightly"]
-other-backends = ["rapier_testbed2d/other-backends"]
-enhanced-determinism = ["rapier2d/enhanced-determinism"]
+parallel = ["vectorg-engine-2d/parallel", "vectorg-engine-testbed-2d/parallel"]
+simd-stable = ["vectorg-engine-2d/simd-stable"]
+simd-nightly = ["vectorg-engine-2d/simd-nightly"]
+other-backends = ["vectorg-engine-testbed-2d/other-backends"]
+enhanced-determinism = ["vectorg-engine-2d/enhanced-determinism"]
 
 [dependencies]
 rand = "0.8"
 Inflector = "0.11"
 
-[dependencies.rapier_testbed2d]
-path = "../crates/rapier_testbed2d"
+[dependencies.vectorg-engine-testbed-2d]
+path = "../crates/vectorg-engine-testbed-2d"
 
-[dependencies.rapier2d]
-path = "../crates/rapier2d"
+[dependencies.vectorg-engine-2d]
+path = "../crates/vectorg-engine-2d"
 
 [[bin]]
 name = "all_benchmarks2"

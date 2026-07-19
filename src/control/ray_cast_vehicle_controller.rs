@@ -1,4 +1,3 @@
-
 use crate::dynamics::{RigidBody, RigidBodyHandle, RigidBodySet};
 use crate::geometry::{ColliderHandle, ColliderSet, Ray};
 use crate::math::{Point, Real, Rotation, Vector, DIM};
@@ -388,10 +387,10 @@ impl DynamicRayCastVehicleController {
     /// Wheels have to be attached afterwards calling [`Self::add_wheel`].
     pub fn new(chassis: RigidBodyHandle, config: VehicleControllerConfig) -> Self {
         let mut tire_types = HashMap::new();
-        
-        // Create default tire types        
+
+        // Create default tire types
         tire_types.insert("default".to_string(), TireType::new("default", 1.0));
-        
+
         Self {
             wheels: vec![],
             forward_ws: vec![],
@@ -465,7 +464,8 @@ impl DynamicRayCastVehicleController {
 
     /// Adds a new tire type to the controller
     pub fn add_tire_type(&mut self, tire_type: &str, friction: Real) {
-        self.tire_types.insert(tire_type.to_string(), TireType::new(tire_type, friction));
+        self.tire_types
+            .insert(tire_type.to_string(), TireType::new(tire_type, friction));
     }
 
     /// Adds a surface to an existing tire type
@@ -569,7 +569,12 @@ impl DynamicRayCastVehicleController {
     }
 
     /// Adds a surface to an existing tire type
-    pub fn add_surface_to_tire_type(&mut self, tire_type_name: &str, surface_name: &str,friction: Real) {
+    pub fn add_surface_to_tire_type(
+        &mut self,
+        tire_type_name: &str,
+        surface_name: &str,
+        friction: Real,
+    ) {
         if let Some(tire_type) = self.tire_types.get_mut(tire_type_name) {
             tire_type.add_surface(surface_name, friction);
         }
@@ -754,11 +759,10 @@ impl DynamicRayCastVehicleController {
         let speed_factor = if steering_config.speed_sensitivity <= Real::EPSILON {
             1.0
         } else {
-            let normalized =
-                (self.current_vehicle_speed.abs() / steering_config.speed_sensitivity).clamp(0.0, 1.0);
+            let normalized = (self.current_vehicle_speed.abs() / steering_config.speed_sensitivity)
+                .clamp(0.0, 1.0);
             steering_config.minimum_speed_factor
-                + (1.0 - normalized).powi(2)
-                    * (1.0 - steering_config.minimum_speed_factor)
+                + (1.0 - normalized).powi(2) * (1.0 - steering_config.minimum_speed_factor)
         };
         let max_angle = steering_config.max_angle;
         let player_angle = input.steering * max_angle * speed_factor;
@@ -775,15 +779,15 @@ impl DynamicRayCastVehicleController {
         let mut drift_angle = None;
         if can_assist {
             let up = chassis.position().rotation * Vector::ith(self.index_up_axis, 1.0);
-            let forward =
-                chassis.position().rotation * Vector::ith(self.index_forward_axis, 1.0);
+            let forward = chassis.position().rotation * Vector::ith(self.index_forward_axis, 1.0);
             let mut velocity = *chassis.linvel();
             velocity -= up * velocity.dot(&up);
 
             if let Some(velocity_dir) = velocity.try_normalize(Real::EPSILON) {
-                drift_angle = Some(up
-                    .dot(&velocity_dir.cross(&forward))
-                    .atan2(velocity_dir.dot(&forward)));
+                drift_angle = Some(
+                    up.dot(&velocity_dir.cross(&forward))
+                        .atan2(velocity_dir.dot(&forward)),
+                );
             }
         }
 
@@ -797,8 +801,8 @@ impl DynamicRayCastVehicleController {
 
             if self.drift_assist_active {
                 let yaw_rate = self.chassis_yaw_rate(chassis);
-                let correction_angle = (-angle - yaw_rate * DRIFT_ASSIST_YAW_DAMPING)
-                    .clamp(-max_angle, max_angle);
+                let correction_angle =
+                    (-angle - yaw_rate * DRIFT_ASSIST_YAW_DAMPING).clamp(-max_angle, max_angle);
                 self.drift_assist_direction = correction_angle.signum();
                 let matching_input = input.steering.abs() > DRIFT_ASSIST_INPUT_DEADZONE
                     && input.steering * correction_angle > 0.0;
@@ -807,11 +811,10 @@ impl DynamicRayCastVehicleController {
                     let normalized_angle = ((absolute_angle - DRIFT_ASSIST_ENTER_ANGLE)
                         / (DRIFT_ASSIST_FULL_ANGLE - DRIFT_ASSIST_ENTER_ANGLE))
                         .clamp(0.0, 1.0);
-                    let activation = normalized_angle * normalized_angle
-                        * (3.0 - 2.0 * normalized_angle);
-                    target_assist_offset = Some(
-                        (correction_angle - player_angle) * correction_strength * activation,
-                    );
+                    let activation =
+                        normalized_angle * normalized_angle * (3.0 - 2.0 * normalized_angle);
+                    target_assist_offset =
+                        Some((correction_angle - player_angle) * correction_strength * activation);
                 } else if input.steering.abs() > DRIFT_ASSIST_INPUT_DEADZONE {
                     cancel_immediately = true;
                 }
@@ -838,12 +841,9 @@ impl DynamicRayCastVehicleController {
                 DRIFT_ASSIST_RESPONSE
             };
             let response = 1.0 - (-response_rate * dt.max(0.0)).exp();
-            self.drift_assist_offset +=
-                (target_offset - self.drift_assist_offset) * response;
+            self.drift_assist_offset += (target_offset - self.drift_assist_offset) * response;
 
-            if target_assist_offset.is_none()
-                && self.drift_assist_offset.abs() <= 1.0e-4
-            {
+            if target_assist_offset.is_none() && self.drift_assist_offset.abs() <= 1.0e-4 {
                 self.drift_assist_offset = 0.0;
                 self.drift_assist_direction = 0.0;
             }
@@ -851,10 +851,7 @@ impl DynamicRayCastVehicleController {
 
         let mut center_angle = player_angle + self.drift_assist_offset;
 
-        center_angle = center_angle.clamp(
-            -max_angle,
-            max_angle,
-        );
+        center_angle = center_angle.clamp(-max_angle, max_angle);
         self.powertrain.state_mut().steering_angle = center_angle;
 
         let side_axis = self.side_axis();
@@ -938,8 +935,7 @@ impl DynamicRayCastVehicleController {
         let steering_rate = (self.powertrain.state().steering_angle
             / self.powertrain.config.steering.max_angle.max(Real::EPSILON))
         .abs();
-        let steering_traction_factor =
-            1.0 - ((steering_rate - 0.5) / 0.5).clamp(0.0, 1.0);
+        let steering_traction_factor = 1.0 - ((steering_rate - 0.5) / 0.5).clamp(0.0, 1.0);
 
         for wheel in &mut self.wheels {
             if wheel.role.driven {
@@ -975,13 +971,12 @@ impl DynamicRayCastVehicleController {
             } else {
                 service_brake
             };
-            wheel.anti_lock_brake = if input.handbrake > service_brake
-                && wheel.role.axle == WheelAxle::Rear
-            {
-                0.0
-            } else {
-                dynamics.abs_strength
-            };
+            wheel.anti_lock_brake =
+                if input.handbrake > service_brake && wheel.role.axle == WheelAxle::Rear {
+                    0.0
+                } else {
+                    dynamics.abs_strength
+                };
         }
     }
 
@@ -1062,9 +1057,7 @@ impl DynamicRayCastVehicleController {
                 let normal = wheel.raycast_info.contact_normal_ws;
                 let axle = wheel.wheel_axle_ws - normal * wheel.wheel_axle_ws.dot(&normal);
                 if let Some(side) = axle.try_normalize(Real::EPSILON) {
-                    if let Some(wheel_forward) =
-                        normal.cross(&side).try_normalize(Real::EPSILON)
-                    {
+                    if let Some(wheel_forward) = normal.cross(&side).try_normalize(Real::EPSILON) {
                         let angle = velocity_direction.angle(&wheel_forward)
                             * up.dot(&velocity_direction.cross(&wheel_forward)).signum();
                         slip_feedback += (-angle * 4.0).clamp(-1.0, 1.0);
@@ -1083,18 +1076,14 @@ impl DynamicRayCastVehicleController {
             let bump = self.last_steering_compression - compression_sum;
             self.last_steering_compression = compression_sum;
             let abs_pulse = (self.timer * 35.0).sin() * abs_activity * 0.2;
-            let feedback = ((slip_feedback / count) * average_skid * speed_factor
-                + bump * 6.0
-                + abs_pulse)
-                .clamp(-1.0, 1.0);
+            let feedback =
+                ((slip_feedback / count) * average_skid * speed_factor + bump * 6.0 + abs_pulse)
+                    .clamp(-1.0, 1.0);
             let wheel_speed_factor =
                 1.0 - (self.powertrain.state().driven_wheel_speed.abs() / 3.0).min(1.0);
             let compression = (compression_sum * 4.0).min(1.0) * wheel_speed_factor;
             let friction = (0.24
-                + (0.6 + average_skid * 0.4)
-                    * average_ground_friction
-                    * compression
-                    * 0.36)
+                + (0.6 + average_skid * 0.4) * average_ground_friction * compression * 0.36)
                 .min(1.0);
             (feedback, friction)
         };
@@ -1122,8 +1111,7 @@ impl DynamicRayCastVehicleController {
 
         let forward_w = chassis.position() * Vector::ith(self.index_forward_axis, 1.0);
         self.current_vehicle_speed = forward_w.dot(chassis.linvel());
-        let (driven_wheel_speed, driven_wheel_radius) =
-            self.driven_wheel_speed_and_radius(dt);
+        let (driven_wheel_speed, driven_wheel_radius) = self.driven_wheel_speed_and_radius(dt);
         let output = self.powertrain.update(
             dt,
             self.current_vehicle_speed,
@@ -1181,8 +1169,7 @@ impl DynamicRayCastVehicleController {
             let target_rotation = wheel.target_rotation * dt;
             if wheel.lock {
                 wheel.delta_rotation = 0.0;
-            }
-            else {
+            } else {
                 if wheel.raycast_info.is_in_contact {
                     let mut fwd = chassis.position() * Vector::ith(self.index_forward_axis, 1.0);
                     let proj = fwd.dot(&wheel.raycast_info.contact_normal_ws);
@@ -1249,7 +1236,7 @@ impl DynamicRayCastVehicleController {
         for w_it in 0..self.wheels.len() {
             let wheels = &mut self.wheels[w_it];
             wheels.suspension_compression_rate = 0.0;
-            
+
             if wheels.raycast_info.is_in_contact {
                 let mut force;
                 //	Spring
@@ -1257,7 +1244,7 @@ impl DynamicRayCastVehicleController {
                     let rest_length = wheels.suspension_rest_length;
                     let current_length = wheels.raycast_info.suspension_length;
                     let length_diff = rest_length - current_length;
-                    wheels.suspension_compression_rate =  1.0 - (current_length / rest_length);
+                    wheels.suspension_compression_rate = 1.0 - (current_length / rest_length);
 
                     force = wheels.suspension_stiffness
                         * length_diff
@@ -1297,13 +1284,7 @@ impl DynamicRayCastVehicleController {
         self.axle.resize(num_wheels, Default::default());
         let mut contacts = vec![WheelContactState::default(); num_wheels];
 
-        let (
-            esc_engine_cut,
-            esc_brake_strength,
-            esc_brake_side,
-            esc_side_axis,
-            chassis_forward,
-        ) = {
+        let (esc_engine_cut, esc_brake_strength, esc_brake_side, esc_side_axis, chassis_forward) = {
             let chassis = &bodies[self.chassis];
             let (engine_cut, brake_strength, brake_side) = self.esc_intervention(chassis);
             (
@@ -1335,10 +1316,10 @@ impl DynamicRayCastVehicleController {
             };
 
             let contact_normal = wheel.raycast_info.contact_normal_ws;
-            let axle = wheel.wheel_axle_ws - contact_normal * wheel.wheel_axle_ws.dot(&contact_normal);
+            let axle =
+                wheel.wheel_axle_ws - contact_normal * wheel.wheel_axle_ws.dot(&contact_normal);
             let side_dir = axle.try_normalize(1.0e-5).unwrap_or_else(Vector::zeros);
-            let forward_dir =
-                aligned_wheel_forward(&contact_normal, &side_dir, &chassis_forward);
+            let forward_dir = aligned_wheel_forward(&contact_normal, &side_dir, &chassis_forward);
             let contact_velocity = relative_velocity_at_contact(
                 bodies,
                 colliders,
@@ -1552,8 +1533,11 @@ impl DynamicRayCastVehicleController {
                 if wheel.side_impulse != 0.0 {
                     let side_impulse = self.axle[wheel_id] * wheel.side_impulse;
 
-                    let v_chassis_world_up = chassis.position().rotation * Vector::ith(self.index_up_axis, 1.0);
-                    impulse_point -= v_chassis_world_up * (v_chassis_world_up.dot(&(impulse_point - chassis.center_of_mass())) * wheel.anti_roll);
+                    let v_chassis_world_up =
+                        chassis.position().rotation * Vector::ith(self.index_up_axis, 1.0);
+                    impulse_point -= v_chassis_world_up
+                        * (v_chassis_world_up.dot(&(impulse_point - chassis.center_of_mass()))
+                            * wheel.anti_roll);
 
                     chassis.apply_impulse_at_point(side_impulse, impulse_point, false);
 
@@ -1604,10 +1588,8 @@ mod tests {
     fn steering_assist_does_not_countersteer_in_reverse() {
         let mut config = VehicleControllerConfig::default();
         config.steering.assist = true;
-        let mut controller = DynamicRayCastVehicleController::new(
-            RigidBodyHandle::invalid(),
-            config,
-        );
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
         controller.index_forward_axis = 2;
         controller.index_up_axis = 1;
         controller.current_vehicle_speed = -10.0;
@@ -1625,10 +1607,8 @@ mod tests {
     fn steering_assist_stays_inactive_below_the_drift_threshold() {
         let mut config = VehicleControllerConfig::default();
         config.steering.assist = true;
-        let mut controller = DynamicRayCastVehicleController::new(
-            RigidBodyHandle::invalid(),
-            config,
-        );
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
         controller.index_forward_axis = 2;
         controller.index_up_axis = 1;
         controller.current_vehicle_speed = 10.0;
@@ -1658,10 +1638,8 @@ mod tests {
     fn steering_assist_smoothly_approaches_matching_correction() {
         let mut config = VehicleControllerConfig::default();
         config.steering.assist = true;
-        let mut controller = DynamicRayCastVehicleController::new(
-            RigidBodyHandle::invalid(),
-            config,
-        );
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
         controller.index_forward_axis = 2;
         controller.index_up_axis = 1;
         controller.current_vehicle_speed = 10.0;
@@ -1699,10 +1677,8 @@ mod tests {
             let mut config = VehicleControllerConfig::default();
             config.steering.assist = true;
             config.steering.drift_correction = strength;
-            let mut controller = DynamicRayCastVehicleController::new(
-                RigidBodyHandle::invalid(),
-                config,
-            );
+            let mut controller =
+                DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
             controller.index_forward_axis = 2;
             controller.index_up_axis = 1;
             controller.current_vehicle_speed = 10.0;
@@ -1738,8 +1714,7 @@ mod tests {
 
         assert!((full.state().steering_angle - correction_angle).abs() < 1.0e-4);
         assert!(
-            (half.state().steering_angle - (player_angle + correction_angle) * 0.5).abs()
-                < 1.0e-4
+            (half.state().steering_angle - (player_angle + correction_angle) * 0.5).abs() < 1.0e-4
         );
     }
 
@@ -1747,10 +1722,8 @@ mod tests {
     fn steering_assist_ignores_zero_or_opposite_user_input() {
         let mut config = VehicleControllerConfig::default();
         config.steering.assist = true;
-        let mut controller = DynamicRayCastVehicleController::new(
-            RigidBodyHandle::invalid(),
-            config,
-        );
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
         controller.index_forward_axis = 2;
         controller.index_up_axis = 1;
         controller.current_vehicle_speed = 10.0;
@@ -1781,10 +1754,8 @@ mod tests {
     fn opposite_input_releases_drift_correction_immediately() {
         let mut config = VehicleControllerConfig::default();
         config.steering.assist = true;
-        let mut controller = DynamicRayCastVehicleController::new(
-            RigidBodyHandle::invalid(),
-            config,
-        );
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
         controller.index_forward_axis = 2;
         controller.index_up_axis = 1;
         controller.current_vehicle_speed = 10.0;
@@ -1821,10 +1792,8 @@ mod tests {
     fn drift_end_smoothly_releases_the_assist_offset() {
         let mut config = VehicleControllerConfig::default();
         config.steering.assist = true;
-        let mut controller = DynamicRayCastVehicleController::new(
-            RigidBodyHandle::invalid(),
-            config,
-        );
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
         controller.index_forward_axis = 2;
         controller.index_up_axis = 1;
         controller.current_vehicle_speed = 10.0;
@@ -1865,10 +1834,8 @@ mod tests {
     fn released_input_smoothly_returns_assisted_steering_to_zero() {
         let mut config = VehicleControllerConfig::default();
         config.steering.assist = true;
-        let mut controller = DynamicRayCastVehicleController::new(
-            RigidBodyHandle::invalid(),
-            config,
-        );
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
         controller.index_forward_axis = 2;
         controller.index_up_axis = 1;
         controller.current_vehicle_speed = 10.0;
@@ -2051,7 +2018,12 @@ fn resolve_ground_impulse(
     }
 }
 
-fn resolve_single_unilateral(body1: &RigidBody, pt1: &Point<Real>, normal: &Vector<Real>, contact_damping: Real,) -> Real {
+fn resolve_single_unilateral(
+    body1: &RigidBody,
+    pt1: &Point<Real>,
+    normal: &Vector<Real>,
+    contact_damping: Real,
+) -> Real {
     let vel1 = body1.velocity_at_point(pt1);
     let dvel = vel1;
     let dpt1 = pt1 - body1.center_of_mass();
@@ -2091,7 +2063,8 @@ impl TireType {
 
     /// Adds a surface material and its friction coefficient
     pub fn add_surface(&mut self, surface_name: &str, friction: Real) {
-        self.surface_friction.insert(surface_name.to_string(), friction);
+        self.surface_friction
+            .insert(surface_name.to_string(), friction);
     }
 
     /// Gets the friction coefficient for a given surface material

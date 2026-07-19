@@ -121,11 +121,11 @@ bitflags::bitflags! {
     #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
     /// Flags affecting the behavior of the constraints solver for a given contact manifold.
     pub struct ActiveHooks: u32 {
-        /// If set, Rapier will call `PhysicsHooks::filter_contact_pair` whenever relevant.
+        /// If set, VectorG Engine will call `PhysicsHooks::filter_contact_pair` whenever relevant.
         const FILTER_CONTACT_PAIRS = 0b0001;
-        /// If set, Rapier will call `PhysicsHooks::filter_intersection_pair` whenever relevant.
+        /// If set, VectorG Engine will call `PhysicsHooks::filter_intersection_pair` whenever relevant.
         const FILTER_INTERSECTION_PAIR = 0b0010;
-        /// If set, Rapier will call `PhysicsHooks::modify_solver_contact` whenever relevant.
+        /// If set, VectorG Engine will call `PhysicsHooks::modify_solver_contact` whenever relevant.
         const MODIFY_SOLVER_CONTACTS = 0b0100;
     }
 }

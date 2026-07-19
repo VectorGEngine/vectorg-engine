@@ -1,5 +1,5 @@
-use rapier2d::prelude::*;
-use rapier_testbed2d::Testbed;
+use vectorg_engine_2d::prelude::*;
+use vectorg_engine_testbed_2d::Testbed;
 
 struct OneWayPlatformHook {
     platform1: ColliderHandle,

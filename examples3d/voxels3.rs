@@ -1,11 +1,11 @@
 use obj::raw::object::Polygon;
-use rapier3d::parry::bounding_volume;
-use rapier3d::parry::transformation::voxelization::FillMode;
-use rapier3d::prelude::*;
-use rapier_testbed3d::KeyCode;
-use rapier_testbed3d::Testbed;
 use std::fs::File;
 use std::io::BufReader;
+use vectorg_engine::parry::bounding_volume;
+use vectorg_engine::parry::transformation::voxelization::FillMode;
+use vectorg_engine::prelude::*;
+use vectorg_engine_testbed_3d::KeyCode;
+use vectorg_engine_testbed_3d::Testbed;
 
 pub fn init_world(testbed: &mut Testbed) {
     /*

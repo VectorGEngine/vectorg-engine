@@ -1,0 +1,33 @@
+[package]
+name = "vectorg-engine-meshloader"
+version = "0.7.0"
+authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
+description = "Mesh loader for VectorG Engine."
+documentation = "https://docs.rs/vectorg-engine-meshloader"
+homepage = "https://github.com/VectorGEngine/vectorg-engine"
+repository = "https://github.com/VectorGEngine/vectorg-engine"
+readme = "README.md"
+categories = [
+    "science",
+    "game-development",
+    "mathematics",
+    "simulation",
+    "wasm",
+]
+keywords = ["physics", "joints", "multibody", "robotics", "urdf"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.82"
+
+[features]
+default = ["stl", "collada", "wavefront"]
+stl = ["mesh-loader/stl"]
+collada = ["mesh-loader/collada"]
+wavefront = ["mesh-loader/obj"]
+
+[dependencies]
+thiserror = "2"
+profiling = "1.0"
+mesh-loader = "0.1.12"
+
+vectorg-engine = { version = "0.26", path = "../vectorg-engine" }

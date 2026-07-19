@@ -15,7 +15,7 @@ mod solver_counters;
 mod stages_counters;
 mod timer;
 
-/// Aggregation of all the performances counters tracked by rapier.
+/// Aggregation of all the performances counters tracked by VectorG Engine.
 #[derive(Clone, Copy)]
 pub struct Counters {
     /// Whether this counter is enabled or not.

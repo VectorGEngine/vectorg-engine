@@ -1,5 +1,5 @@
-use rapier3d::prelude::*;
-use rapier_testbed3d::Testbed;
+use vectorg_engine::prelude::*;
+use vectorg_engine_testbed_3d::Testbed;
 
 fn create_ball_articulations(
     bodies: &mut RigidBodySet,

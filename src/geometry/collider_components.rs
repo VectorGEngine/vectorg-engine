@@ -257,8 +257,6 @@ where
     }
 }
 
-
-
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 /// The constraints solver-related properties of this collider (friction, restitution, etc.)

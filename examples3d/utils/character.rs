@@ -1,8 +1,8 @@
-use rapier3d::{
+use vectorg_engine::{
     control::{CharacterLength, KinematicCharacterController, PidController},
     prelude::*,
 };
-use rapier_testbed3d::{
+use vectorg_engine_testbed_3d::{
     ui::egui::{Align2, ComboBox, Slider, Ui, Window},
     KeyCode, PhysicsState, TestbedGraphics,
 };

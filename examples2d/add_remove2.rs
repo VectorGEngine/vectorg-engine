@@ -1,5 +1,5 @@
-use rapier2d::{na::UnitComplex, prelude::*};
-use rapier_testbed2d::Testbed;
+use vectorg_engine_2d::{na::UnitComplex, prelude::*};
+use vectorg_engine_testbed_2d::Testbed;
 
 pub fn init_world(testbed: &mut Testbed) {
     let mut bodies = RigidBodySet::new();

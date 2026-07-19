@@ -962,7 +962,7 @@ pub struct RigidBodyIds {
 /// The set of colliders attached to this rigid-bodies.
 ///
 /// This should not be modified manually unless you really know what
-/// you are doing (for example if you are trying to integrate Rapier
+/// you are doing (for example if you are trying to integrate VectorG Engine
 /// to a game engine using its component-based interface).
 pub struct RigidBodyColliders(pub Vec<ColliderHandle>);
 

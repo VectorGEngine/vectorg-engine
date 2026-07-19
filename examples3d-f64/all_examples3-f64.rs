@@ -2,11 +2,11 @@
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
-extern crate rapier3d_f64 as rapier3d;
-extern crate rapier_testbed3d_f64 as rapier_testbed3d;
+extern crate vectorg_engine_f64 as vectorg_engine;
+extern crate vectorg_engine_testbed_3d_f64 as vectorg_engine_testbed_3d;
 
-use rapier_testbed3d::{Testbed, TestbedApp};
 use std::cmp::Ordering;
+use vectorg_engine_testbed_3d::{Testbed, TestbedApp};
 
 mod debug_serialized3;
 

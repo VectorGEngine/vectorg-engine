@@ -3,8 +3,8 @@
 use crate::harness::Harness;
 use bevy::gizmos::gizmos::Gizmos;
 use bevy::prelude::*;
-use rapier::math::{Point, Real};
-use rapier::pipeline::{
+use engine::math::{Point, Real};
+use engine::pipeline::{
     DebugColor, DebugRenderBackend, DebugRenderMode, DebugRenderObject, DebugRenderPipeline,
 };
 
@@ -15,9 +15,9 @@ pub struct DebugRenderPipelineResource {
 }
 
 #[derive(Default)]
-pub struct RapierDebugRenderPlugin {}
+pub struct VectorGEngineDebugRenderPlugin {}
 
-impl Plugin for RapierDebugRenderPlugin {
+impl Plugin for VectorGEngineDebugRenderPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(DebugRenderPipelineResource {
             pipeline: DebugRenderPipeline::new(

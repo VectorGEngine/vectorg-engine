@@ -56,7 +56,7 @@
 
 ### Fix
 
-- The broad-phase region key has been replaced by an i64 in the f64 version of rapier, increasing the range before
+- The broad-phase region key has been replaced by an i64 in the f64 version of VectorG Engine, increasing the range before
   panics occur.
 - Fix `BroadphaseMultiSap` not being able to serialize correctly with serde_json.
 - Fix `KinematicCharacterController::move_shape` not respecting parameters `max_slope_climb_angle` and
@@ -101,7 +101,7 @@
 - Update parry to v0.17. Refer to [its changelog](https://github.com/dimforge/parry/blob/master/CHANGELOG.md#v0170) for
   further details.
 - Divided by two the value of each `QueryFilterFlags` variant so that
-  the smallest one is 1 instead of 2 (fixes a bug in rapier.js).
+  the smallest one is 1 instead of 2 (fixes a bug in VectorG Engine JS).
 - `BroadphaseMultiSap` now serializes its `colliders_proxy_ids` as `Vec[(ColliderHandle, BroadPhaseProxyIndex)]`.
 
 ## v0.21.0 (23 June 2024)
@@ -121,9 +121,9 @@
 
 This release introduces two new crates:
 
-- `rapier3d-urdf` for loading URDF files into rapier3d. This will load the rigid-bodies,
+- `vectorg-engine-urdf` for loading URDF files into vectorg-engine. This will load the rigid-bodies,
   colliders, and joints.
-- `rapier3d-stl` for loading an STL file as a collision shape.
+- `vectorg-engine-stl` for loading an STL file as a collision shape.
 
 ### Added
 
@@ -220,7 +220,7 @@ changes, see [#625](https://github.com/dimforge/rapier/pull/625).**
 additional details.**
 
 - Renamed `BroadPhase` to `BroadPhaseMultiSap`. The `BroadPhase` is now a trait that can be
-  implemented for providing a custom broad-phase to rapier. Equivalently, the `DefaultBroadPhase` type
+  implemented for providing a custom broad-phase to VectorG Engine. Equivalently, the `DefaultBroadPhase` type
   alias can be used in place of `BroadPhaseMultiSap`.
 - The kinematic character controller autostepping is now disabled by default.
 - Add `KinematicCharacterController::normal_nudge_factor` used to help getting the character unstuck
@@ -544,8 +544,8 @@ reflected by an API change. See [#304](https://github.com/dimforge/rapier/pull/3
 
 ## v0.11.0
 
-Check out the user-guide for the JS/Typescript bindings for rapier. It has been fully rewritten and is now exhaustive!
-Check it out on [rapier.rs](https://www.rapier.rs/docs/user_guides/javascript/getting_started_js)
+Check out the user-guide for the JS/Typescript bindings for VectorG Engine. It has been fully rewritten and is now exhaustive!
+See the VectorG Engine JS repository documentation
 
 ### Added
 
@@ -557,7 +557,7 @@ Check it out on [rapier.rs](https://www.rapier.rs/docs/user_guides/javascript/ge
 
 ### Fixed
 
-- Fix the build of Rapier when targeting emscripten.
+- Fix the build of VectorG Engine when targeting emscripten.
 
 ## v0.10.1
 
@@ -584,7 +584,7 @@ Check it out on [rapier.rs](https://www.rapier.rs/docs/user_guides/javascript/ge
 ### Added
 
 - Make the method JointSet::remove_joints_attached_to_rigid_body public so that it can can be called externally for
-  letting component-based Rapier integration call it to cleanup joints after a rigid-body removal.
+  letting component-based VectorG Engine integration call it to cleanup joints after a rigid-body removal.
 
 ### Fixed
 
@@ -594,16 +594,16 @@ Check it out on [rapier.rs](https://www.rapier.rs/docs/user_guides/javascript/ge
 
 ### Added
 
-- Add `rapier::prelude::nalgebra` so that the `vector!` and `point!` macros work out-of-the-box after importing
-  the prelude: `use rapier::prelude::*`
+- Add `vectorg_engine::prelude::nalgebra` so that the `vector!` and `point!` macros work out-of-the-box after importing
+  the prelude: `use vectorg_engine::prelude::*`
 
 ## v0.9.0
 
-The user-guide has been fully rewritten and is now exhaustive! Check it out on [rapier.rs](https://rapier.rs/)
+The user-guide has been fully rewritten and is now exhaustive! See the VectorG Engine repository documentation
 
 ### Added
 
-- A prelude has been added in order to simplify the most common imports. For example: `use rapier3d::prelude::*`
+- A prelude has been added in order to simplify the most common imports. For example: `use vectorg-engine::prelude::*`
 - Add `RigidBody::set_translation` and `RigidBody.translation()`.
 - Add `RigidBody::set_rotation` and `RigidBody.rotation()`.
 - Add `RigidBody::set_next_translation` for setting the next translation of a position-based kinematic body.
@@ -617,7 +617,7 @@ The user-guide has been fully rewritten and is now exhaustive! Check it out on [
 ### Modified
 
 The use of `RigidBodySet, ColliderSet, RigidBody, Collider` is no longer mandatory. Rigid-bodies and colliders have
-been split into multiple components that can be stored in a user-defined set. This is useful for integrating Rapier
+been split into multiple components that can be stored in a user-defined set. This is useful for integrating VectorG Engine
 with other engines (for example this allows us to use Bevy's Query as our rigid-body/collider sets).
 
 The `RigidBodySet, ColliderSet, RigidBody, Collider` are still the best option for whoever doesn't want to
@@ -779,12 +779,12 @@ Added the methods:
 ## v0.5.0
 
 In this release we are dropping `ncollide` and use our new crate [`parry`](https://parry.rs)
-instead! This comes with a lot of new features, as well as two new crates: `rapier2d-f64` and
-`rapier3d-f64` for physics simulation with 64-bits floats.
+instead! This comes with a lot of new features, as well as two new crates: `vectorg-engine-2d-f64` and
+`vectorg-engine-f64` for physics simulation with 64-bits floats.
 
 ### Added
 
-- Added a `RAPIER.version()` function at the root of the package to retrieve the version of Rapier
+- Added a `RAPIER.version()` function at the root of the package to retrieve the version of VectorG Engine
   as a string.
 
 Several geometric queries have been added to the `QueryPipeline`:
@@ -833,7 +833,7 @@ Breaking changes related to contacts:
 
 - The way contacts are represented changed. Refer to the documentation
   of `parry::query::ContactManifold`, `parry::query::TrackedContact`
-  and `rapier::geometry::ContactManifoldData` and `rapier::geometry::ContactData` for details.
+  and `vectorg_engine::geometry::ContactManifoldData` and `vectorg_engine::geometry::ContactData` for details.
 
 Breaking changes related to rigid-bodies:
 

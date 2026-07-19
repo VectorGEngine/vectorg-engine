@@ -5,7 +5,7 @@ use parry::math::Real;
 /// An internal index stored in colliders by some broad-phase algorithms.
 pub type BroadPhaseProxyIndex = u32;
 
-/// Trait implemented by broad-phase algorithms supported by Rapier.
+/// Trait implemented by broad-phase algorithms supported by VectorG Engine.
 ///
 /// The task of a broad-phase algorithm is to detect potential collision pairs, usually based on
 /// bounding volumes. The pairs must be conservative: it is OK to create a collision pair if

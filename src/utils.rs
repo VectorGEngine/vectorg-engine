@@ -15,7 +15,7 @@ use {
     num::One,
 };
 
-/// The trait for real numbers used by Rapier.
+/// The trait for real numbers used by VectorG Engine.
 ///
 /// This includes `f32`, `f64` and their related SIMD types.
 pub trait SimdRealCopy: SimdRealField<Element = Real> + Copy {}

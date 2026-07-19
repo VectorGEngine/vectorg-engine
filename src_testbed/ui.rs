@@ -1,11 +1,11 @@
-use rapier::counters::Counters;
-use rapier::math::Real;
+use engine::counters::Counters;
+use engine::math::Real;
 use std::num::NonZeroUsize;
 
 use crate::debug_render::DebugRenderPipelineResource;
 use crate::harness::Harness;
 use crate::testbed::{
-    RapierSolverType, RunMode, TestbedActionFlags, TestbedState, TestbedStateFlags,
+    RunMode, TestbedActionFlags, TestbedState, TestbedStateFlags, VectorGEngineSolverType,
     PHYSX_BACKEND_PATCH_FRICTION, PHYSX_BACKEND_TWO_FRICTION_DIR,
 };
 
@@ -15,7 +15,7 @@ use crate::settings::SettingValue;
 use crate::PhysicsState;
 use bevy_egui::egui::{ComboBox, Slider, Ui, Window};
 use bevy_egui::EguiContexts;
-use rapier::dynamics::IntegrationParameters;
+use engine::dynamics::IntegrationParameters;
 use web_time::Instant;
 
 pub(crate) fn update_ui(
@@ -124,9 +124,9 @@ pub(crate) fn update_ui(
                 .selected_text(format!("{:?}", state.solver_type))
                 .show_ui(ui, |ui| {
                     let solver_types = [
-                        RapierSolverType::TgsSoft,
-                        RapierSolverType::TgsSoftNoWarmstart,
-                        RapierSolverType::PgsLegacy,
+                        VectorGEngineSolverType::TgsSoft,
+                        VectorGEngineSolverType::TgsSoftNoWarmstart,
+                        VectorGEngineSolverType::PgsLegacy,
                     ];
                     for sty in solver_types {
                         changed = ui
@@ -138,14 +138,14 @@ pub(crate) fn update_ui(
 
             if changed {
                 match state.solver_type {
-                    RapierSolverType::TgsSoft => {
+                    VectorGEngineSolverType::TgsSoft => {
                         *integration_parameters = IntegrationParameters::tgs_soft();
                     }
-                    RapierSolverType::TgsSoftNoWarmstart => {
+                    VectorGEngineSolverType::TgsSoftNoWarmstart => {
                         *integration_parameters =
                             IntegrationParameters::tgs_soft_without_warmstart();
                     }
-                    RapierSolverType::PgsLegacy => {
+                    VectorGEngineSolverType::PgsLegacy => {
                         *integration_parameters = IntegrationParameters::pgs_legacy();
                     }
                 }
@@ -504,7 +504,7 @@ fn profiler_ui(ui_context: &mut EguiContexts) {
             set_default_rapier_filter();
         });
         window.show(ui_context.ctx_mut(), |ui| {
-            if ui.button("🔍 Rapier filter").clicked() {
+            if ui.button("🔍 VectorG Engine filter").clicked() {
                 set_default_rapier_filter();
             }
             puffin_egui::profiler_ui(ui);

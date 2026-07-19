@@ -1,5 +1,5 @@
-use rapier2d::prelude::*;
-use rapier_testbed2d::Testbed;
+use vectorg_engine_2d::prelude::*;
+use vectorg_engine_testbed_2d::Testbed;
 
 pub fn init_world(testbed: &mut Testbed) {
     /*
@@ -37,9 +37,9 @@ pub fn init_world(testbed: &mut Testbed) {
     /*
      * Create the trimeshes from a tessellated SVG.
      */
-    let rapier_logo_buffers = crate::utils::svg::rapier_logo();
+    let vectorg_engine_logo_buffers = crate::utils::svg::vectorg_engine_logo();
 
-    for (ith, (vtx, idx)) in rapier_logo_buffers.into_iter().enumerate() {
+    for (ith, (vtx, idx)) in vectorg_engine_logo_buffers.into_iter().enumerate() {
         for k in 0..5 {
             let collider = ColliderBuilder::trimesh(vtx.clone(), idx.clone())
                 .unwrap()

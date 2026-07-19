@@ -1,16 +1,17 @@
 [package]
-name = "rapier-examples-3d"
+name = "vectorg-engine-examples-3d"
 version = "0.1.0"
 authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
 edition = "2021"
+rust-version = "1.82"
 default-run = "all_examples3"
 
 [features]
-parallel = ["rapier3d/parallel", "rapier_testbed3d/parallel"]
-simd-stable = ["rapier3d/simd-stable"]
-simd-nightly = ["rapier3d/simd-nightly"]
-other-backends = ["rapier_testbed3d/other-backends"]
-enhanced-determinism = ["rapier3d/enhanced-determinism"]
+parallel = ["vectorg-engine/parallel", "vectorg-engine-testbed-3d/parallel"]
+simd-stable = ["vectorg-engine/simd-stable"]
+simd-nightly = ["vectorg-engine/simd-nightly"]
+other-backends = ["vectorg-engine-testbed-3d/other-backends"]
+enhanced-determinism = ["vectorg-engine/enhanced-determinism"]
 
 [dependencies]
 rand = "0.8"
@@ -22,15 +23,15 @@ bincode = "1"
 serde_json = "1"
 dot_vox = "5"
 
-[dependencies.rapier_testbed3d]
-path = "../crates/rapier_testbed3d"
+[dependencies.vectorg-engine-testbed-3d]
+path = "../crates/vectorg-engine-testbed-3d"
 features = ["profiler_ui"]
 
-[dependencies.rapier3d]
-path = "../crates/rapier3d"
+[dependencies.vectorg-engine]
+path = "../crates/vectorg-engine"
 
-[dependencies.rapier3d-urdf]
-path = "../crates/rapier3d-urdf"
+[dependencies.vectorg-engine-urdf]
+path = "../crates/vectorg-engine-urdf"
 features = ["stl"]
 
 [[bin]]

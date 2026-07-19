@@ -1,20 +1,20 @@
 [workspace]
 members = [
-    "crates/rapier2d",
-    "crates/rapier2d-f64",
-    "crates/rapier_testbed2d",
-    "crates/rapier_testbed2d-f64",
+    "crates/vectorg-engine-2d",
+    "crates/vectorg-engine-2d-f64",
+    "crates/vectorg-engine-testbed-2d",
+    "crates/vectorg-engine-testbed-2d-f64",
     "examples2d",
     "benchmarks2d",
-    "crates/rapier3d",
-    "crates/rapier3d-f64",
-    "crates/rapier_testbed3d",
-    "crates/rapier_testbed3d-f64",
+    "crates/vectorg-engine",
+    "crates/vectorg-engine-f64",
+    "crates/vectorg-engine-testbed-3d",
+    "crates/vectorg-engine-testbed-3d-f64",
     "examples3d",
     "examples3d-f64",
     "benchmarks3d",
-    "crates/rapier3d-urdf",
-    "crates/rapier3d-meshloader",
+    "crates/vectorg-engine-urdf",
+    "crates/vectorg-engine-meshloader",
 ]
 resolver = "2"
 
@@ -60,7 +60,7 @@ puffin_egui = { git = "https://github.com/tedsteen/puffin.git", rev = "11771ebe0
 opt-level = 1
 
 
-#[profile.dev.package.rapier3d]
+#[profile.dev.package.vectorg-engine]
 #opt-level = 3
 #
 #[profile.dev.package.kiss3d]

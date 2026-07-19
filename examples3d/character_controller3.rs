@@ -1,9 +1,9 @@
 use crate::utils::character::{self, CharacterControlMode};
-use rapier3d::{
+use vectorg_engine::{
     control::{KinematicCharacterController, PidController},
     prelude::*,
 };
-use rapier_testbed3d::Testbed;
+use vectorg_engine_testbed_3d::Testbed;
 
 pub fn init_world(testbed: &mut Testbed) {
     /*

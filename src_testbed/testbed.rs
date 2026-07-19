@@ -6,7 +6,7 @@ use std::env;
 use std::mem;
 use std::num::NonZeroUsize;
 
-use crate::debug_render::{DebugRenderPipelineResource, RapierDebugRenderPlugin};
+use crate::debug_render::{DebugRenderPipelineResource, VectorGEngineDebugRenderPlugin};
 use crate::graphics::BevyMaterialComponent;
 use crate::mouse::{self, track_mouse_state, MainCamera, SceneMouse};
 use crate::physics::{DeserializedPhysicsSnapshot, PhysicsEvents, PhysicsSnapshot, PhysicsState};
@@ -17,21 +17,21 @@ use crate::ui;
 use crate::{graphics::GraphicsManager, harness::RunState};
 use bevy::window::PrimaryWindow;
 
-use na::{self, Point2, Point3, Vector3};
-use rapier::dynamics::{
+use engine::dynamics::{
     ImpulseJointSet, IntegrationParameters, MultibodyJointSet, RigidBodyActivation,
     RigidBodyHandle, RigidBodySet,
 };
 #[cfg(feature = "dim3")]
-use rapier::geometry::Ray;
-use rapier::geometry::{ColliderHandle, ColliderSet, NarrowPhase};
-use rapier::math::{Real, Vector};
-use rapier::pipeline::{PhysicsHooks, QueryPipeline};
+use engine::geometry::Ray;
+use engine::geometry::{ColliderHandle, ColliderSet, NarrowPhase};
+use engine::math::{Real, Vector};
+use engine::pipeline::{PhysicsHooks, QueryPipeline};
 #[cfg(feature = "dim3")]
-use rapier::{
+use engine::{
     control::{DynamicRayCastVehicleController, VehicleInput},
     prelude::QueryFilter,
 };
+use na::{self, Point2, Point3, Vector3};
 
 #[cfg(all(feature = "dim2", feature = "other-backends"))]
 use crate::box2d_backend::Box2dWorld;
@@ -105,7 +105,7 @@ bitflags::bitflags! {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum RapierSolverType {
+pub enum VectorGEngineSolverType {
     #[default]
     TgsSoft,
     TgsSoftNoWarmstart,
@@ -134,7 +134,7 @@ pub struct TestbedState {
     pub selected_example: usize,
     pub selected_backend: usize,
     pub example_settings: ExampleSettings,
-    pub solver_type: RapierSolverType,
+    pub solver_type: VectorGEngineSolverType,
     pub physx_use_two_friction_directions: bool,
     pub snapshot: Option<PhysicsSnapshot>,
     pub nsteps: usize,
@@ -221,7 +221,7 @@ impl TestbedApp {
         let flags = TestbedStateFlags::default();
 
         #[allow(unused_mut)]
-        let mut backend_names = vec!["rapier"];
+        let mut backend_names = vec!["vectorg-engine"];
         #[cfg(all(feature = "dim2", feature = "other-backends"))]
         backend_names.push("box2d");
         #[cfg(all(feature = "dim3", feature = "other-backends"))]
@@ -249,7 +249,7 @@ impl TestbedApp {
             example_settings: ExampleSettings::default(),
             selected_example: 0,
             selected_backend: RAPIER_BACKEND,
-            solver_type: RapierSolverType::default(),
+            solver_type: VectorGEngineSolverType::default(),
             physx_use_two_friction_directions: true,
             nsteps: 1,
             camera_locked: false,
@@ -464,9 +464,9 @@ impl TestbedApp {
             }
         } else {
             let title = if cfg!(feature = "dim2") {
-                "Rapier: 2D demos".to_string()
+                "VectorG Engine: 2D demos".to_string()
             } else {
-                "Rapier: 3D demos".to_string()
+                "VectorG Engine: 3D demos".to_string()
             };
 
             let window_plugin = WindowPlugin {
@@ -487,7 +487,7 @@ impl TestbedApp {
                 .add_plugins(DefaultPlugins.set(window_plugin))
                 .add_plugins(OrbitCameraPlugin)
                 .add_plugins(WireframePlugin)
-                .add_plugins(RapierDebugRenderPlugin::default())
+                .add_plugins(VectorGEngineDebugRenderPlugin::default())
                 .add_plugins(bevy_egui::EguiPlugin);
 
             #[cfg(target_arch = "wasm32")]
@@ -953,8 +953,8 @@ impl Testbed<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_> {
     //
     // #[cfg(feature = "dim3")]
     // fn handle_special_event(&mut self) {
-    //     use rapier::dynamics::RigidBodyBuilder;
-    //     use rapier::geometry::ColliderBuilder;
+    //     use engine::dynamics::RigidBodyBuilder;
+    //     use engine::geometry::ColliderBuilder;
     //
     //     if window.is_conrod_ui_capturing_mouse() {
     //         return;
@@ -987,7 +987,7 @@ impl Testbed<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_> {
 }
 
 fn draw_contacts(_nf: &NarrowPhase, _colliders: &ColliderSet) {
-    // use rapier::math::Isometry;
+    // use engine::math::Isometry;
     //
     // for pair in nf.contact_pairs() {
     //     for manifold in &pair.manifolds {

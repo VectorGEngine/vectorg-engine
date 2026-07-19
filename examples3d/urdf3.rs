@@ -1,6 +1,6 @@
-use rapier3d::prelude::*;
-use rapier3d_urdf::{UrdfLoaderOptions, UrdfMultibodyOptions, UrdfRobot};
-use rapier_testbed3d::Testbed;
+use vectorg_engine::prelude::*;
+use vectorg_engine_testbed_3d::Testbed;
+use vectorg_engine_urdf::{UrdfLoaderOptions, UrdfMultibodyOptions, UrdfRobot};
 
 pub fn init_world(testbed: &mut Testbed) {
     /*

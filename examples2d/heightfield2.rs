@@ -1,6 +1,6 @@
-use rapier2d::na::DVector;
-use rapier2d::prelude::*;
-use rapier_testbed2d::Testbed;
+use vectorg_engine_2d::na::DVector;
+use vectorg_engine_2d::prelude::*;
+use vectorg_engine_testbed_2d::Testbed;
 
 pub fn init_world(testbed: &mut Testbed) {
     /*

@@ -1,13 +1,13 @@
 use crossbeam::channel::Receiver;
-use rapier::dynamics::{
+use engine::dynamics::{
     CCDSolver, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet,
     RigidBodySet,
 };
-use rapier::geometry::{
+use engine::geometry::{
     ColliderSet, CollisionEvent, ContactForceEvent, DefaultBroadPhase, NarrowPhase,
 };
-use rapier::math::{Real, Vector};
-use rapier::pipeline::{PhysicsHooks, PhysicsPipeline, QueryPipeline};
+use engine::math::{Real, Vector};
+use engine::pipeline::{PhysicsHooks, PhysicsPipeline, QueryPipeline};
 
 pub struct PhysicsSnapshot {
     timestep_id: usize,

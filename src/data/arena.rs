@@ -39,7 +39,7 @@ enum Entry<T> {
 /// # Examples
 ///
 /// ```ignore
-/// use rapier::data::arena::Arena;
+/// use vectorg_engine::data::arena::Arena;
 ///
 /// let mut arena = Arena::new();
 /// let idx = arena.insert(123);
@@ -106,7 +106,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::<usize>::new();
     /// # let _ = arena;
@@ -122,7 +122,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::with_capacity(10);
     ///
@@ -151,7 +151,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::with_capacity(1);
     /// arena.insert(42);
@@ -189,7 +189,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     ///
@@ -230,7 +230,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::{Arena, Index};
+    /// use vectorg_engine::data::arena::{Arena, Index};
     ///
     /// let mut arena = Arena::new();
     ///
@@ -284,7 +284,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     ///
@@ -307,7 +307,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::{Arena, Index};
+    /// use vectorg_engine::data::arena::{Arena, Index};
     ///
     /// let mut arena = Arena::new();
     ///
@@ -349,7 +349,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     /// let idx = arena.insert(42);
@@ -393,7 +393,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut crew = Arena::new();
     /// crew.extend(&["Jim Hawkins", "John Silver", "Alexander Smollett", "Israel Hands"]);
@@ -434,7 +434,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     /// let idx = arena.insert(42);
@@ -455,7 +455,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     /// let idx = arena.insert(42);
@@ -481,7 +481,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     /// let idx = arena.insert(42);
@@ -512,7 +512,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     /// let idx1 = arena.insert(0);
@@ -577,7 +577,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     /// assert_eq!(arena.len(), 0);
@@ -600,7 +600,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     /// assert!(arena.is_empty());
@@ -624,7 +624,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::with_capacity(10);
     /// assert_eq!(arena.capacity(), 10);
@@ -652,7 +652,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::with_capacity(10);
     /// arena.reserve(5);
@@ -687,7 +687,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     /// for i in 0..10 {
@@ -714,7 +714,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     /// for i in 0..10 {
@@ -743,7 +743,7 @@ impl<T> Arena<T> {
     /// # Examples
     ///
     /// ```ignore
-    /// use rapier::data::arena::Arena;
+    /// use vectorg_engine::data::arena::Arena;
     ///
     /// let mut arena = Arena::new();
     /// let idx_1 = arena.insert("hello");
@@ -830,7 +830,7 @@ impl<T> IntoIterator for Arena<T> {
 /// # Examples
 ///
 /// ```ignore
-/// use rapier::data::arena::Arena;
+/// use vectorg_engine::data::arena::Arena;
 ///
 /// let mut arena = Arena::new();
 /// for i in 0..10 {
@@ -914,7 +914,7 @@ impl<'a, T> IntoIterator for &'a Arena<T> {
 /// # Examples
 ///
 /// ```ignore
-/// use rapier::data::arena::Arena;
+/// use vectorg_engine::data::arena::Arena;
 ///
 /// let mut arena = Arena::new();
 /// for i in 0..10 {
@@ -1018,7 +1018,7 @@ impl<'a, T> IntoIterator for &'a mut Arena<T> {
 /// # Examples
 ///
 /// ```ignore
-/// use rapier::data::arena::Arena;
+/// use vectorg_engine::data::arena::Arena;
 ///
 /// let mut arena = Arena::new();
 /// for i in 0..10 {
@@ -1116,7 +1116,7 @@ impl<T> FusedIterator for IterMut<'_, T> {}
 /// # Examples
 ///
 /// ```ignore
-/// use rapier::data::arena::Arena;
+/// use vectorg_engine::data::arena::Arena;
 ///
 /// let mut arena = Arena::new();
 /// let idx_1 = arena.insert("hello");

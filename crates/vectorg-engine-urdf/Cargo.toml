@@ -1,0 +1,36 @@
+[package]
+name = "vectorg-engine-urdf"
+version = "0.7.0"
+authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
+description = "URDF loader for VectorG Engine."
+documentation = "https://docs.rs/vectorg-engine-urdf"
+homepage = "https://github.com/VectorGEngine/vectorg-engine"
+repository = "https://github.com/VectorGEngine/vectorg-engine"
+readme = "README.md"
+categories = [
+    "science",
+    "game-development",
+    "mathematics",
+    "simulation",
+    "wasm",
+]
+keywords = ["physics", "joints", "multibody", "robotics", "urdf"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.82"
+
+[features]
+stl = ["dep:vectorg-engine-meshloader", "vectorg-engine-meshloader/stl", "__meshloader_is_enabled"]
+collada = ["dep:vectorg-engine-meshloader", "vectorg-engine-meshloader/collada", "__meshloader_is_enabled"]
+wavefront = ["dep:vectorg-engine-meshloader", "vectorg-engine-meshloader/wavefront", "__meshloader_is_enabled"]
+## Private feature for detecting when meshloader is enabled by any of the file type features above.
+__meshloader_is_enabled = []
+
+[dependencies]
+log = "0.4"
+anyhow = "1"
+bitflags = "2"
+urdf-rs = "0.9"
+
+vectorg-engine = { version = "0.26", path = "../vectorg-engine" }
+vectorg-engine-meshloader = { version = "0.7.0", path = "../vectorg-engine-meshloader", default-features = false, optional = true }

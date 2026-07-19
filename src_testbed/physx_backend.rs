@@ -1,5 +1,11 @@
 #![allow(dead_code)]
 
+use engine::counters::Counters;
+use engine::dynamics::{
+    ImpulseJointSet, IntegrationParameters, MultibodyJointSet, RigidBodyHandle, RigidBodySet,
+};
+use engine::geometry::{Collider, ColliderSet};
+use engine::prelude::JointAxesMask;
 use na::{Isometry3, Matrix4, Point3, Quaternion, Translation3, Unit, UnitQuaternion, Vector3};
 use physx::cooking::{
     ConvexMeshCookingResult, PxConvexMeshDesc, PxCookingParams, PxHeightFieldDesc,
@@ -14,12 +20,6 @@ use physx_sys::{
     FilterShaderCallbackInfo, PxBitAndByte, PxConvexFlags, PxConvexMeshGeometryFlags,
     PxHeightFieldSample, PxMeshGeometryFlags, PxMeshScale_new, PxRigidActor,
 };
-use rapier::counters::Counters;
-use rapier::dynamics::{
-    ImpulseJointSet, IntegrationParameters, MultibodyJointSet, RigidBodyHandle, RigidBodySet,
-};
-use rapier::geometry::{Collider, ColliderSet};
-use rapier::prelude::JointAxesMask;
 use std::collections::HashMap;
 
 trait IntoNa {

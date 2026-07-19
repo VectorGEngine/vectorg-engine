@@ -22,7 +22,7 @@ pub enum MeshConverterError {
     TriMeshBuilderError(TriMeshBuilderError),
 }
 
-/// Determines how meshes (generally when loaded from a file) are converted into Rapier colliders.
+/// Determines how meshes (generally when loaded from a file) are converted into VectorG Engine colliders.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum MeshConverter {
     /// The mesh is loaded as-is without any particular processing.

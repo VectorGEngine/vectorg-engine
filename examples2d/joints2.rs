@@ -1,5 +1,5 @@
-use rapier2d::prelude::*;
-use rapier_testbed2d::Testbed;
+use vectorg_engine_2d::prelude::*;
+use vectorg_engine_testbed_2d::Testbed;
 
 pub fn init_world(testbed: &mut Testbed) {
     /*
@@ -15,7 +15,7 @@ pub fn init_world(testbed: &mut Testbed) {
      */
     // Build the rigid body.
     // NOTE: a smaller radius (e.g. 0.1) breaks Box2D so
-    // in order to be able to compare rapier with Box2D,
+    // in order to be able to compare VectorG Engine with Box2D,
     // we set it to 0.4.
     let rad = 0.4;
     let numi = 10; // Num vertical nodes.

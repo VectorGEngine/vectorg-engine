@@ -1,6 +1,6 @@
-use rapier2d::parry::transformation::voxelization::FillMode;
-use rapier2d::prelude::*;
-use rapier_testbed2d::Testbed;
+use vectorg_engine_2d::parry::transformation::voxelization::FillMode;
+use vectorg_engine_2d::prelude::*;
+use vectorg_engine_testbed_2d::Testbed;
 
 const VOXEL_SIZE: Real = 0.1; // 0.25;
 

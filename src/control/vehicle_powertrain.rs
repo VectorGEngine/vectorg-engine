@@ -429,13 +429,11 @@ impl VehiclePowertrain {
         let mut next_rpm = self.state.engine_rpm + rpm_acceleration * dt;
 
         if clutch_engagement > 0.0 && ratio != 0.0 {
-            let wheel_rpm = (driven_wheel_speed.abs()
-                / (TAU * driven_wheel_radius.max(0.01)))
-                * 60.0;
-            let drivetrain_rpm = (wheel_rpm
-                * ratio.abs()
-                * self.config.transmission.final_drive_ratio)
-                .max(self.config.engine.idle_rpm);
+            let wheel_rpm =
+                (driven_wheel_speed.abs() / (TAU * driven_wheel_radius.max(0.01))) * 60.0;
+            let drivetrain_rpm =
+                (wheel_rpm * ratio.abs() * self.config.transmission.final_drive_ratio)
+                    .max(self.config.engine.idle_rpm);
             let coupling =
                 1.0 - (-self.config.transmission.clutch_response * clutch_engagement * dt).exp();
             next_rpm += (drivetrain_rpm - next_rpm) * coupling;
@@ -446,8 +444,7 @@ impl VehiclePowertrain {
             .engine
             .rev_limit_rpm
             .min(self.config.engine.max_rpm);
-        self.state.engine_rpm =
-            next_rpm.clamp(self.config.engine.idle_rpm, limit);
+        self.state.engine_rpm = next_rpm.clamp(self.config.engine.idle_rpm, limit);
         let at_limit = self.state.engine_rpm >= limit - 0.5;
         self.state.rev_limiter_amount =
             ((self.state.engine_rpm - limit * 0.97) / (limit * 0.03).max(1.0)).clamp(0.0, 1.0);
@@ -483,8 +480,7 @@ impl VehiclePowertrain {
         };
         let gear_engaged = if ratio == 0.0 { 0.0 } else { clutch_engagement };
         let torque_load = ((available_torque / self.peak_torque) * boost).clamp(0.0, 1.5) / 1.5;
-        let driven_load =
-            drive_throttle * (0.35 + torque_load * 0.65) * gear_engaged;
+        let driven_load = drive_throttle * (0.35 + torque_load * 0.65) * gear_engaged;
         let free_rev_load = drive_throttle * (1.0 - gear_engaged) * 0.75;
         let engine_brake_load = rpm_rate
             * gear_engaged
@@ -610,7 +606,11 @@ impl VehiclePowertrain {
 
         while target < max_gear
             && road_speed
-                >= self.shift_speed(target, self.config.transmission.upshift_range_position, wheel_radius)
+                >= self.shift_speed(
+                    target,
+                    self.config.transmission.upshift_range_position,
+                    wheel_radius,
+                )
         {
             target += 1;
         }
@@ -660,8 +660,7 @@ impl VehiclePowertrain {
                 self.state.turbo_release_sequence =
                     self.state.turbo_release_sequence.wrapping_add(1);
             }
-            self.turbo_load =
-                (self.turbo_load - self.config.turbo.release_rate * dt).max(0.0);
+            self.turbo_load = (self.turbo_load - self.config.turbo.release_rate * dt).max(0.0);
         }
         self.previous_throttle = throttle;
     }
@@ -706,10 +705,8 @@ fn sanitize_config(config: &mut VehicleControllerConfig) {
         .rev_limit_rpm
         .clamp(config.engine.idle_rpm, config.engine.max_rpm);
     config.engine.inertia = config.engine.inertia.max(0.01);
-    config.engine.drivetrain_efficiency =
-        config.engine.drivetrain_efficiency.clamp(0.0, 1.0);
-    config.transmission.final_drive_ratio =
-        config.transmission.final_drive_ratio.abs().max(0.01);
+    config.engine.drivetrain_efficiency = config.engine.drivetrain_efficiency.clamp(0.0, 1.0);
+    config.transmission.final_drive_ratio = config.transmission.final_drive_ratio.abs().max(0.01);
     config.transmission.reverse_ratio = -config.transmission.reverse_ratio.abs().max(0.01);
     config.transmission.shift_cooldown = config.transmission.shift_cooldown.max(0.0);
     config.transmission.upshift_range_position =
@@ -730,8 +727,7 @@ fn sanitize_config(config: &mut VehicleControllerConfig) {
         config.dynamics.traction_control_strength.clamp(0.0, 1.0);
     config.dynamics.esc_strength = config.dynamics.esc_strength.clamp(0.0, 1.0);
     config.steering.max_angle = config.steering.max_angle.abs();
-    config.steering.minimum_speed_factor =
-        config.steering.minimum_speed_factor.clamp(0.0, 1.0);
+    config.steering.minimum_speed_factor = config.steering.minimum_speed_factor.clamp(0.0, 1.0);
     config.steering.drift_correction = config.steering.drift_correction.clamp(0.0, 1.0);
 }
 
@@ -739,17 +735,14 @@ fn prepare_torque_curve(engine: &mut EngineConfig) -> Real {
     engine
         .torque_curve
         .retain(|(rpm, torque)| rpm.is_finite() && torque.is_finite() && *torque >= 0.0);
-    engine
-        .torque_curve
-        .sort_by(|a, b| a.0.total_cmp(&b.0));
+    engine.torque_curve.sort_by(|a, b| a.0.total_cmp(&b.0));
     engine
         .torque_curve
         .dedup_by(|a, b| (a.0 - b.0).abs() <= Real::EPSILON);
 
     if engine.torque_curve.is_empty() {
         let peak_rpm = engine.max_rpm * 0.65;
-        let peak_torque =
-            engine.horsepower.max(1.0) * 745.7 / (peak_rpm * TAU / 60.0);
+        let peak_torque = engine.horsepower.max(1.0) * 745.7 / (peak_rpm * TAU / 60.0);
         engine.torque_curve = vec![
             (engine.idle_rpm, peak_torque * 0.7),
             (peak_rpm, peak_torque),

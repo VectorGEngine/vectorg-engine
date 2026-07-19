@@ -8,10 +8,10 @@ bitflags::bitflags! {
     #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
     /// Flags affecting the events generated for this collider.
     pub struct ActiveEvents: u32 {
-        /// If set, Rapier will call `EventHandler::handle_collision_event`
+        /// If set, VectorG Engine will call `EventHandler::handle_collision_event`
         /// whenever relevant for this collider.
         const COLLISION_EVENTS = 0b0001;
-        /// If set, Rapier will call `EventHandler::handle_contact_force_event`
+        /// If set, VectorG Engine will call `EventHandler::handle_contact_force_event`
         /// whenever relevant for this collider.
         const CONTACT_FORCE_EVENTS = 0b0010;
     }
