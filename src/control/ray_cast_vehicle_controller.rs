@@ -784,8 +784,10 @@ impl DynamicRayCastVehicleController {
 
         for wheel in &self.wheels {
             if wheel.role.driven {
-                let speed = wheel.delta_rotation.abs() * wheel.radius / dt;
-                driven_speed = driven_speed.max(speed);
+                let speed = wheel.delta_rotation * wheel.radius / dt;
+                if speed.abs() > driven_speed.abs() {
+                    driven_speed = speed;
+                }
                 radius_sum += wheel.radius;
                 driven_count += 1;
             }
@@ -1631,6 +1633,29 @@ mod tests {
     }
 
     #[test]
+    fn driven_wheel_speed_preserves_rotation_direction() {
+        let mut controller = DynamicRayCastVehicleController::new(
+            RigidBodyHandle::invalid(),
+            VehicleControllerConfig::default(),
+        );
+        controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            0.4,
+            0.35,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Rear, true, false),
+        );
+        controller.wheels[0].delta_rotation = -0.5;
+
+        let (speed, radius) = controller.driven_wheel_speed_and_radius(0.1);
+
+        assert!(speed < 0.0);
+        assert_eq!(radius, 0.35);
+    }
+
+    #[test]
     fn steering_assist_does_not_countersteer_in_reverse() {
         let mut config = VehicleControllerConfig::default();
         config.steering.assist = true;
@@ -1969,6 +1994,7 @@ mod tests {
             controller.state().engine_rpm,
             controller.powertrain.config.engine.idle_rpm
         );
+        assert!(controller.state().engine_running);
         assert_eq!(controller.state().current_gear, 0);
         assert_eq!(controller.current_vehicle_speed, 0.0);
         assert!(!controller.drift_assist_active);
