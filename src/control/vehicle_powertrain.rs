@@ -345,6 +345,22 @@ impl VehiclePowertrain {
         };
     }
 
+    pub fn reset(&mut self) {
+        self.input = VehicleInput::default();
+        self.state = VehicleState {
+            engine_rpm: self.config.engine.idle_rpm,
+            current_gear: 0,
+            ..VehicleState::default()
+        };
+        self.shift_cooldown = 0.0;
+        self.reverse_cooldown = 0.0;
+        self.manual_override = 0.0;
+        self.shift_target = 0;
+        self.reverse_brake_armed = false;
+        self.turbo_load = 0.0;
+        self.previous_throttle = 0.0;
+    }
+
     pub fn input(&self) -> VehicleInput {
         self.input
     }
@@ -910,5 +926,66 @@ mod tests {
                 steering: 1.0,
             }
         );
+    }
+
+    #[test]
+    fn reset_restores_initial_runtime_state_without_changing_config() {
+        let mut config = VehicleControllerConfig::default();
+        config.engine.idle_rpm = 1100.0;
+        config.turbo.enabled = true;
+        let mut powertrain = VehiclePowertrain::new(config);
+
+        powertrain.input = VehicleInput {
+            throttle: 1.0,
+            brake: 0.5,
+            clutch: 0.25,
+            handbrake: 1.0,
+            steering: -0.75,
+        };
+        powertrain.state = VehicleState {
+            engine_rpm: 5000.0,
+            current_gear: 3,
+            reverse_direction: true,
+            vehicle_speed: 30.0,
+            driven_wheel_speed: 35.0,
+            steering_angle: 0.4,
+            engine_load: 0.8,
+            rev_limiter_amount: 0.6,
+            turbo_load: 0.9,
+            turbo_release_sequence: 7,
+            wheels_in_contact: 4,
+            abs_activity: 0.5,
+            traction_control_activity: 0.4,
+            force_feedback: 0.3,
+            steering_friction: 0.2,
+        };
+        powertrain.shift_cooldown = 0.5;
+        powertrain.reverse_cooldown = 0.4;
+        powertrain.manual_override = 0.3;
+        powertrain.shift_target = 4;
+        powertrain.reverse_brake_armed = true;
+        powertrain.turbo_load = 0.9;
+        powertrain.previous_throttle = 1.0;
+
+        powertrain.reset();
+
+        assert_eq!(powertrain.input(), VehicleInput::default());
+        assert_eq!(
+            powertrain.state(),
+            VehicleState {
+                engine_rpm: 1100.0,
+                current_gear: 0,
+                ..VehicleState::default()
+            }
+        );
+        assert_eq!(powertrain.shift_cooldown, 0.0);
+        assert_eq!(powertrain.reverse_cooldown, 0.0);
+        assert_eq!(powertrain.manual_override, 0.0);
+        assert_eq!(powertrain.shift_target, 0);
+        assert!(!powertrain.reverse_brake_armed);
+        assert_eq!(powertrain.turbo_load, 0.0);
+        assert_eq!(powertrain.previous_throttle, 0.0);
+        assert_eq!(powertrain.config.engine.idle_rpm, 1100.0);
+        assert!(powertrain.config.turbo.enabled);
     }
 }

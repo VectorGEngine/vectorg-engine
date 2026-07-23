@@ -289,6 +289,36 @@ impl Wheel {
         }
     }
 
+    fn reset(&mut self) {
+        self.raycast_info = RayCastInfo::default();
+        self.center = Point::origin();
+        self.wheel_direction_ws = self.direction_cs;
+        self.wheel_axle_ws = self.axle_cs;
+        self.rotation = 0.0;
+        self.delta_rotation = 0.0;
+        self.target_rotation = 0.0;
+        self.forward_impulse = 0.0;
+        self.side_impulse = 0.0;
+        self.brake_impulse = 0.0;
+        self.steering = 0.0;
+        self.engine_force = 0.0;
+        self.brake = 0.0;
+        self.anti_lock_brake = 0.0;
+        self.is_anti_lock_brake = false;
+        self.traction_control = 0.0;
+        self.engine_force_feedback = 0.0;
+        self.lock = false;
+        self.clipped_inv_contact_dot_suspension = 0.0;
+        self.suspension_relative_velocity = 0.0;
+        self.wheel_suspension_force = 0.0;
+        self.skid_info = 0.0;
+        self.last_skid_info = 0.0;
+        self.ground_friction = 1.0;
+        self.ground_type.clear();
+        self.suspension_compression_rate = 0.0;
+        self.contact_damping = self.base_contact_damping;
+    }
+
     /// Information about suspension and the ground obtained from the ray-casting
     /// for this wheel.
     pub fn raycast_info(&self) -> &RayCastInfo {
@@ -423,6 +453,22 @@ impl DynamicRayCastVehicleController {
     /// The current engine, transmission, and vehicle output state.
     pub fn state(&self) -> VehicleState {
         self.powertrain.state()
+    }
+
+    /// Restores all transient simulation state while preserving vehicle configuration and tuning.
+    pub fn reset(&mut self) {
+        self.powertrain.reset();
+        self.current_vehicle_speed = 0.0;
+        self.forward_ws.clear();
+        self.axle.clear();
+        self.last_steering_compression = 0.0;
+        self.drift_assist_active = false;
+        self.drift_assist_offset = 0.0;
+        self.drift_assist_direction = 0.0;
+        self.timer = 0.0;
+        for wheel in &mut self.wheels {
+            wheel.reset();
+        }
     }
 
     /// Requests the next higher gear.
@@ -1875,6 +1921,69 @@ mod tests {
         assert_eq!(controller.powertrain.config.steering.drift_correction, 1.0);
         controller.set_drift_correction(-1.0);
         assert_eq!(controller.powertrain.config.steering.drift_correction, 0.0);
+    }
+
+    #[test]
+    fn reset_clears_controller_and_wheel_runtime_state_without_changing_tuning() {
+        let mut controller = DynamicRayCastVehicleController::new(
+            RigidBodyHandle::invalid(),
+            VehicleControllerConfig::default(),
+        );
+        controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            0.4,
+            0.35,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Front, true, true),
+        );
+        controller.set_input(VehicleInput {
+            throttle: 1.0,
+            steering: 0.5,
+            ..VehicleInput::default()
+        });
+        controller.powertrain.state_mut().engine_rpm = 5000.0;
+        controller.powertrain.state_mut().current_gear = 3;
+        controller.current_vehicle_speed = 25.0;
+        controller.last_steering_compression = 1.0;
+        controller.drift_assist_active = true;
+        controller.drift_assist_offset = 0.3;
+        controller.drift_assist_direction = 1.0;
+        controller.timer = 5.0;
+        let wheel = &mut controller.wheels[0];
+        wheel.rotation = 10.0;
+        wheel.delta_rotation = 2.0;
+        wheel.target_rotation = 3.0;
+        wheel.engine_force = 100.0;
+        wheel.brake = 0.5;
+        wheel.steering = 0.4;
+        wheel.skid_info = 0.2;
+        wheel.ground_type = "asphalt".to_string();
+        let suspension_rest_length = wheel.suspension_rest_length;
+
+        controller.reset();
+
+        assert_eq!(controller.input(), VehicleInput::default());
+        assert_eq!(
+            controller.state().engine_rpm,
+            controller.powertrain.config.engine.idle_rpm
+        );
+        assert_eq!(controller.state().current_gear, 0);
+        assert_eq!(controller.current_vehicle_speed, 0.0);
+        assert!(!controller.drift_assist_active);
+        assert_eq!(controller.drift_assist_offset, 0.0);
+        assert_eq!(controller.timer, 0.0);
+        let wheel = &controller.wheels[0];
+        assert_eq!(wheel.rotation, 0.0);
+        assert_eq!(wheel.delta_rotation, 0.0);
+        assert_eq!(wheel.target_rotation, 0.0);
+        assert_eq!(wheel.engine_force, 0.0);
+        assert_eq!(wheel.brake, 0.0);
+        assert_eq!(wheel.steering, 0.0);
+        assert_eq!(wheel.skid_info, 0.0);
+        assert!(wheel.ground_type.is_empty());
+        assert_eq!(wheel.suspension_rest_length, suspension_rest_length);
     }
 }
 
