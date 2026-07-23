@@ -496,7 +496,8 @@ impl VehiclePowertrain {
             0.0
         };
         let friction_torque = if self.state.engine_running {
-            friction_scale * (0.2 + 2.0 * rpm_rate * rpm_rate) * pumping_loss
+            let friction_curve = 0.2 + 1.2 * rpm_rate + 0.8 * rpm_rate * rpm_rate;
+            friction_scale * friction_curve * pumping_loss
         } else {
             0.0
         };
@@ -948,6 +949,26 @@ mod tests {
         config.engine.torque_curve = vec![(1000.0, 100.0), (3000.0, 200.0)];
         let powertrain = VehiclePowertrain::new(config);
         assert!((powertrain.torque_at(2000.0) - 150.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn neutral_engine_speed_returns_to_idle_without_a_slow_midrange_tail() {
+        let mut config = VehicleControllerConfig::default();
+        config.engine.idle_rpm = 1000.0;
+        config.engine.max_rpm = 8000.0;
+        config.engine.rev_limit_rpm = 7900.0;
+        config.engine.inertia = 0.9;
+        config.engine.friction_torque = Some(70.0);
+        let mut powertrain = VehiclePowertrain::new(config);
+        powertrain.state.engine_rpm = 7900.0;
+
+        for _ in 0..300 {
+            powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        }
+
+        assert_eq!(powertrain.state.current_gear, 0);
+        assert!(powertrain.state.engine_rpm >= powertrain.config.engine.idle_rpm);
+        assert!(powertrain.state.engine_rpm < 2200.0);
     }
 
     fn automatic_powertrain() -> VehiclePowertrain {
