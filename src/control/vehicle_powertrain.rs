@@ -7,6 +7,12 @@ const TRANSMISSION_MANUAL_OVERRIDE: Real = 1.5;
 const MANUAL_SHIFT_CLUTCH_DISENGAGEMENT: Real = 0.8;
 const STALL_RPM_RATIO: Real = 0.55;
 const CLUTCH_CAPACITY_MULTIPLIER: Real = 2.0;
+const AUTO_BLIP_CLUTCH_DISENGAGE_DURATION: Real = 0.05;
+const AUTO_BLIP_CLUTCH_REENGAGE_DURATION: Real = 0.12;
+const AUTO_BLIP_RPM_TOLERANCE: Real = 75.0;
+const AUTO_BLIP_THROTTLE: Real = 1.0;
+const AUTO_BLIP_MIN_RPM_GAP: Real = 100.0;
+const AUTO_BLIP_OVERSHOOT_FACTOR: Real = 0.1;
 
 /// Engine parameters used by the vehicle powertrain.
 #[derive(Clone, Debug)]
@@ -74,6 +80,10 @@ pub struct TransmissionConfig {
     pub clutch_response: Real,
     /// Minimum time between gear changes.
     pub shift_cooldown: Real,
+    /// Whether sequential and automatic downshifts perform a clutch-assisted rev match.
+    pub auto_blip: bool,
+    /// Maximum time allowed for open-clutch RPM matching, in seconds.
+    pub auto_blip_duration: Real,
     /// Position within adjacent gears' speed overlap used for upshifts.
     pub upshift_range_position: Real,
     /// Position within adjacent gears' speed overlap used for downshifts.
@@ -93,6 +103,8 @@ impl Default for TransmissionConfig {
             auto_reverse: true,
             clutch_response: 12.0,
             shift_cooldown: 0.73,
+            auto_blip: true,
+            auto_blip_duration: 0.2,
             upshift_range_position: 0.9,
             downshift_range_position: 0.7,
             stopped_speed: 0.1,
@@ -307,6 +319,16 @@ pub(crate) struct PowertrainOutput {
     pub service_brake: Real,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ShiftPhase {
+    #[default]
+    Idle,
+    Disengaging,
+    Blipping,
+    Settling,
+    Reengaging,
+}
+
 pub(crate) struct VehiclePowertrain {
     pub config: VehicleControllerConfig,
     input: VehicleInput,
@@ -316,6 +338,11 @@ pub(crate) struct VehiclePowertrain {
     reverse_cooldown: Real,
     manual_override: Real,
     shift_target: i32,
+    shift_target_allows_blip: bool,
+    shift_phase: ShiftPhase,
+    shift_phase_timer: Real,
+    shift_to: i32,
+    shift_overshoot_rpm: Real,
     reverse_brake_armed: bool,
     turbo_load: Real,
     previous_throttle: Real,
@@ -341,6 +368,11 @@ impl VehiclePowertrain {
             reverse_cooldown: 0.0,
             manual_override: 0.0,
             shift_target: 0,
+            shift_target_allows_blip: false,
+            shift_phase: ShiftPhase::Idle,
+            shift_phase_timer: 0.0,
+            shift_to: 0,
+            shift_overshoot_rpm: 0.0,
             reverse_brake_armed: false,
             turbo_load: 0.0,
             previous_throttle: 0.0,
@@ -370,6 +402,11 @@ impl VehiclePowertrain {
         self.reverse_cooldown = 0.0;
         self.manual_override = 0.0;
         self.shift_target = 0;
+        self.shift_target_allows_blip = false;
+        self.shift_phase = ShiftPhase::Idle;
+        self.shift_phase_timer = 0.0;
+        self.shift_to = 0;
+        self.shift_overshoot_rpm = 0.0;
         self.reverse_brake_armed = false;
         self.turbo_load = 0.0;
         self.previous_throttle = 0.0;
@@ -389,6 +426,10 @@ impl VehiclePowertrain {
     }
 
     pub fn shift_up(&mut self) {
+        if self.shift_phase != ShiftPhase::Idle {
+            return;
+        }
+
         let max_gear = self.config.transmission.forward_ratios.len() as i32;
         let gear = (self.shift_target + 1).min(max_gear);
         if self.reject_manual_shift_without_clutch(gear) {
@@ -399,10 +440,14 @@ impl VehiclePowertrain {
             return;
         }
 
-        self.set_manual_shift_target(gear);
+        self.set_manual_shift_target(gear, false);
     }
 
     pub fn shift_down(&mut self) {
+        if self.shift_phase != ShiftPhase::Idle {
+            return;
+        }
+
         let gear = (self.shift_target - 1).max(-1);
         if self.reject_manual_shift_without_clutch(gear) {
             return;
@@ -412,14 +457,14 @@ impl VehiclePowertrain {
             return;
         }
 
-        self.set_manual_shift_target(gear);
+        self.set_manual_shift_target(gear, true);
     }
 
     pub fn set_gear(&mut self, gear: i32) {
         let max_gear = self.config.transmission.forward_ratios.len() as i32;
         let gear = gear.clamp(-1, max_gear);
         if !self.reject_manual_shift_without_clutch(gear) {
-            self.set_manual_shift_target(gear);
+            self.set_manual_shift_target(gear, false);
         }
     }
 
@@ -432,15 +477,16 @@ impl VehiclePowertrain {
             return false;
         }
 
-        self.set_manual_shift_target(0);
+        self.set_manual_shift_target(0, false);
         self.shift_cooldown = 0.0;
         true
     }
 
-    fn set_manual_shift_target(&mut self, gear: i32) {
+    fn set_manual_shift_target(&mut self, gear: i32, allows_blip: bool) {
         self.state.reverse_direction = false;
         self.reverse_brake_armed = false;
         self.shift_target = gear;
+        self.shift_target_allows_blip = allows_blip;
         self.manual_override = TRANSMISSION_MANUAL_OVERRIDE;
     }
 
@@ -454,8 +500,10 @@ impl VehiclePowertrain {
         let dt = dt.clamp(0.0, 0.05);
         self.state.vehicle_speed = vehicle_speed;
         self.state.driven_wheel_speed = driven_wheel_speed.abs();
+        self.update_shift_sequence(dt, driven_wheel_speed.abs(), driven_wheel_radius);
 
-        let (drive_throttle, service_brake) = self.effective_pedals();
+        let (mut drive_throttle, service_brake) = self.effective_pedals();
+        drive_throttle = drive_throttle.max(self.shift_throttle_override());
         self.update_engine_start_state(drive_throttle);
         if self.state.engine_running {
             self.update_turbo(dt, drive_throttle);
@@ -471,7 +519,7 @@ impl VehiclePowertrain {
         let clutch_engagement = if ratio == 0.0 {
             0.0
         } else {
-            1.0 - self.input.clutch
+            1.0 - self.input.clutch.max(self.shift_clutch_override())
         };
         let available_torque = self.torque_at(self.state.engine_rpm);
         let boost = if self.config.turbo.enabled {
@@ -607,7 +655,12 @@ impl VehiclePowertrain {
         };
         self.state.turbo_load = self.turbo_load;
 
-        self.update_transmission(dt, vehicle_speed, driven_wheel_radius);
+        self.update_transmission(
+            dt,
+            vehicle_speed,
+            driven_wheel_speed.abs(),
+            driven_wheel_radius,
+        );
 
         PowertrainOutput {
             drive_torque,
@@ -622,6 +675,27 @@ impl VehiclePowertrain {
             (self.input.brake, self.input.throttle)
         } else {
             (self.input.throttle, self.input.brake)
+        }
+    }
+
+    fn shift_clutch_override(&self) -> Real {
+        match self.shift_phase {
+            ShiftPhase::Idle => 0.0,
+            ShiftPhase::Disengaging => {
+                1.0 - self.shift_phase_timer / AUTO_BLIP_CLUTCH_DISENGAGE_DURATION
+            }
+            ShiftPhase::Blipping => 1.0,
+            ShiftPhase::Settling => 1.0,
+            ShiftPhase::Reengaging => self.shift_phase_timer / AUTO_BLIP_CLUTCH_REENGAGE_DURATION,
+        }
+        .clamp(0.0, 1.0)
+    }
+
+    fn shift_throttle_override(&self) -> Real {
+        if self.shift_phase == ShiftPhase::Blipping {
+            AUTO_BLIP_THROTTLE
+        } else {
+            0.0
         }
     }
 
@@ -683,16 +757,30 @@ impl VehiclePowertrain {
         }
     }
 
-    fn update_transmission(&mut self, dt: Real, speed: Real, wheel_radius: Real) {
+    fn update_transmission(
+        &mut self,
+        dt: Real,
+        vehicle_speed: Real,
+        driven_wheel_speed: Real,
+        wheel_radius: Real,
+    ) {
         self.shift_cooldown = (self.shift_cooldown - dt).max(0.0);
         self.reverse_cooldown = (self.reverse_cooldown - dt).max(0.0);
         self.manual_override = (self.manual_override - dt).max(0.0);
 
+        if self.shift_phase != ShiftPhase::Idle {
+            return;
+        }
+
         if self.config.transmission.automatic && self.manual_override <= Real::EPSILON {
-            self.update_automatic_transmission(speed, wheel_radius);
+            self.update_automatic_transmission(vehicle_speed, wheel_radius);
         }
 
         if self.shift_cooldown > Real::EPSILON || self.state.current_gear == self.shift_target {
+            return;
+        }
+
+        if self.start_auto_blip_shift(driven_wheel_speed, wheel_radius) {
             return;
         }
 
@@ -701,6 +789,105 @@ impl VehiclePowertrain {
             self.state.reverse_direction = false;
         }
         self.shift_cooldown = self.config.transmission.shift_cooldown;
+        self.shift_target_allows_blip = false;
+    }
+
+    fn start_auto_blip_shift(&mut self, speed: Real, wheel_radius: Real) -> bool {
+        if !self.config.transmission.auto_blip
+            || !self.shift_target_allows_blip
+            || !self.state.engine_running
+            || self.config.transmission.auto_blip_duration <= Real::EPSILON
+        {
+            return false;
+        }
+
+        let old_gear = self.state.current_gear;
+        let new_gear = self.shift_target;
+        if old_gear <= new_gear || old_gear <= 1 || new_gear < 1 {
+            return false;
+        }
+
+        let Some(target_rpm) = self.target_rpm_for_gear(new_gear, speed, wheel_radius) else {
+            return false;
+        };
+        let rpm_gap = target_rpm - self.state.engine_rpm;
+        if rpm_gap < AUTO_BLIP_MIN_RPM_GAP {
+            return false;
+        }
+
+        self.shift_to = new_gear;
+        self.shift_overshoot_rpm = (self.config.engine.max_rpm - self.state.engine_rpm).max(0.0)
+            * AUTO_BLIP_OVERSHOOT_FACTOR;
+        self.shift_phase = ShiftPhase::Disengaging;
+        self.shift_phase_timer = AUTO_BLIP_CLUTCH_DISENGAGE_DURATION;
+        self.shift_cooldown = self.config.transmission.shift_cooldown;
+        true
+    }
+
+    fn update_shift_sequence(&mut self, dt: Real, speed: Real, wheel_radius: Real) {
+        if self.shift_phase == ShiftPhase::Idle {
+            return;
+        }
+
+        self.shift_phase_timer = (self.shift_phase_timer - dt).max(0.0);
+        match self.shift_phase {
+            ShiftPhase::Idle => {}
+            ShiftPhase::Disengaging if self.shift_phase_timer <= Real::EPSILON => {
+                self.state.current_gear = self.shift_to;
+                self.state.reverse_direction = false;
+                self.shift_phase = ShiftPhase::Blipping;
+                self.shift_phase_timer = self.config.transmission.auto_blip_duration;
+            }
+            ShiftPhase::Blipping => {
+                let overshoot_reached = self
+                    .target_rpm_for_gear(self.shift_to, speed, wheel_radius)
+                    .is_none_or(|target_rpm| {
+                        let limit = self
+                            .config
+                            .engine
+                            .rev_limit_rpm
+                            .min(self.config.engine.max_rpm);
+                        let overshoot_target = (target_rpm + self.shift_overshoot_rpm).min(limit);
+                        self.state.engine_rpm >= overshoot_target - AUTO_BLIP_RPM_TOLERANCE
+                    });
+                if overshoot_reached {
+                    self.shift_phase = ShiftPhase::Settling;
+                } else if self.shift_phase_timer <= Real::EPSILON {
+                    self.shift_phase = ShiftPhase::Reengaging;
+                    self.shift_phase_timer = AUTO_BLIP_CLUTCH_REENGAGE_DURATION;
+                }
+            }
+            ShiftPhase::Settling => {
+                let target_reached = self
+                    .target_rpm_for_gear(self.shift_to, speed, wheel_radius)
+                    .is_none_or(|target_rpm| {
+                        self.state.engine_rpm <= target_rpm + AUTO_BLIP_RPM_TOLERANCE
+                    });
+                if target_reached || self.shift_phase_timer <= Real::EPSILON {
+                    self.shift_phase = ShiftPhase::Reengaging;
+                    self.shift_phase_timer = AUTO_BLIP_CLUTCH_REENGAGE_DURATION;
+                }
+            }
+            ShiftPhase::Reengaging if self.shift_phase_timer <= Real::EPSILON => {
+                self.shift_phase = ShiftPhase::Idle;
+                self.shift_phase_timer = 0.0;
+                self.shift_to = 0;
+                self.shift_overshoot_rpm = 0.0;
+                self.shift_target_allows_blip = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn target_rpm_for_gear(&self, gear: i32, speed: Real, wheel_radius: Real) -> Option<Real> {
+        let ratio = self
+            .config
+            .transmission
+            .forward_ratios
+            .get((gear - 1) as usize)
+            .copied()?;
+        let wheel_rpm = (speed.abs() / (TAU * wheel_radius.max(0.01))) * 60.0;
+        Some(wheel_rpm * ratio * self.config.transmission.final_drive_ratio)
     }
 
     fn update_automatic_transmission(&mut self, speed: Real, wheel_radius: Real) {
@@ -729,6 +916,7 @@ impl VehiclePowertrain {
             if self.state.reverse_direction && stopped && throttle_pressed {
                 self.state.reverse_direction = false;
                 self.shift_target = 1;
+                self.shift_target_allows_blip = false;
                 self.reverse_cooldown = self.config.transmission.shift_cooldown;
                 self.reverse_brake_armed = false;
                 return;
@@ -741,6 +929,7 @@ impl VehiclePowertrain {
             {
                 self.state.reverse_direction = true;
                 self.shift_target = -1;
+                self.shift_target_allows_blip = false;
                 self.reverse_cooldown = self.config.transmission.shift_cooldown;
                 self.reverse_brake_armed = false;
                 return;
@@ -755,11 +944,13 @@ impl VehiclePowertrain {
 
         if self.shift_target != 0 && stopped && drive_pedal <= TRANSMISSION_PEDAL_RELEASE {
             self.shift_target = 0;
+            self.shift_target_allows_blip = false;
             return;
         }
 
         if self.shift_target == 0 && drive_pedal > TRANSMISSION_PEDAL_ENGAGE {
             self.shift_target = if self.state.reverse_direction { -1 } else { 1 };
+            self.shift_target_allows_blip = false;
             return;
         }
 
@@ -800,6 +991,7 @@ impl VehiclePowertrain {
             target -= 1;
         }
 
+        self.shift_target_allows_blip = target < self.shift_target;
         self.shift_target = target;
     }
 
@@ -884,6 +1076,7 @@ fn sanitize_config(config: &mut VehicleControllerConfig) {
     config.transmission.reverse_ratio = -config.transmission.reverse_ratio.abs().max(0.01);
     config.transmission.clutch_response = config.transmission.clutch_response.max(0.0);
     config.transmission.shift_cooldown = config.transmission.shift_cooldown.max(0.0);
+    config.transmission.auto_blip_duration = config.transmission.auto_blip_duration.max(0.0);
     config.transmission.upshift_range_position =
         config.transmission.upshift_range_position.clamp(0.0, 1.0);
     config.transmission.downshift_range_position =
@@ -1073,6 +1266,7 @@ mod tests {
         config.transmission.forward_ratios = vec![4.0, 2.0, 1.0];
         config.transmission.final_drive_ratio = 4.0;
         config.transmission.shift_cooldown = 0.0;
+        config.transmission.auto_blip = false;
         let mut powertrain = VehiclePowertrain::new(config);
         powertrain.set_input(VehicleInput {
             throttle: 1.0,
@@ -1083,8 +1277,28 @@ mod tests {
         assert_eq!(powertrain.state().current_gear, 1);
         powertrain.update(1.0 / 60.0, 12.0, 0.0, 0.3);
         assert_eq!(powertrain.state().current_gear, 2);
-        powertrain.update(1.0 / 60.0, 8.0, 0.0, 0.3);
+        powertrain.update(1.0 / 60.0, 8.0, 8.0, 0.3);
         assert_eq!(powertrain.state().current_gear, 1);
+    }
+
+    #[test]
+    fn automatic_downshift_triggers_auto_blip() {
+        let mut config = VehicleControllerConfig::default();
+        config.engine.idle_rpm = 1000.0;
+        config.engine.max_rpm = 6000.0;
+        config.transmission.forward_ratios = vec![4.0, 2.0, 1.0];
+        config.transmission.final_drive_ratio = 4.0;
+        config.transmission.shift_cooldown = 0.0;
+        let mut powertrain = VehiclePowertrain::new(config);
+        powertrain.state.current_gear = 3;
+        powertrain.shift_target = 3;
+        powertrain.state.engine_rpm = 1000.0;
+
+        powertrain.update(1.0 / 60.0, 8.0, 8.0, 0.3);
+
+        assert_eq!(powertrain.state().current_gear, 3);
+        assert_eq!(powertrain.shift_phase, ShiftPhase::Disengaging);
+        assert!(powertrain.shift_overshoot_rpm > 0.0);
     }
 
     #[test]
@@ -1170,6 +1384,11 @@ mod tests {
         powertrain.reverse_cooldown = 0.4;
         powertrain.manual_override = 0.3;
         powertrain.shift_target = 4;
+        powertrain.shift_target_allows_blip = true;
+        powertrain.shift_phase = ShiftPhase::Blipping;
+        powertrain.shift_phase_timer = 0.2;
+        powertrain.shift_to = 3;
+        powertrain.shift_overshoot_rpm = 600.0;
         powertrain.reverse_brake_armed = true;
         powertrain.turbo_load = 0.9;
         powertrain.previous_throttle = 1.0;
@@ -1191,6 +1410,11 @@ mod tests {
         assert_eq!(powertrain.reverse_cooldown, 0.0);
         assert_eq!(powertrain.manual_override, 0.0);
         assert_eq!(powertrain.shift_target, 0);
+        assert!(!powertrain.shift_target_allows_blip);
+        assert_eq!(powertrain.shift_phase, ShiftPhase::Idle);
+        assert_eq!(powertrain.shift_phase_timer, 0.0);
+        assert_eq!(powertrain.shift_to, 0);
+        assert_eq!(powertrain.shift_overshoot_rpm, 0.0);
         assert!(!powertrain.reverse_brake_armed);
         assert_eq!(powertrain.turbo_load, 0.0);
         assert_eq!(powertrain.previous_throttle, 0.0);
@@ -1326,6 +1550,85 @@ mod tests {
         VehiclePowertrain::new(config)
     }
 
+    fn select_manual_gear(powertrain: &mut VehiclePowertrain, gear: i32) {
+        powertrain.set_input(VehicleInput {
+            clutch: 1.0,
+            ..VehicleInput::default()
+        });
+        powertrain.set_gear(gear);
+        powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        assert_eq!(powertrain.state().current_gear, gear);
+        powertrain.set_input(VehicleInput::default());
+    }
+
+    #[test]
+    fn sequential_manual_downshift_triggers_auto_blip() {
+        let mut powertrain = manual_auto_clutch_powertrain();
+        select_manual_gear(&mut powertrain, 3);
+        powertrain.config.engine.inertia = 0.2;
+        powertrain.config.transmission.auto_blip_duration = 0.5;
+        powertrain.state.engine_rpm = 1000.0;
+        let wheel_radius = 0.35;
+        let target_rpm = 1500.0;
+        let wheel_speed = wheel_speed_for_gear_crank_rpm(&powertrain, 2, target_rpm, wheel_radius);
+
+        powertrain.shift_down();
+        powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
+        let expected_overshoot = (powertrain.config.engine.max_rpm - powertrain.state.engine_rpm)
+            * AUTO_BLIP_OVERSHOOT_FACTOR;
+
+        assert_eq!(powertrain.state().current_gear, 3);
+        assert_eq!(powertrain.shift_phase, ShiftPhase::Disengaging);
+        assert_eq!(powertrain.shift_clutch_override(), 0.0);
+        assert_eq!(powertrain.shift_throttle_override(), 0.0);
+        assert_eq!(powertrain.shift_overshoot_rpm, expected_overshoot);
+
+        let mut output = powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
+        for _ in 0..2 {
+            output = powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
+        }
+
+        assert_eq!(powertrain.state().current_gear, 2);
+        assert_eq!(powertrain.shift_phase, ShiftPhase::Blipping);
+        assert_eq!(powertrain.shift_clutch_override(), 1.0);
+        assert!(powertrain.shift_throttle_override() > 0.0);
+        assert_eq!(output.drive_torque, 0.0);
+
+        let mut peak_blip_rpm = powertrain.state.engine_rpm;
+        let mut settled_after_overshoot = false;
+        for _ in 0..60 {
+            powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
+            if matches!(
+                powertrain.shift_phase,
+                ShiftPhase::Blipping | ShiftPhase::Settling
+            ) {
+                peak_blip_rpm = peak_blip_rpm.max(powertrain.state.engine_rpm);
+            }
+            settled_after_overshoot |= powertrain.shift_phase == ShiftPhase::Settling;
+        }
+        assert!(peak_blip_rpm >= target_rpm + expected_overshoot - AUTO_BLIP_RPM_TOLERANCE);
+        assert!(settled_after_overshoot);
+        assert_eq!(powertrain.shift_phase, ShiftPhase::Idle);
+        assert_eq!(powertrain.shift_clutch_override(), 0.0);
+        assert_eq!(powertrain.shift_throttle_override(), 0.0);
+    }
+
+    #[test]
+    fn direct_manual_gear_selection_does_not_trigger_auto_blip() {
+        let mut powertrain = manual_auto_clutch_powertrain();
+        select_manual_gear(&mut powertrain, 3);
+        powertrain.state.engine_rpm = 1000.0;
+        let wheel_radius = 0.35;
+        let wheel_speed = wheel_speed_for_gear_crank_rpm(&powertrain, 2, 5000.0, wheel_radius);
+
+        powertrain.set_gear(2);
+        powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
+
+        assert_eq!(powertrain.state().current_gear, 2);
+        assert_eq!(powertrain.shift_phase, ShiftPhase::Idle);
+        assert_eq!(powertrain.shift_throttle_override(), 0.0);
+    }
+
     #[test]
     fn manual_shift_requires_eighty_percent_clutch_disengagement() {
         let mut powertrain = manual_powertrain();
@@ -1453,6 +1756,18 @@ mod tests {
         crank_rpm
             / (powertrain.current_ratio() * powertrain.config.transmission.final_drive_ratio)
             / 60.0
+            * TAU
+            * wheel_radius
+    }
+
+    fn wheel_speed_for_gear_crank_rpm(
+        powertrain: &VehiclePowertrain,
+        gear: i32,
+        crank_rpm: Real,
+        wheel_radius: Real,
+    ) -> Real {
+        let ratio = powertrain.config.transmission.forward_ratios[(gear - 1) as usize];
+        crank_rpm / (ratio * powertrain.config.transmission.final_drive_ratio) / 60.0
             * TAU
             * wheel_radius
     }
