@@ -338,9 +338,7 @@ impl Wheel {
         self.rotation = 0.0;
         self.delta_rotation = 0.0;
         self.target_rotation = 0.0;
-        self.powered_angular_velocity = 0.0;
-        self.powered_slip = 0.0;
-        self.powered_slip_timer = 0.0;
+        self.clear_powered_spin_state();
         self.previous_rolling_surface_speed = 0.0;
         self.wheel_coupling_torque = 0.0;
         self.wheel_limit_velocity = 0.0;
@@ -367,6 +365,12 @@ impl Wheel {
         self.ground_type.clear();
         self.suspension_compression_rate = 0.0;
         self.contact_damping = self.base_contact_damping;
+    }
+
+    fn clear_powered_spin_state(&mut self) {
+        self.powered_angular_velocity = 0.0;
+        self.powered_slip = 0.0;
+        self.powered_slip_timer = 0.0;
     }
 
     /// Information about suspension and the ground obtained from the ray-casting
@@ -520,14 +524,30 @@ fn update_powered_wheel_rotation(
     }
 
     if wheel.lock {
-        wheel.powered_angular_velocity = 0.0;
-        wheel.powered_slip = 0.0;
-        wheel.powered_slip_timer = 0.0;
+        wheel.clear_powered_spin_state();
     }
 
     wheel.previous_rolling_surface_speed = rolling_surface_speed;
     rolling_angular_velocity
         + (wheel.powered_angular_velocity - rolling_angular_velocity) * wheel.powered_slip
+}
+
+fn update_wheel_rotation(wheel: &mut Wheel, rolling_angular_velocity: Real, dt: Real) {
+    if wheel.lock {
+        wheel.delta_rotation = 0.0;
+        wheel.clear_powered_spin_state();
+    } else if wheel.raycast_info.is_in_contact {
+        wheel.delta_rotation =
+            update_powered_wheel_rotation(wheel, rolling_angular_velocity, dt) * dt;
+    } else {
+        let rolling_angular_velocity = wheel.delta_rotation / dt.max(Real::EPSILON);
+        wheel.delta_rotation =
+            update_powered_wheel_rotation(wheel, rolling_angular_velocity, dt) * dt;
+        wheel.delta_rotation *= 1.0 - wheel.brake.clamp(0.0, 1.0);
+    }
+
+    wheel.rotation += wheel.delta_rotation;
+    wheel.delta_rotation *= 0.99;
 }
 
 fn smoothstep(edge0: Real, edge1: Real, value: Real) -> Real {
@@ -1486,25 +1506,7 @@ impl DynamicRayCastVehicleController {
             .collect();
 
         for (wheel_id, wheel) in self.wheels.iter_mut().enumerate() {
-            if wheel.lock {
-                wheel.delta_rotation = 0.0;
-            } else {
-                if wheel.raycast_info.is_in_contact {
-                    wheel.delta_rotation = update_powered_wheel_rotation(
-                        wheel,
-                        rolling_angular_velocities[wheel_id],
-                        dt,
-                    ) * dt;
-                } else {
-                    let rolling_angular_velocity = wheel.delta_rotation / dt.max(Real::EPSILON);
-                    wheel.delta_rotation =
-                        update_powered_wheel_rotation(wheel, rolling_angular_velocity, dt) * dt;
-                    wheel.delta_rotation *= 1.0 - wheel.brake.clamp(0.0, 1.0); // Apply brake
-                }
-            }
-
-            wheel.rotation += wheel.delta_rotation;
-            wheel.delta_rotation *= 0.99; //damping of rotation when not in contact
+            update_wheel_rotation(wheel, rolling_angular_velocities[wheel_id], dt);
         }
         let chassis = &bodies[self.chassis];
         self.update_output_state(chassis);
@@ -2345,6 +2347,25 @@ mod tests {
         let rotation = update_powered_wheel_rotation(&mut wheel, 0.0, 1.0 / 60.0);
 
         assert_eq!(rotation, 0.0);
+        assert_eq!(wheel.powered_angular_velocity, 0.0);
+        assert_eq!(wheel.powered_slip, 0.0);
+        assert_eq!(wheel.powered_slip_timer, 0.0);
+    }
+
+    #[test]
+    fn locked_wheel_rotation_update_clears_powered_spin_state() {
+        let mut wheel = powered_test_wheel();
+        wheel.rotation = 4.0;
+        wheel.delta_rotation = 0.5;
+        wheel.powered_angular_velocity = 30.0;
+        wheel.powered_slip = 1.0;
+        wheel.powered_slip_timer = POWERED_SLIP_RESISTANCE_DELAY;
+        wheel.lock = true;
+
+        update_wheel_rotation(&mut wheel, 0.0, 1.0 / 60.0);
+
+        assert_eq!(wheel.rotation, 4.0);
+        assert_eq!(wheel.delta_rotation, 0.0);
         assert_eq!(wheel.powered_angular_velocity, 0.0);
         assert_eq!(wheel.powered_slip, 0.0);
         assert_eq!(wheel.powered_slip_timer, 0.0);
