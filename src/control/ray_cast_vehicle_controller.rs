@@ -18,6 +18,27 @@ const DRIFT_ASSIST_RESPONSE: Real = 8.0;
 const DRIFT_ASSIST_RELEASE_RESPONSE: Real = 15.0;
 const DRIFT_ASSIST_YAW_DAMPING: Real = 0.08;
 const DRIFT_ASSIST_INPUT_DEADZONE: Real = 0.01;
+const POWERED_SLIP_MIN_SURFACE_SPEED_GAP: Real = 0.5;
+const POWERED_SLIP_MIN_ROAD_ACCELERATION: Real = 0.5;
+const POWERED_SLIP_RESISTANCE_MAX_ROAD_SPEED: Real = 1.0;
+const POWERED_SLIP_RESISTANCE_DELAY: Real = 0.18;
+const POWERED_SLIP_ENGAGE_RESPONSE: Real = 14.0;
+const POWERED_SLIP_RELEASE_RESPONSE: Real = 3.0;
+const POWERED_SLIP_EFFECTIVE_INERTIA: Real = 12.0;
+const POWERED_SLIP_ROTATIONAL_DAMPING: Real = 0.35;
+const TRACTION_CONTROL_MIN_BODY_SPEED: Real = 0.75;
+const TRACTION_CONTROL_LOW_SPEED_GAP_START: Real = 0.5;
+const TRACTION_CONTROL_LOW_SPEED_GAP_FULL: Real = 3.0;
+const TRACTION_CONTROL_SLIP_START: Real = 0.12;
+const TRACTION_CONTROL_SLIP_FULL: Real = 0.55;
+const TRACTION_CONTROL_SPEED_OFF: Real = 2.0;
+const TRACTION_CONTROL_SPEED_FULL: Real = 8.0;
+const TRACTION_CONTROL_LOW_SPEED_OVERRIDE_FULL: Real = 2.0;
+const TRACTION_CONTROL_LOW_SPEED_OVERRIDE_OFF: Real = 4.0;
+const TRACTION_CONTROL_STEERING_OVERRIDE_START: Real = 0.2;
+const TRACTION_CONTROL_STEERING_OVERRIDE_FULL: Real = 0.8;
+const TRACTION_CONTROL_ENGAGE_RESPONSE: Real = 18.0;
+const TRACTION_CONTROL_RELEASE_RESPONSE: Real = 8.0;
 
 /// A character controller to simulate vehicles using ray-casting for the wheels.
 pub struct DynamicRayCastVehicleController {
@@ -177,6 +198,16 @@ pub struct Wheel {
     pub delta_rotation: Real,
     /// The target angular velocity of the wheel.
     pub target_rotation: Real,
+    powered_angular_velocity: Real,
+    powered_slip: Real,
+    powered_slip_timer: Real,
+    previous_rolling_surface_speed: Real,
+    wheel_coupling_torque: Real,
+    wheel_limit_velocity: Real,
+    drive_throttle: Real,
+    drivetrain_connected: bool,
+    drive_slip_demand: Real,
+    traction_control_cut: Real,
     /// The influence of the roll on the wheel’s suspension.
     pub anti_roll: Real,
     /// The maximum force applied by the suspension.
@@ -258,6 +289,16 @@ impl Wheel {
             rotation: 0.0,
             delta_rotation: 0.0,
             target_rotation: 0.0,
+            powered_angular_velocity: 0.0,
+            powered_slip: 0.0,
+            powered_slip_timer: 0.0,
+            previous_rolling_surface_speed: 0.0,
+            wheel_coupling_torque: 0.0,
+            wheel_limit_velocity: 0.0,
+            drive_throttle: 0.0,
+            drivetrain_connected: false,
+            drive_slip_demand: 0.0,
+            traction_control_cut: 0.0,
             brake: 0.0,
             max_brake_force: 1000.0,
             anti_lock_brake: 0.0,
@@ -297,6 +338,16 @@ impl Wheel {
         self.rotation = 0.0;
         self.delta_rotation = 0.0;
         self.target_rotation = 0.0;
+        self.powered_angular_velocity = 0.0;
+        self.powered_slip = 0.0;
+        self.powered_slip_timer = 0.0;
+        self.previous_rolling_surface_speed = 0.0;
+        self.wheel_coupling_torque = 0.0;
+        self.wheel_limit_velocity = 0.0;
+        self.drive_throttle = 0.0;
+        self.drivetrain_connected = false;
+        self.drive_slip_demand = 0.0;
+        self.traction_control_cut = 0.0;
         self.forward_impulse = 0.0;
         self.side_impulse = 0.0;
         self.brake_impulse = 0.0;
@@ -305,7 +356,6 @@ impl Wheel {
         self.brake = 0.0;
         self.anti_lock_brake = 0.0;
         self.is_anti_lock_brake = false;
-        self.traction_control = 0.0;
         self.engine_force_feedback = 0.0;
         self.lock = false;
         self.clipped_inv_contact_dot_suspension = 0.0;
@@ -401,14 +451,210 @@ fn aligned_wheel_forward(
     forward
 }
 
-fn powered_against_motion(
-    engine_force: Real,
-    target_rotation: Real,
-    rolling_rotation: Real,
-) -> bool {
-    engine_force.abs() > Real::EPSILON
-        && target_rotation.abs() > Real::EPSILON
-        && rolling_rotation * target_rotation < 0.0
+fn update_powered_wheel_rotation(
+    wheel: &mut Wheel,
+    rolling_angular_velocity: Real,
+    dt: Real,
+) -> Real {
+    let dt = dt.max(Real::EPSILON);
+    let radius = wheel.radius.max(Real::EPSILON);
+    let direction = wheel.target_rotation.signum();
+    let rolling_surface_speed = rolling_angular_velocity * radius;
+    let speed_gap = (wheel.target_rotation * radius - rolling_surface_speed) * direction;
+    let road_acceleration =
+        ((rolling_surface_speed - wheel.previous_rolling_surface_speed) / dt) * direction;
+    let powered = wheel.role.driven
+        && wheel.drivetrain_connected
+        && wheel.drive_throttle > 0.1
+        && direction != 0.0;
+    let opposing_motion = rolling_angular_velocity * wheel.target_rotation < 0.0;
+    let resisted = powered
+        && wheel.raycast_info.is_in_contact
+        && rolling_surface_speed.abs() < POWERED_SLIP_RESISTANCE_MAX_ROAD_SPEED
+        && speed_gap > POWERED_SLIP_MIN_SURFACE_SPEED_GAP
+        && road_acceleration < POWERED_SLIP_MIN_ROAD_ACCELERATION;
+    let airborne = powered && !wheel.raycast_info.is_in_contact;
+
+    if resisted {
+        wheel.powered_slip_timer =
+            (wheel.powered_slip_timer + dt).min(POWERED_SLIP_RESISTANCE_DELAY);
+    } else {
+        wheel.powered_slip_timer = (wheel.powered_slip_timer - dt * 2.0).max(0.0);
+    }
+
+    let resistance_confirmed =
+        resisted && wheel.powered_slip_timer >= POWERED_SLIP_RESISTANCE_DELAY;
+    let unrestricted_slip = opposing_motion || airborne || resistance_confirmed;
+    let requested_slip = if unrestricted_slip {
+        1.0
+    } else {
+        wheel.drive_slip_demand.clamp(0.0, 1.0)
+    };
+    let spin_requested = powered && requested_slip > Real::EPSILON;
+    let response = if spin_requested {
+        POWERED_SLIP_ENGAGE_RESPONSE
+    } else {
+        POWERED_SLIP_RELEASE_RESPONSE
+    };
+    let target_slip = if spin_requested { requested_slip } else { 0.0 };
+    let blend = 1.0 - (-response * dt).exp();
+    let previous_slip = wheel.powered_slip;
+    wheel.powered_slip += (target_slip - wheel.powered_slip) * blend;
+
+    if previous_slip <= Real::EPSILON && wheel.powered_slip > Real::EPSILON {
+        wheel.powered_angular_velocity = rolling_angular_velocity;
+    }
+
+    if wheel.powered_slip > Real::EPSILON {
+        let inertia = POWERED_SLIP_EFFECTIVE_INERTIA * (radius / 0.35).powi(2);
+        wheel.powered_angular_velocity += wheel.wheel_coupling_torque / inertia * dt;
+        wheel.powered_angular_velocity *= (-POWERED_SLIP_ROTATIONAL_DAMPING * dt).exp();
+
+        let limit = wheel.wheel_limit_velocity.abs();
+        if limit > Real::EPSILON {
+            let directed_velocity = (wheel.powered_angular_velocity * direction).clamp(0.0, limit);
+            wheel.powered_angular_velocity = directed_velocity * direction;
+        }
+    } else {
+        wheel.powered_angular_velocity = rolling_angular_velocity;
+    }
+
+    if wheel.lock {
+        wheel.powered_angular_velocity = 0.0;
+        wheel.powered_slip = 0.0;
+        wheel.powered_slip_timer = 0.0;
+    }
+
+    wheel.previous_rolling_surface_speed = rolling_surface_speed;
+    rolling_angular_velocity
+        + (wheel.powered_angular_velocity - rolling_angular_velocity) * wheel.powered_slip
+}
+
+fn smoothstep(edge0: Real, edge1: Real, value: Real) -> Real {
+    let rate = ((value - edge0) / (edge1 - edge0).max(Real::EPSILON)).clamp(0.0, 1.0);
+    rate * rate * (3.0 - 2.0 * rate)
+}
+
+fn traction_control_speed_factor(body_speed: Real) -> Real {
+    smoothstep(
+        TRACTION_CONTROL_SPEED_OFF,
+        TRACTION_CONTROL_SPEED_FULL,
+        body_speed.abs(),
+    )
+}
+
+fn traction_control_steering_factor(steering_input: Real) -> Real {
+    smoothstep(
+        TRACTION_CONTROL_STEERING_OVERRIDE_START,
+        TRACTION_CONTROL_STEERING_OVERRIDE_FULL,
+        steering_input.abs(),
+    )
+}
+
+fn traction_control_low_speed_factor(body_speed: Real) -> Real {
+    smoothstep(
+        TRACTION_CONTROL_LOW_SPEED_OVERRIDE_FULL,
+        TRACTION_CONTROL_LOW_SPEED_OVERRIDE_OFF,
+        body_speed.abs(),
+    )
+}
+
+fn effective_traction_control_strength(
+    assigned_strength: Real,
+    body_speed: Real,
+    steering_input: Real,
+) -> Real {
+    let speed_recovery = traction_control_speed_factor(body_speed);
+    let steering_override = traction_control_steering_factor(steering_input);
+    let low_speed_factor = traction_control_low_speed_factor(body_speed);
+    assigned_strength.clamp(0.0, 1.0)
+        * low_speed_factor
+        * (1.0 - steering_override * (1.0 - speed_recovery))
+}
+
+fn planar_speed(linear_velocity: &Vector<Real>, up: &Vector<Real>) -> Real {
+    let planar_velocity = linear_velocity - up * linear_velocity.dot(up);
+    planar_velocity.norm()
+}
+
+fn drive_capacity_excess(drive_demand: Real, forward_capacity: Real) -> Real {
+    if drive_demand <= Real::EPSILON {
+        0.0
+    } else {
+        ((drive_demand - forward_capacity.max(0.0)) / drive_demand).clamp(0.0, 1.0)
+    }
+}
+
+fn powered_slip_forward_capacity(
+    longitudinal_capacity: Real,
+    remaining_forward_capacity: Real,
+    body_speed: Real,
+) -> Real {
+    let speed_factor = traction_control_speed_factor(body_speed);
+    remaining_forward_capacity + (longitudinal_capacity - remaining_forward_capacity) * speed_factor
+}
+
+fn residual_drive_slip_demand(
+    controlled_drive_demand: Real,
+    forward_capacity: Real,
+    raw_drive_demand: Real,
+) -> Real {
+    let residual_excess = (controlled_drive_demand - forward_capacity).max(0.0);
+    let capacity_scale = forward_capacity.max(raw_drive_demand * 0.1);
+    (residual_excess / capacity_scale.max(Real::EPSILON)).clamp(0.0, 1.0)
+}
+
+fn traction_controlled_drive_slip_demand(
+    raw_drive_demand: Real,
+    forward_capacity: Real,
+    traction_control_strength: Real,
+) -> Real {
+    let uncontrolled_slip =
+        residual_drive_slip_demand(raw_drive_demand, forward_capacity, raw_drive_demand);
+    uncontrolled_slip * (1.0 - traction_control_strength.clamp(0.0, 1.0))
+}
+
+fn contact_rolling_angular_velocity(
+    contact_velocity: &Vector<Real>,
+    wheel_forward: &Vector<Real>,
+    wheel_radius: Real,
+) -> Real {
+    wheel_forward.dot(contact_velocity) / wheel_radius.max(Real::EPSILON)
+}
+
+fn traction_control_target(
+    strength: Real,
+    wheel_surface_speed: Real,
+    body_forward_speed: Real,
+    drive_direction: Real,
+    capacity_excess: Real,
+    bypass: bool,
+) -> Real {
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= Real::EPSILON || drive_direction == 0.0 || bypass {
+        return 0.0;
+    }
+
+    let directed_body_speed = body_forward_speed * drive_direction;
+    if directed_body_speed < -TRACTION_CONTROL_MIN_BODY_SPEED {
+        return 0.0;
+    }
+
+    let directed_wheel_speed = wheel_surface_speed * drive_direction;
+    let powered_overspeed = (directed_wheel_speed - directed_body_speed).max(0.0);
+    let low_speed = directed_body_speed <= TRACTION_CONTROL_MIN_BODY_SPEED;
+    let slip_intervention = if low_speed {
+        ((powered_overspeed - TRACTION_CONTROL_LOW_SPEED_GAP_START)
+            / (TRACTION_CONTROL_LOW_SPEED_GAP_FULL - TRACTION_CONTROL_LOW_SPEED_GAP_START))
+            .clamp(0.0, 1.0)
+    } else {
+        let slip_ratio = powered_overspeed / directed_body_speed;
+        ((slip_ratio - TRACTION_CONTROL_SLIP_START)
+            / (TRACTION_CONTROL_SLIP_FULL - TRACTION_CONTROL_SLIP_START))
+            .clamp(0.0, 1.0)
+    };
+
+    strength * slip_intervention.max(capacity_excess.clamp(0.0, 1.0))
 }
 
 impl DynamicRayCastVehicleController {
@@ -658,7 +904,14 @@ impl DynamicRayCastVehicleController {
         };
 
         let wheel_id = self.wheels.len();
-        self.wheels.push(Wheel::new(ci));
+        let mut wheel = Wheel::new(ci);
+        wheel.traction_control = self
+            .powertrain
+            .config
+            .dynamics
+            .traction_control_strength
+            .clamp(0.0, 1.0);
+        self.wheels.push(wheel);
 
         &mut self.wheels[wheel_id]
     }
@@ -980,10 +1233,6 @@ impl DynamicRayCastVehicleController {
             0.0
         };
         let speed_factor = ((self.current_vehicle_speed.abs() - 10.0) / 10.0).clamp(0.0, 1.0);
-        let steering_rate = (self.powertrain.state().steering_angle
-            / self.powertrain.config.steering.max_angle.max(Real::EPSILON))
-        .abs();
-        let steering_traction_factor = 1.0 - ((steering_rate - 0.5) / 0.5).clamp(0.0, 1.0);
 
         for wheel in &mut self.wheels {
             if wheel.role.driven {
@@ -993,8 +1242,10 @@ impl DynamicRayCastVehicleController {
                     output.engine_brake_torque / (radius * driven_divisor) * motion_sign;
                 wheel.engine_force = drive_force - engine_brake_force;
                 wheel.target_rotation = output.wheel_target_velocity;
-                wheel.traction_control = dynamics.traction_control_strength
-                    * (steering_traction_factor * (1.0 - speed_factor) + speed_factor);
+                wheel.wheel_coupling_torque = output.wheel_coupling_torque / driven_divisor;
+                wheel.wheel_limit_velocity = output.wheel_limit_velocity;
+                wheel.drive_throttle = output.drive_throttle;
+                wheel.drivetrain_connected = output.drivetrain_connected;
                 let wheel_speed = wheel.delta_rotation.abs() * wheel.radius;
                 let skid = if wheel_speed > 0.1 {
                     (self.current_vehicle_speed.abs() * dt / wheel_speed).powi(3)
@@ -1007,7 +1258,10 @@ impl DynamicRayCastVehicleController {
             } else {
                 wheel.engine_force = 0.0;
                 wheel.target_rotation = 0.0;
-                wheel.traction_control = 0.0;
+                wheel.wheel_coupling_torque = 0.0;
+                wheel.wheel_limit_velocity = 0.0;
+                wheel.drive_throttle = 0.0;
+                wheel.drivetrain_connected = false;
             }
 
             let service_brake = match wheel.role.axle {
@@ -1077,7 +1331,7 @@ impl DynamicRayCastVehicleController {
             self.wheels
                 .iter()
                 .filter(|wheel| wheel.role.driven && wheel.raycast_info.is_in_contact)
-                .map(|wheel| (0.8 - wheel.skid_info).max(0.0) / 0.8)
+                .map(|wheel| wheel.traction_control_cut)
                 .sum::<Real>()
                 / driven_count as Real
         };
@@ -1208,58 +1462,43 @@ impl DynamicRayCastVehicleController {
 
         self.update_friction(bodies, colliders, dt);
 
-        let chassis = bodies
-            .get_mut_internal_with_modification_tracking(self.chassis)
-            .unwrap();
+        let rolling_angular_velocities: Vec<Real> = self
+            .wheels
+            .iter()
+            .enumerate()
+            .map(|(wheel_id, wheel)| {
+                let Some(ground_object) = wheel.raycast_info.ground_object else {
+                    return wheel.delta_rotation / dt.max(Real::EPSILON);
+                };
+                let contact_velocity = relative_velocity_at_contact(
+                    bodies,
+                    colliders,
+                    self.chassis,
+                    Some(ground_object),
+                    &wheel.raycast_info.contact_point_ws,
+                );
+                contact_rolling_angular_velocity(
+                    &contact_velocity,
+                    &self.forward_ws[wheel_id],
+                    wheel.radius,
+                )
+            })
+            .collect();
 
-        for wheel in &mut self.wheels {
-            let vel = chassis.velocity_at_point(&wheel.center);
-            let target_rotation = wheel.target_rotation * dt;
+        for (wheel_id, wheel) in self.wheels.iter_mut().enumerate() {
             if wheel.lock {
                 wheel.delta_rotation = 0.0;
             } else {
                 if wheel.raycast_info.is_in_contact {
-                    let mut fwd = chassis.position() * Vector::ith(self.index_forward_axis, 1.0);
-                    let proj = fwd.dot(&wheel.raycast_info.contact_normal_ws);
-                    fwd -= wheel.raycast_info.contact_normal_ws * proj;
-
-                    wheel.delta_rotation = if let Some(fwd) = fwd.try_normalize(Real::EPSILON) {
-                        (fwd.dot(&vel) * dt) / wheel.radius.max(Real::EPSILON)
-                    } else {
-                        0.0
-                    };
-                    if powered_against_motion(
-                        wheel.engine_force,
-                        target_rotation,
-                        wheel.delta_rotation,
-                    ) {
-                        // A ray-cast wheel has no angular body of its own. Drive it at the
-                        // powered target while the chassis is still moving the other way.
-                        wheel.delta_rotation = target_rotation;
-                    } else {
-                        let allow_drive_spin =
-                            self.current_vehicle_speed.abs() >= 0.5 || wheel.skid_info < 0.5;
-                        if wheel.skid_info < 0.8
-                            && wheel.engine_force.abs() > 0.0
-                            && allow_drive_spin
-                        {
-                            let traction_control = wheel.traction_control.clamp(0.0, 1.0);
-                            let slip = ((0.8 - wheel.skid_info) / 0.8).clamp(0.0, 1.0);
-                            let speed_factor =
-                                (self.current_vehicle_speed.abs() / 5.0).clamp(0.0, 1.0);
-                            let traction_control_factor = traction_control * slip * speed_factor;
-                            // Apply custom rotation when accelerating and sliding
-                            wheel.delta_rotation = wheel.delta_rotation * traction_control_factor
-                                + (wheel.delta_rotation
-                                    + ((target_rotation - wheel.delta_rotation)
-                                        * (1.0 - wheel.skid_info.powi(2))))
-                                    * (1.0 - traction_control_factor);
-                        }
-                    }
+                    wheel.delta_rotation = update_powered_wheel_rotation(
+                        wheel,
+                        rolling_angular_velocities[wheel_id],
+                        dt,
+                    ) * dt;
                 } else {
-                    if wheel.engine_force.abs() > 0.0 && target_rotation != 0.0 {
-                        wheel.delta_rotation = target_rotation;
-                    }
+                    let rolling_angular_velocity = wheel.delta_rotation / dt.max(Real::EPSILON);
+                    wheel.delta_rotation =
+                        update_powered_wheel_rotation(wheel, rolling_angular_velocity, dt) * dt;
                     wheel.delta_rotation *= 1.0 - wheel.brake.clamp(0.0, 1.0); // Apply brake
                 }
             }
@@ -1267,6 +1506,7 @@ impl DynamicRayCastVehicleController {
             wheel.rotation += wheel.delta_rotation;
             wheel.delta_rotation *= 0.99; //damping of rotation when not in contact
         }
+        let chassis = &bodies[self.chassis];
         self.update_output_state(chassis);
     }
 
@@ -1323,6 +1563,7 @@ impl DynamicRayCastVehicleController {
     #[profiling::function]
     fn update_friction(&mut self, bodies: &mut RigidBodySet, colliders: &ColliderSet, dt: Real) {
         let num_wheels = self.wheels.len();
+        let steering_input = self.powertrain.input().steering;
 
         if num_wheels == 0 {
             return;
@@ -1332,15 +1573,26 @@ impl DynamicRayCastVehicleController {
         self.axle.resize(num_wheels, Default::default());
         let mut contacts = vec![WheelContactState::default(); num_wheels];
 
-        let (esc_engine_cut, esc_brake_strength, esc_brake_side, esc_side_axis, chassis_forward) = {
+        let (
+            esc_engine_cut,
+            esc_brake_strength,
+            esc_brake_side,
+            esc_side_axis,
+            chassis_forward,
+            body_speed,
+        ) = {
             let chassis = &bodies[self.chassis];
             let (engine_cut, brake_strength, brake_side) = self.esc_intervention(chassis);
+            let rotation = chassis.position().rotation;
+            let chassis_forward = rotation * Vector::ith(self.index_forward_axis, 1.0);
+            let chassis_up = rotation * Vector::ith(self.index_up_axis, 1.0);
             (
                 engine_cut,
                 brake_strength,
                 brake_side,
                 self.side_axis(),
-                chassis.position().rotation * Vector::ith(self.index_forward_axis, 1.0),
+                chassis_forward,
+                planar_speed(chassis.linvel(), &chassis_up),
             )
         };
 
@@ -1354,12 +1606,14 @@ impl DynamicRayCastVehicleController {
             wheel.lock = false;
             wheel.skid_info = 0.0;
             wheel.engine_force_feedback = 0.0;
+            wheel.drive_slip_demand = 0.0;
         }
 
         for wheel_id in 0..num_wheels {
             let wheel = &mut self.wheels[wheel_id];
             let Some(ground_object) = wheel.raycast_info.ground_object else {
                 wheel.last_skid_info = wheel.skid_info;
+                wheel.traction_control_cut = 0.0;
                 continue;
             };
 
@@ -1420,17 +1674,103 @@ impl DynamicRayCastVehicleController {
             );
             wheel.engine_force_feedback = rolling_friction;
 
-            let traction_control = wheel.traction_control.clamp(0.0, 1.0);
-            let traction_slip = ((0.8 - wheel.last_skid_info) / 0.8).clamp(0.0, 1.0);
-            let traction_speed = (self.current_vehicle_speed.abs() / 5.0).clamp(0.0, 1.0);
-            let traction_cut = if wheel.last_skid_info < 0.8 && wheel.engine_force.abs() > 0.0 {
-                traction_control * traction_slip * traction_speed
+            wheel.side_impulse = resolve_ground_impulse(
+                bodies,
+                colliders,
+                self.chassis,
+                contact.ground_object,
+                &wheel.raycast_info.contact_point_ws,
+                &contact.side_dir,
+                wheel.contact_damping,
+            );
+
+            if contact.side_speed.abs() < 1.0 {
+                let side_hold = resolve_ground_impulse(
+                    bodies,
+                    colliders,
+                    self.chassis,
+                    contact.ground_object,
+                    &wheel.raycast_info.contact_point_ws,
+                    &contact.side_dir,
+                    1.0,
+                );
+
+                if side_hold.abs() > wheel.side_impulse.abs() {
+                    wheel.side_impulse = side_hold;
+                }
+            }
+
+            wheel.side_impulse *= wheel.side_friction_stiffness;
+            let side_total = wheel.side_impulse * wheel.side_factor;
+            let limit_squared = contact.friction_limit * contact.friction_limit;
+            let remaining_forward_limit = (limit_squared - side_total * side_total).max(0.0).sqrt();
+
+            let drive_direction = wheel.target_rotation.signum();
+            let powered_acceleration = wheel.role.driven
+                && wheel.drivetrain_connected
+                && wheel.drive_throttle > 0.1
+                && wheel.engine_force * drive_direction > Real::EPSILON;
+            let raw_drive_impulse = wheel.engine_force * dt * (1.0 - esc_engine_cut);
+            let raw_drive_demand = (raw_drive_impulse * wheel.fwd_factor).abs();
+            let capacity_excess = if powered_acceleration && raw_drive_demand > Real::EPSILON {
+                drive_capacity_excess(raw_drive_demand, contact.friction_limit)
             } else {
                 0.0
             };
+            let resistance_confirmed = wheel.powered_slip_timer >= POWERED_SLIP_RESISTANCE_DELAY
+                && contact.forward_speed.abs() < POWERED_SLIP_RESISTANCE_MAX_ROAD_SPEED;
+            let opposing_motion =
+                contact.forward_speed * drive_direction < -TRACTION_CONTROL_MIN_BODY_SPEED;
+            let traction_control_bypass = resistance_confirmed || opposing_motion;
+            let wheel_surface_speed = wheel.delta_rotation / dt.max(Real::EPSILON) * wheel.radius;
+            let effective_strength = effective_traction_control_strength(
+                wheel.traction_control,
+                body_speed,
+                steering_input,
+            );
+            let target_traction_cut = if powered_acceleration {
+                traction_control_target(
+                    effective_strength,
+                    wheel_surface_speed,
+                    contact.forward_speed,
+                    drive_direction,
+                    capacity_excess,
+                    traction_control_bypass,
+                )
+            } else {
+                0.0
+            };
+            if effective_strength <= Real::EPSILON {
+                wheel.traction_control_cut = 0.0;
+            } else {
+                let traction_response = if target_traction_cut > wheel.traction_control_cut {
+                    TRACTION_CONTROL_ENGAGE_RESPONSE
+                } else {
+                    TRACTION_CONTROL_RELEASE_RESPONSE
+                };
+                let traction_blend = 1.0 - (-traction_response * dt).exp();
+                wheel.traction_control_cut +=
+                    (target_traction_cut - wheel.traction_control_cut) * traction_blend;
+            }
+            let traction_cut = wheel.traction_control_cut;
 
-            wheel.forward_impulse = wheel.engine_force * dt * (1.0 - traction_cut);
-            wheel.forward_impulse *= 1.0 - esc_engine_cut;
+            wheel.forward_impulse = raw_drive_impulse * (1.0 - traction_cut);
+            wheel.drive_slip_demand = if powered_acceleration && traction_control_bypass {
+                1.0
+            } else if powered_acceleration {
+                let powered_slip_capacity = powered_slip_forward_capacity(
+                    contact.friction_limit,
+                    remaining_forward_limit,
+                    body_speed,
+                );
+                traction_controlled_drive_slip_demand(
+                    raw_drive_demand,
+                    powered_slip_capacity,
+                    effective_strength,
+                )
+            } else {
+                0.0
+            };
 
             let esc_brake = if esc_brake_strength > 0.0 {
                 let side = wheel.chassis_connection_point_cs.coords[esc_side_axis];
@@ -1512,39 +1852,9 @@ impl DynamicRayCastVehicleController {
                 wheel.lock = true;
             }
 
-            wheel.side_impulse = resolve_ground_impulse(
-                bodies,
-                colliders,
-                self.chassis,
-                contact.ground_object,
-                &wheel.raycast_info.contact_point_ws,
-                &contact.side_dir,
-                wheel.contact_damping,
-            );
-
-            if contact.side_speed.abs() < 1.0 {
-                let side_hold = resolve_ground_impulse(
-                    bodies,
-                    colliders,
-                    self.chassis,
-                    contact.ground_object,
-                    &wheel.raycast_info.contact_point_ws,
-                    &contact.side_dir,
-                    1.0,
-                );
-
-                if side_hold.abs() > wheel.side_impulse.abs() {
-                    wheel.side_impulse = side_hold;
-                }
-            }
-
-            wheel.side_impulse *= wheel.side_friction_stiffness;
-
             let forward_total =
                 wheel.forward_impulse * wheel.fwd_factor + wheel.brake_impulse * wheel.brake_factor;
-            let side_total = wheel.side_impulse * wheel.side_factor;
             let impulse_squared = forward_total * forward_total + side_total * side_total;
-            let limit_squared = contact.friction_limit * contact.friction_limit;
 
             wheel.skid_info = 1.0;
 
@@ -1620,19 +1930,6 @@ mod tests {
     }
 
     #[test]
-    fn powered_wheel_overrides_opposite_rolling_rotation_in_forward_and_reverse() {
-        assert!(powered_against_motion(100.0, 0.5, -0.2));
-        assert!(powered_against_motion(-100.0, -0.5, 0.2));
-    }
-
-    #[test]
-    fn unpowered_or_aligned_wheel_keeps_rolling_rotation() {
-        assert!(!powered_against_motion(0.0, 0.5, -0.2));
-        assert!(!powered_against_motion(100.0, 0.5, 0.2));
-        assert!(!powered_against_motion(100.0, 0.0, -0.2));
-    }
-
-    #[test]
     fn driven_wheel_speed_preserves_rotation_direction() {
         let mut controller = DynamicRayCastVehicleController::new(
             RigidBodyHandle::invalid(),
@@ -1653,6 +1950,486 @@ mod tests {
 
         assert!(speed < 0.0);
         assert_eq!(radius, 0.35);
+    }
+
+    fn powered_test_wheel() -> Wheel {
+        let mut wheel = Wheel::new(WheelDesc {
+            chassis_connection_cs: Point::origin(),
+            direction_cs: -Vector::y(),
+            axle_cs: Vector::x(),
+            suspension_rest_length: 0.4,
+            max_suspension_travel: 5.0,
+            radius: 0.35,
+            suspension_stiffness: 5.88,
+            damping_compression: 0.83,
+            damping_relaxation: 0.88,
+            friction_slip: 10.5,
+            max_suspension_force: 6000.0,
+            side_friction_stiffness: 1.0,
+            tire_type: "default".to_string(),
+            role: WheelRole::new(WheelAxle::Rear, true, false),
+        });
+        wheel.raycast_info.is_in_contact = true;
+        wheel.skid_info = 1.0;
+        wheel.target_rotation = 20.0;
+        wheel.wheel_limit_velocity = 50.0;
+        wheel.wheel_coupling_torque = 500.0;
+        wheel.drive_throttle = 1.0;
+        wheel.drivetrain_connected = true;
+        wheel
+    }
+
+    #[test]
+    fn accelerating_gripped_wheel_keeps_legacy_road_rotation() {
+        let mut wheel = powered_test_wheel();
+        let dt = 1.0 / 60.0;
+
+        for step in 0..120 {
+            let rolling_angular_velocity = step as Real * 0.15;
+            let rotation = update_powered_wheel_rotation(&mut wheel, rolling_angular_velocity, dt);
+            assert!((rotation - rolling_angular_velocity).abs() < 1.0e-5);
+        }
+
+        assert!(wheel.powered_slip < 1.0e-5);
+        assert_eq!(wheel.skid_info, 1.0);
+    }
+
+    #[test]
+    fn resisted_powered_wheel_transitions_into_spin_without_changing_tire_forces() {
+        let mut wheel = powered_test_wheel();
+        wheel.forward_impulse = 12.0;
+        wheel.side_impulse = 7.0;
+        let dt = 1.0 / 60.0;
+        let mut rotation = 0.0;
+
+        for _ in 0..120 {
+            rotation = update_powered_wheel_rotation(&mut wheel, 0.0, dt);
+        }
+
+        assert!(wheel.powered_slip > 0.99);
+        assert!(rotation > 10.0);
+        assert_eq!(wheel.forward_impulse, 12.0);
+        assert_eq!(wheel.side_impulse, 7.0);
+        assert_eq!(wheel.skid_info, 1.0);
+    }
+
+    #[test]
+    fn saturated_powered_wheel_enters_spin_without_the_resistance_delay() {
+        let mut wheel = powered_test_wheel();
+        wheel.drive_slip_demand = 1.0;
+        let dt = 1.0 / 60.0;
+
+        let rotation = update_powered_wheel_rotation(&mut wheel, 2.0, dt);
+
+        assert!(wheel.powered_slip > 0.0);
+        assert!(rotation > 2.0);
+        assert_eq!(wheel.powered_slip_timer, 0.0);
+    }
+
+    #[test]
+    fn powered_wheel_without_excess_drive_keeps_road_rotation_at_any_speed() {
+        let mut wheel = powered_test_wheel();
+        wheel.target_rotation = 250.0;
+        wheel.wheel_limit_velocity = 250.0;
+        let dt = 1.0 / 60.0;
+        let rolling_angular_velocity = 30.0 / wheel.radius;
+
+        for _ in 0..120 {
+            let rotation = update_powered_wheel_rotation(&mut wheel, rolling_angular_velocity, dt);
+            assert!((rotation - rolling_angular_velocity).abs() < 1.0e-5);
+        }
+
+        assert_eq!(wheel.powered_slip, 0.0);
+    }
+
+    #[test]
+    fn traction_control_cut_does_not_double_suppress_powered_spin() {
+        let mut wheel = powered_test_wheel();
+        wheel.drive_slip_demand = 1.0;
+        wheel.traction_control_cut = 1.0;
+        let dt = 1.0 / 60.0;
+        let mut rotation = 0.0;
+
+        for _ in 0..120 {
+            rotation = update_powered_wheel_rotation(&mut wheel, 5.0, dt);
+        }
+
+        assert!(wheel.powered_slip > 0.99);
+        assert!(rotation > 10.0);
+    }
+
+    #[test]
+    fn gear_change_does_not_artificially_clear_powered_spin() {
+        let mut controller = DynamicRayCastVehicleController::new(
+            RigidBodyHandle::invalid(),
+            VehicleControllerConfig::default(),
+        );
+        controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            0.4,
+            0.35,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Rear, true, false),
+        );
+        let wheel = &mut controller.wheels[0];
+        wheel.powered_angular_velocity = 40.0;
+        wheel.powered_slip = 1.0;
+        wheel.powered_slip_timer = POWERED_SLIP_RESISTANCE_DELAY;
+
+        controller.powertrain.state_mut().current_gear = 2;
+        controller.apply_powertrain_output(
+            super::super::vehicle_powertrain::PowertrainOutput {
+                drive_torque: 0.0,
+                engine_brake_torque: 0.0,
+                wheel_coupling_torque: 0.0,
+                wheel_target_velocity: 10.0,
+                wheel_limit_velocity: 50.0,
+                drive_throttle: 1.0,
+                drivetrain_connected: true,
+                service_brake: 0.0,
+            },
+            1.0 / 60.0,
+        );
+
+        let wheel = &controller.wheels[0];
+        assert_eq!(wheel.powered_angular_velocity, 40.0);
+        assert_eq!(wheel.powered_slip, 1.0);
+        assert_eq!(wheel.powered_slip_timer, POWERED_SLIP_RESISTANCE_DELAY);
+    }
+
+    #[test]
+    fn traction_control_uses_body_speed_for_straight_line_wheelspin() {
+        let matching_speed = traction_control_target(0.8, 10.5, 10.0, 1.0, 0.0, false);
+        let excessive_speed = traction_control_target(0.8, 15.0, 10.0, 1.0, 0.0, false);
+
+        assert_eq!(matching_speed, 0.0);
+        assert!(excessive_speed > 0.65);
+        assert!(excessive_speed <= 0.8);
+    }
+
+    #[test]
+    fn traction_control_supports_reverse_body_speed() {
+        let cut = traction_control_target(0.8, -16.0, -10.0, -1.0, 0.0, false);
+
+        assert_eq!(cut, 0.8);
+    }
+
+    #[test]
+    fn traction_control_strength_scales_intervention_monotonically() {
+        let strengths = [0.0, 0.25, 0.5, 0.75, 1.0];
+        let cuts =
+            strengths.map(|strength| traction_control_target(strength, 5.0, 5.0, 1.0, 0.6, false));
+
+        assert_eq!(cuts[0], 0.0);
+        assert!((cuts[1] - 0.15).abs() < 1.0e-5);
+        assert!((cuts[2] - 0.3).abs() < 1.0e-5);
+        assert!((cuts[3] - 0.45).abs() < 1.0e-5);
+        assert!((cuts[4] - 0.6).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn zero_traction_control_never_applies_electronic_intervention() {
+        for body_speed in [0.0, 2.0, 5.0, 8.0, 20.0] {
+            for steering_input in [-1.0, 0.0, 0.5, 1.0] {
+                let strength = effective_traction_control_strength(0.0, body_speed, steering_input);
+                let cut = traction_control_target(strength, 30.0, body_speed, 1.0, 1.0, false);
+
+                assert_eq!(strength, 0.0);
+                assert_eq!(cut, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn low_speed_override_recovers_assigned_traction_control_between_two_and_four_mps() {
+        let strengths = [0.0, 1.0, 2.0, 2.5, 3.0, 3.5, 4.0, 8.0]
+            .map(|speed| effective_traction_control_strength(0.8, speed, 0.0));
+
+        assert_eq!(strengths[0], 0.0);
+        assert_eq!(strengths[1], 0.0);
+        assert_eq!(strengths[2], 0.0);
+        assert!((strengths[3] - 0.125).abs() < 1.0e-5);
+        assert!((strengths[4] - 0.4).abs() < 1.0e-5);
+        assert!((strengths[5] - 0.675).abs() < 1.0e-5);
+        assert_eq!(strengths[6], 0.8);
+        assert_eq!(strengths[7], 0.8);
+    }
+
+    #[test]
+    fn steering_override_uses_the_existing_input_range() {
+        assert_eq!(traction_control_steering_factor(0.2), 0.0);
+        assert!((traction_control_steering_factor(0.5) - 0.5).abs() < 1.0e-5);
+        assert_eq!(traction_control_steering_factor(0.8), 1.0);
+        assert_eq!(traction_control_steering_factor(-1.0), 1.0);
+    }
+
+    #[test]
+    fn low_speed_and_steering_overrides_combine_independently() {
+        let no_steering_at_three = effective_traction_control_strength(1.0, 3.0, 0.0);
+        let full_steering_at_three = effective_traction_control_strength(1.0, 3.0, 1.0);
+        let no_steering_at_four = effective_traction_control_strength(1.0, 4.0, 0.0);
+        let full_steering_at_four = effective_traction_control_strength(1.0, 4.0, 1.0);
+
+        assert!((no_steering_at_three - 0.5).abs() < 1.0e-5);
+        assert!(full_steering_at_three > 0.0);
+        assert!(full_steering_at_three < no_steering_at_three);
+        assert_eq!(no_steering_at_four, 1.0);
+        assert!((full_steering_at_four - traction_control_speed_factor(4.0)).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn full_steering_traction_control_recovers_smoothly_with_body_speed() {
+        let strengths = [0.0, 2.0, 3.5, 5.0, 6.5, 8.0, 10.0]
+            .map(|speed| effective_traction_control_strength(1.0, speed, 1.0));
+
+        assert_eq!(strengths[0], 0.0);
+        assert_eq!(strengths[1], 0.0);
+        assert!(strengths.windows(2).all(|values| values[0] <= values[1]));
+        assert_eq!(strengths[5], 1.0);
+        assert_eq!(strengths[6], 1.0);
+    }
+
+    #[test]
+    fn speed_recovery_preserves_the_assigned_strength() {
+        assert!((effective_traction_control_strength(0.8, 5.0, 1.0) - 0.4).abs() < 1.0e-5);
+        assert!((effective_traction_control_strength(0.8, 5.0, 0.5) - 0.6).abs() < 1.0e-5);
+        assert_eq!(effective_traction_control_strength(0.8, 8.0, 1.0), 0.8);
+        assert_eq!(effective_traction_control_strength(0.8, 20.0, -1.0), 0.8);
+    }
+
+    #[test]
+    fn traction_control_does_not_feed_its_cut_back_into_powered_slip_demand() {
+        let raw_drive_demand = 12.0;
+        let forward_capacity = 6.0;
+
+        let no_tc = traction_controlled_drive_slip_demand(raw_drive_demand, forward_capacity, 0.0);
+        let partial_tc =
+            traction_controlled_drive_slip_demand(raw_drive_demand, forward_capacity, 0.5);
+        let full_tc =
+            traction_controlled_drive_slip_demand(raw_drive_demand, forward_capacity, 1.0);
+
+        assert!((no_tc - 1.0).abs() < 1.0e-5);
+        assert!((partial_tc - 0.5).abs() < 1.0e-5);
+        assert_eq!(full_tc, 0.0);
+    }
+
+    #[test]
+    fn steered_contact_speed_drives_rolling_rotation() {
+        let steering_angle: Real = 30.0;
+        let steering_angle = steering_angle.to_radians();
+        let wheel_forward =
+            Vector::ith(0, steering_angle.cos()) + Vector::ith(2, steering_angle.sin());
+        let contact_velocity = Vector::ith(0, 20.0);
+        let radius = 0.4;
+
+        let rolling_speed =
+            contact_rolling_angular_velocity(&contact_velocity, &wheel_forward, radius);
+        let wheel_surface_speed = rolling_speed * radius;
+        let expected_contact_speed = wheel_forward.dot(&contact_velocity);
+
+        assert!((wheel_surface_speed - expected_contact_speed).abs() < 1.0e-5);
+        assert!(wheel_surface_speed < contact_velocity[0]);
+    }
+
+    #[test]
+    fn high_speed_steering_does_not_change_powered_slip_capacity() {
+        let up = Vector::ith(1, 1.0);
+        let velocity = Vector::ith(0, 20.0) + Vector::ith(2, 1.0);
+        let body_speed = planar_speed(&velocity, &up);
+        let longitudinal_capacity = 10.0;
+        let straight_capacity =
+            powered_slip_forward_capacity(longitudinal_capacity, longitudinal_capacity, body_speed);
+        let cornering_capacity =
+            powered_slip_forward_capacity(longitudinal_capacity, 2.0, body_speed);
+
+        assert!(body_speed > TRACTION_CONTROL_SPEED_FULL);
+        assert_eq!(straight_capacity, longitudinal_capacity);
+        assert_eq!(cornering_capacity, longitudinal_capacity);
+    }
+
+    #[test]
+    fn zero_traction_control_preserves_real_high_speed_longitudinal_wheelspin() {
+        let raw_drive_demand = 12.0;
+        let forward_capacity = powered_slip_forward_capacity(10.0, 2.0, 20.0);
+        let mut wheel = powered_test_wheel();
+        wheel.drive_slip_demand =
+            residual_drive_slip_demand(raw_drive_demand, forward_capacity, raw_drive_demand);
+
+        let rotation = update_powered_wheel_rotation(&mut wheel, 20.0, 1.0 / 60.0);
+
+        assert!(wheel.drive_slip_demand > 0.0);
+        assert!(wheel.powered_slip > 0.0);
+        assert!(rotation > 20.0);
+    }
+
+    #[test]
+    fn low_speed_lateral_capacity_still_supports_donuts() {
+        let longitudinal_capacity = 10.0;
+        let remaining_cornering_capacity = 2.0;
+        let capacity =
+            powered_slip_forward_capacity(longitudinal_capacity, remaining_cornering_capacity, 0.0);
+
+        assert_eq!(capacity, remaining_cornering_capacity);
+        assert!(residual_drive_slip_demand(8.0, capacity, 8.0) > 0.0);
+    }
+
+    #[test]
+    fn traction_control_does_not_block_confirmed_resistance_or_opposing_burnout() {
+        let resisted = traction_control_target(0.8, 20.0, 0.0, 1.0, 1.0, true);
+        let opposing = traction_control_target(0.8, 20.0, -5.0, 1.0, 1.0, true);
+
+        assert_eq!(resisted, 0.0);
+        assert_eq!(opposing, 0.0);
+    }
+
+    #[test]
+    fn per_wheel_traction_control_strength_is_not_overwritten_by_powertrain_updates() {
+        let config = VehicleControllerConfig::default();
+        let expected_strength = config.dynamics.traction_control_strength;
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
+        controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            0.4,
+            0.35,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Rear, true, false),
+        );
+        let output = || super::super::vehicle_powertrain::PowertrainOutput {
+            drive_torque: 100.0,
+            engine_brake_torque: 0.0,
+            wheel_coupling_torque: 100.0,
+            wheel_target_velocity: 10.0,
+            wheel_limit_velocity: 50.0,
+            drive_throttle: 1.0,
+            drivetrain_connected: true,
+            service_brake: 0.0,
+        };
+
+        controller.wheels[0].traction_control = 0.25;
+        controller.apply_powertrain_output(output(), 1.0 / 60.0);
+
+        assert_ne!(expected_strength, 0.25);
+        assert_eq!(controller.wheels[0].traction_control, 0.25);
+    }
+
+    #[test]
+    fn powered_spin_preserves_reverse_rotation_direction() {
+        let mut wheel = powered_test_wheel();
+        wheel.target_rotation = -20.0;
+        wheel.wheel_limit_velocity = -50.0;
+        wheel.wheel_coupling_torque = -500.0;
+        let dt = 1.0 / 60.0;
+        let mut rotation = 0.0;
+
+        for _ in 0..120 {
+            rotation = update_powered_wheel_rotation(&mut wheel, 0.0, dt);
+        }
+
+        assert!(wheel.powered_slip > 0.99);
+        assert!(rotation < -10.0);
+    }
+
+    #[test]
+    fn locked_wheel_clears_powered_spin_state() {
+        let mut wheel = powered_test_wheel();
+        wheel.powered_angular_velocity = 30.0;
+        wheel.powered_slip = 1.0;
+        wheel.powered_slip_timer = POWERED_SLIP_RESISTANCE_DELAY;
+        wheel.lock = true;
+
+        let rotation = update_powered_wheel_rotation(&mut wheel, 0.0, 1.0 / 60.0);
+
+        assert_eq!(rotation, 0.0);
+        assert_eq!(wheel.powered_angular_velocity, 0.0);
+        assert_eq!(wheel.powered_slip, 0.0);
+        assert_eq!(wheel.powered_slip_timer, 0.0);
+    }
+
+    #[test]
+    fn powered_spin_smoothly_releases_when_drive_fits_available_traction() {
+        let mut wheel = powered_test_wheel();
+        wheel.powered_angular_velocity = 30.0;
+        wheel.powered_slip = 1.0;
+        wheel.drive_slip_demand = 1.0;
+        let dt = 1.0 / 60.0;
+        let rolling_angular_velocity = 5.0;
+
+        update_powered_wheel_rotation(&mut wheel, rolling_angular_velocity, dt);
+        assert_eq!(wheel.powered_slip, 1.0);
+
+        wheel.drive_slip_demand = 0.0;
+        update_powered_wheel_rotation(&mut wheel, rolling_angular_velocity, dt);
+        assert!(wheel.powered_slip > 0.9);
+
+        for _ in 0..180 {
+            update_powered_wheel_rotation(&mut wheel, rolling_angular_velocity, dt);
+        }
+        assert!(wheel.powered_slip < 2.0e-4);
+    }
+
+    #[test]
+    fn released_powered_spin_smoothly_returns_to_road_rotation() {
+        let mut wheel = powered_test_wheel();
+        wheel.powered_angular_velocity = 30.0;
+        wheel.powered_slip = 1.0;
+        wheel.powered_slip_timer = POWERED_SLIP_RESISTANCE_DELAY;
+        wheel.drive_throttle = 0.0;
+        wheel.wheel_coupling_torque = 0.0;
+        let dt = 1.0 / 60.0;
+        let rolling_angular_velocity = 5.0;
+        let mut rotation = 0.0;
+
+        for _ in 0..300 {
+            rotation = update_powered_wheel_rotation(&mut wheel, rolling_angular_velocity, dt);
+        }
+
+        assert!(wheel.powered_slip < 1.0e-5);
+        assert!((rotation - rolling_angular_velocity).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn powered_wheel_spin_raises_clutch_coupled_engine_rpm() {
+        let mut config = VehicleControllerConfig::default();
+        config.transmission.automatic = false;
+        config.transmission.auto_clutch = true;
+        let idle_rpm = config.engine.idle_rpm;
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
+        controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            0.4,
+            0.35,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Rear, true, false),
+        );
+        controller.set_gear(1);
+        controller.set_input(VehicleInput {
+            throttle: 1.0,
+            ..VehicleInput::default()
+        });
+        let dt = 1.0 / 60.0;
+
+        for _ in 0..180 {
+            let (wheel_speed, wheel_radius) = controller.driven_wheel_speed_and_radius(dt);
+            let output = controller
+                .powertrain
+                .update(dt, 0.0, wheel_speed, wheel_radius);
+            controller.apply_powertrain_output(output, dt);
+            let wheel = &mut controller.wheels[0];
+            wheel.raycast_info.is_in_contact = true;
+            wheel.skid_info = 1.0;
+            wheel.delta_rotation = update_powered_wheel_rotation(wheel, 0.0, dt) * dt * 0.99;
+        }
+
+        assert!(controller.wheels[0].powered_slip > 0.99);
+        assert!(controller.state().engine_rpm > idle_rpm * 2.0);
     }
 
     #[test]
@@ -1980,6 +2757,11 @@ mod tests {
         wheel.rotation = 10.0;
         wheel.delta_rotation = 2.0;
         wheel.target_rotation = 3.0;
+        wheel.powered_angular_velocity = 20.0;
+        wheel.powered_slip = 1.0;
+        wheel.powered_slip_timer = 1.0;
+        wheel.drive_slip_demand = 1.0;
+        wheel.traction_control = 0.35;
         wheel.engine_force = 100.0;
         wheel.brake = 0.5;
         wheel.steering = 0.4;
@@ -2004,6 +2786,11 @@ mod tests {
         assert_eq!(wheel.rotation, 0.0);
         assert_eq!(wheel.delta_rotation, 0.0);
         assert_eq!(wheel.target_rotation, 0.0);
+        assert_eq!(wheel.powered_angular_velocity, 0.0);
+        assert_eq!(wheel.powered_slip, 0.0);
+        assert_eq!(wheel.powered_slip_timer, 0.0);
+        assert_eq!(wheel.drive_slip_demand, 0.0);
+        assert_eq!(wheel.traction_control, 0.35);
         assert_eq!(wheel.engine_force, 0.0);
         assert_eq!(wheel.brake, 0.0);
         assert_eq!(wheel.steering, 0.0);

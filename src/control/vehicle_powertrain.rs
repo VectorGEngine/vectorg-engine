@@ -315,7 +315,11 @@ impl WheelRole {
 pub(crate) struct PowertrainOutput {
     pub drive_torque: Real,
     pub engine_brake_torque: Real,
+    pub wheel_coupling_torque: Real,
     pub wheel_target_velocity: Real,
+    pub wheel_limit_velocity: Real,
+    pub drive_throttle: Real,
+    pub drivetrain_connected: bool,
     pub service_brake: Real,
 }
 
@@ -617,10 +621,17 @@ impl VehiclePowertrain {
         let rpm_rate =
             ((self.state.engine_rpm - self.config.engine.idle_rpm) / rpm_span).clamp(0.0, 1.0);
         let gear_factor = ratio.abs().powf(self.config.engine.gear_force_exponent);
-        let wheel_torque_scale = gear_factor
+        let mechanical_wheel_torque_scale = gear_factor
             * self.config.transmission.final_drive_ratio
-            * self.config.engine.drivetrain_efficiency
-            * self.config.engine.force_scale;
+            * self.config.engine.drivetrain_efficiency;
+        let wheel_torque_scale = mechanical_wheel_torque_scale * self.config.engine.force_scale;
+        let wheel_coupling_torque = if clutch_torque < 0.0
+            || (self.state.engine_running && !at_limit && clutch_torque > 0.0)
+        {
+            clutch_torque * mechanical_wheel_torque_scale * ratio.signum()
+        } else {
+            0.0
+        };
         let drive_torque = if self.state.engine_running && !at_limit && clutch_torque > 0.0 {
             clutch_torque * wheel_torque_scale * ratio.signum()
         } else {
@@ -636,6 +647,11 @@ impl VehiclePowertrain {
         } else {
             (self.state.engine_rpm * TAU / 60.0)
                 / (ratio * self.config.transmission.final_drive_ratio)
+        };
+        let wheel_limit_velocity = if ratio == 0.0 {
+            0.0
+        } else {
+            (limit * TAU / 60.0) / (ratio * self.config.transmission.final_drive_ratio)
         };
         let gear_engaged = if ratio == 0.0 { 0.0 } else { clutch_engagement };
         let torque_load = ((available_torque / self.peak_torque) * boost).clamp(0.0, 1.5) / 1.5;
@@ -665,7 +681,11 @@ impl VehiclePowertrain {
         PowertrainOutput {
             drive_torque,
             engine_brake_torque,
+            wheel_coupling_torque,
             wheel_target_velocity,
+            wheel_limit_velocity,
+            drive_throttle,
+            drivetrain_connected,
             service_brake,
         }
     }
@@ -1142,6 +1162,80 @@ mod tests {
         config.engine.torque_curve = vec![(1000.0, 100.0), (3000.0, 200.0)];
         let powertrain = VehiclePowertrain::new(config);
         assert!((powertrain.torque_at(2000.0) - 150.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn force_scale_does_not_change_mechanical_wheel_coupling_torque() {
+        fn output(force_scale: Real) -> PowertrainOutput {
+            let mut config = VehicleControllerConfig::default();
+            config.engine.force_scale = force_scale;
+            config.transmission.automatic = false;
+            config.transmission.auto_clutch = true;
+            let mut powertrain = VehiclePowertrain::new(config);
+            select_first_gear(&mut powertrain);
+            powertrain.state.engine_rpm = 3000.0;
+            powertrain.set_input(VehicleInput {
+                throttle: 1.0,
+                ..VehicleInput::default()
+            });
+            let wheel_radius = 0.35;
+            let wheel_speed = powertrain.state.engine_rpm
+                / (powertrain.current_ratio() * powertrain.config.transmission.final_drive_ratio)
+                / 60.0
+                * TAU
+                * wheel_radius;
+            powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius)
+        }
+
+        let low_scale = output(0.3);
+        let full_scale = output(1.0);
+
+        assert!(low_scale.drive_torque < full_scale.drive_torque);
+        assert!(
+            (low_scale.wheel_coupling_torque - full_scale.wheel_coupling_torque).abs() < 1.0e-4
+        );
+    }
+
+    #[test]
+    fn throttle_holds_engine_rpm_at_fixed_road_speed_in_every_gear() {
+        let mut config = VehicleControllerConfig::default();
+        config.transmission.automatic = false;
+        config.transmission.auto_clutch = true;
+        let additional_ratio = config
+            .transmission
+            .forward_ratios
+            .last()
+            .copied()
+            .unwrap_or(1.0)
+            * 0.8;
+        config.transmission.forward_ratios.push(additional_ratio);
+        let wheel_radius = 0.35;
+        let road_rpm = 3000.0;
+
+        for gear_index in 0..config.transmission.forward_ratios.len() {
+            let gear = gear_index as i32 + 1;
+            let ratio = config.transmission.forward_ratios[gear_index]
+                * config.transmission.final_drive_ratio;
+            let road_speed = road_rpm / ratio / 60.0 * TAU * wheel_radius;
+            let mut powertrain = VehiclePowertrain::new(config.clone());
+            powertrain.set_gear(gear);
+            powertrain.state.current_gear = gear;
+            powertrain.state.engine_rpm = road_rpm;
+            powertrain.set_input(VehicleInput {
+                throttle: 1.0,
+                ..VehicleInput::default()
+            });
+
+            for _ in 0..300 {
+                powertrain.update(1.0 / 60.0, road_speed, road_speed, wheel_radius);
+            }
+
+            assert!(
+                (powertrain.state.engine_rpm - road_rpm).abs() < 1.0,
+                "gear {gear}: engine rpm {}, road rpm {road_rpm}",
+                powertrain.state.engine_rpm
+            );
+        }
     }
 
     #[test]
