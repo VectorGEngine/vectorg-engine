@@ -9,7 +9,8 @@ use super::vehicle_powertrain::{
     VehicleControllerConfig, VehicleInput, VehiclePowertrain, VehicleState, WheelAxle, WheelRole,
 };
 
-const DRIFT_ASSIST_MIN_SPEED: Real = 3.0;
+const DRIFT_ASSIST_MIN_SPEED: Real = 5.0;
+const DRIFT_ASSIST_FULL_SPEED: Real = 10.0;
 const DRIFT_ASSIST_MIN_CONTACTS: usize = 2;
 const DRIFT_ASSIST_ENTER_ANGLE: Real = 0.104_719_76; // 6 degrees.
 const DRIFT_ASSIST_EXIT_ANGLE: Real = 0.052_359_88; // 3 degrees.
@@ -39,6 +40,13 @@ const TRACTION_CONTROL_STEERING_OVERRIDE_START: Real = 0.2;
 const TRACTION_CONTROL_STEERING_OVERRIDE_FULL: Real = 0.8;
 const TRACTION_CONTROL_ENGAGE_RESPONSE: Real = 18.0;
 const TRACTION_CONTROL_RELEASE_RESPONSE: Real = 8.0;
+
+fn drift_assist_speed_activation(forward_speed: Real) -> Real {
+    let normalized = ((forward_speed - DRIFT_ASSIST_MIN_SPEED)
+        / (DRIFT_ASSIST_FULL_SPEED - DRIFT_ASSIST_MIN_SPEED))
+        .clamp(0.0, 1.0);
+    normalized * normalized * (3.0 - 2.0 * normalized)
+}
 
 /// A character controller to simulate vehicles using ray-casting for the wheels.
 pub struct DynamicRayCastVehicleController {
@@ -1089,12 +1097,13 @@ impl DynamicRayCastVehicleController {
         let player_angle = input.steering * max_angle * speed_factor;
         let assist_enabled = steering_config.assist;
         let correction_strength = steering_config.drift_correction.clamp(0.0, 1.0);
+        let assist_speed_activation = drift_assist_speed_activation(self.current_vehicle_speed);
         let mut target_assist_offset = None;
         let mut cancel_immediately = false;
         let grounded = self.powertrain.state().wheels_in_contact >= DRIFT_ASSIST_MIN_CONTACTS;
         let can_assist = assist_enabled
             && correction_strength > Real::EPSILON
-            && self.current_vehicle_speed > DRIFT_ASSIST_MIN_SPEED
+            && assist_speed_activation > 0.0
             && grounded;
 
         let mut drift_angle = None;
@@ -1132,8 +1141,10 @@ impl DynamicRayCastVehicleController {
                     let normalized_angle = ((absolute_angle - DRIFT_ASSIST_ENTER_ANGLE)
                         / (DRIFT_ASSIST_FULL_ANGLE - DRIFT_ASSIST_ENTER_ANGLE))
                         .clamp(0.0, 1.0);
-                    let activation =
-                        normalized_angle * normalized_angle * (3.0 - 2.0 * normalized_angle);
+                    let activation = normalized_angle
+                        * normalized_angle
+                        * (3.0 - 2.0 * normalized_angle)
+                        * assist_speed_activation;
                     target_assist_offset =
                         Some((correction_angle - player_angle) * correction_strength * activation);
                 } else if input.steering.abs() > DRIFT_ASSIST_INPUT_DEADZONE {
@@ -2470,6 +2481,46 @@ mod tests {
         controller.update_steering(&chassis, 1.0 / 60.0);
 
         assert!(controller.state().steering_angle.abs() <= Real::EPSILON);
+    }
+
+    #[test]
+    fn steering_assist_speed_activation_blends_from_five_to_ten_meters_per_second() {
+        assert_eq!(drift_assist_speed_activation(-10.0), 0.0);
+        assert_eq!(drift_assist_speed_activation(5.0), 0.0);
+        assert!((drift_assist_speed_activation(7.5) - 0.5).abs() < 1.0e-5);
+        assert_eq!(drift_assist_speed_activation(10.0), 1.0);
+        assert_eq!(drift_assist_speed_activation(20.0), 1.0);
+    }
+
+    #[test]
+    fn steering_assist_does_not_step_when_crossing_the_minimum_speed() {
+        let mut config = VehicleControllerConfig::default();
+        config.steering.assist = true;
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
+        controller.index_forward_axis = 2;
+        controller.index_up_axis = 1;
+        controller.powertrain.state_mut().wheels_in_contact = 4;
+        controller.set_input(VehicleInput {
+            steering: 1.0,
+            ..VehicleInput::default()
+        });
+
+        let minimum_speed_chassis = RigidBodyBuilder::dynamic()
+            .linvel(Vector::z() * 5.0 + Vector::x() * 5.0)
+            .build();
+        controller.current_vehicle_speed = 5.0;
+        controller.update_steering(&minimum_speed_chassis, 1.0 / 60.0);
+        assert_eq!(controller.drift_assist_offset, 0.0);
+
+        let just_above_minimum_chassis = RigidBodyBuilder::dynamic()
+            .linvel(Vector::z() * 5.001 + Vector::x() * 5.0)
+            .build();
+        controller.current_vehicle_speed = 5.001;
+        controller.update_steering(&just_above_minimum_chassis, 1.0 / 60.0);
+
+        assert!(controller.drift_assist_offset.abs() > 0.0);
+        assert!(controller.drift_assist_offset.abs() < 1.0e-6);
     }
 
     #[test]
