@@ -34,8 +34,8 @@ const TRACTION_CONTROL_SLIP_START: Real = 0.12;
 const TRACTION_CONTROL_SLIP_FULL: Real = 0.55;
 const TRACTION_CONTROL_SPEED_OFF: Real = 2.0;
 const TRACTION_CONTROL_SPEED_FULL: Real = 8.0;
-const TRACTION_CONTROL_LOW_SPEED_OVERRIDE_FULL: Real = 2.0;
-const TRACTION_CONTROL_LOW_SPEED_OVERRIDE_OFF: Real = 4.0;
+const TRACTION_CONTROL_LOW_SPEED_OVERRIDE_FULL: Real = 0.0;
+const TRACTION_CONTROL_LOW_SPEED_OVERRIDE_OFF: Real = 15.0;
 const TRACTION_CONTROL_STEERING_OVERRIDE_START: Real = 0.2;
 const TRACTION_CONTROL_STEERING_OVERRIDE_FULL: Real = 0.8;
 const TRACTION_CONTROL_ENGAGE_RESPONSE: Real = 18.0;
@@ -2156,18 +2156,16 @@ mod tests {
     }
 
     #[test]
-    fn low_speed_override_recovers_assigned_traction_control_between_two_and_four_mps() {
-        let strengths = [0.0, 1.0, 2.0, 2.5, 3.0, 3.5, 4.0, 8.0]
+    fn low_speed_override_recovers_assigned_traction_control_between_zero_and_fifteen_mps() {
+        let strengths = [0.0, 3.75, 7.5, 11.25, 15.0, 17.0]
             .map(|speed| effective_traction_control_strength(0.8, speed, 0.0));
 
         assert_eq!(strengths[0], 0.0);
-        assert_eq!(strengths[1], 0.0);
-        assert_eq!(strengths[2], 0.0);
-        assert!((strengths[3] - 0.125).abs() < 1.0e-5);
-        assert!((strengths[4] - 0.4).abs() < 1.0e-5);
-        assert!((strengths[5] - 0.675).abs() < 1.0e-5);
-        assert_eq!(strengths[6], 0.8);
-        assert_eq!(strengths[7], 0.8);
+        assert!((strengths[1] - 0.125).abs() < 1.0e-5);
+        assert!((strengths[2] - 0.4).abs() < 1.0e-5);
+        assert!((strengths[3] - 0.675).abs() < 1.0e-5);
+        assert_eq!(strengths[4], 0.8);
+        assert_eq!(strengths[5], 0.8);
     }
 
     #[test]
@@ -2180,21 +2178,21 @@ mod tests {
 
     #[test]
     fn low_speed_and_steering_overrides_combine_independently() {
-        let no_steering_at_three = effective_traction_control_strength(1.0, 3.0, 0.0);
-        let full_steering_at_three = effective_traction_control_strength(1.0, 3.0, 1.0);
-        let no_steering_at_four = effective_traction_control_strength(1.0, 4.0, 0.0);
-        let full_steering_at_four = effective_traction_control_strength(1.0, 4.0, 1.0);
+        let no_steering_at_midpoint = effective_traction_control_strength(1.0, 7.5, 0.0);
+        let full_steering_at_midpoint = effective_traction_control_strength(1.0, 7.5, 1.0);
+        let no_steering_at_fifteen = effective_traction_control_strength(1.0, 15.0, 0.0);
+        let full_steering_at_fifteen = effective_traction_control_strength(1.0, 15.0, 1.0);
 
-        assert!((no_steering_at_three - 0.5).abs() < 1.0e-5);
-        assert!(full_steering_at_three > 0.0);
-        assert!(full_steering_at_three < no_steering_at_three);
-        assert_eq!(no_steering_at_four, 1.0);
-        assert!((full_steering_at_four - traction_control_speed_factor(4.0)).abs() < 1.0e-5);
+        assert!((no_steering_at_midpoint - 0.5).abs() < 1.0e-5);
+        assert!(full_steering_at_midpoint > 0.0);
+        assert!(full_steering_at_midpoint < no_steering_at_midpoint);
+        assert_eq!(no_steering_at_fifteen, 1.0);
+        assert_eq!(full_steering_at_fifteen, 1.0);
     }
 
     #[test]
     fn full_steering_traction_control_recovers_smoothly_with_body_speed() {
-        let strengths = [0.0, 2.0, 3.5, 5.0, 6.5, 8.0, 10.0]
+        let strengths = [0.0, 1.0, 3.75, 7.5, 11.25, 15.0, 17.0]
             .map(|speed| effective_traction_control_strength(1.0, speed, 1.0));
 
         assert_eq!(strengths[0], 0.0);
@@ -2206,9 +2204,8 @@ mod tests {
 
     #[test]
     fn speed_recovery_preserves_the_assigned_strength() {
-        assert!((effective_traction_control_strength(0.8, 5.0, 1.0) - 0.4).abs() < 1.0e-5);
-        assert!((effective_traction_control_strength(0.8, 5.0, 0.5) - 0.6).abs() < 1.0e-5);
-        assert_eq!(effective_traction_control_strength(0.8, 8.0, 1.0), 0.8);
+        assert!((effective_traction_control_strength(0.8, 7.5, 0.0) - 0.4).abs() < 1.0e-5);
+        assert_eq!(effective_traction_control_strength(0.8, 15.0, 1.0), 0.8);
         assert_eq!(effective_traction_control_strength(0.8, 20.0, -1.0), 0.8);
     }
 
