@@ -801,7 +801,8 @@ impl DynamicRayCastVehicleController {
         self.powertrain.set_gear(gear);
     }
 
-    /// Enables or disables velocity-based counter-steering assistance.
+    /// Enables or disables all steering assistance, including speed-sensitive
+    /// steering range reduction and velocity-based counter-steering.
     pub fn set_steering_assist(&mut self, enabled: bool) {
         self.powertrain.config.steering.assist = enabled;
 
@@ -1126,7 +1127,9 @@ impl DynamicRayCastVehicleController {
     fn update_steering(&mut self, chassis: &RigidBody, dt: Real) {
         let steering_config = &self.powertrain.config.steering;
         let input = self.powertrain.input();
-        let speed_factor = if steering_config.speed_sensitivity <= Real::EPSILON {
+        let assist_enabled = steering_config.assist;
+        let speed_factor = if !assist_enabled || steering_config.speed_sensitivity <= Real::EPSILON
+        {
             1.0
         } else {
             let normalized = (self.current_vehicle_speed.abs() / steering_config.speed_sensitivity)
@@ -1136,7 +1139,6 @@ impl DynamicRayCastVehicleController {
         };
         let max_angle = steering_config.max_angle;
         let player_angle = input.steering * max_angle * speed_factor;
-        let assist_enabled = steering_config.assist;
         let correction_strength = steering_config.drift_correction.clamp(0.0, 1.0);
         let assist_speed_activation = drift_assist_speed_activation(self.current_vehicle_speed);
         let mut target_assist_offset = None;
@@ -2630,6 +2632,34 @@ mod tests {
         controller.update_steering(&chassis, 1.0 / 60.0);
 
         assert!(controller.state().steering_angle.abs() <= Real::EPSILON);
+    }
+
+    #[test]
+    fn disabling_steering_assist_restores_the_full_steering_range_at_speed() {
+        let mut config = VehicleControllerConfig::default();
+        config.steering.assist = true;
+        config.steering.speed_sensitivity = 20.0;
+        config.steering.minimum_speed_factor = 0.25;
+        let max_angle = config.steering.max_angle;
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
+        controller.index_forward_axis = 2;
+        controller.index_up_axis = 1;
+        controller.current_vehicle_speed = 20.0;
+        controller.set_input(VehicleInput {
+            steering: 1.0,
+            ..VehicleInput::default()
+        });
+
+        let chassis = RigidBodyBuilder::dynamic()
+            .linvel(Vector::z() * 20.0)
+            .build();
+        controller.update_steering(&chassis, 1.0 / 60.0);
+        assert!((controller.state().steering_angle - max_angle * 0.25).abs() < 1.0e-5);
+
+        controller.set_steering_assist(false);
+        controller.update_steering(&chassis, 1.0 / 60.0);
+        assert!((controller.state().steering_angle - max_angle).abs() < 1.0e-5);
     }
 
     #[test]

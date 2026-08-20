@@ -199,11 +199,11 @@ impl Default for VehicleDynamicsConfig {
 pub struct SteeringConfig {
     /// Maximum central steering angle in radians.
     pub max_angle: Real,
-    /// Speed where steering reaches its minimum multiplier.
+    /// Speed where assisted steering reaches its minimum multiplier.
     pub speed_sensitivity: Real,
-    /// Steering multiplier retained at and above the sensitivity speed.
+    /// Assisted steering multiplier retained at and above the sensitivity speed.
     pub minimum_speed_factor: Real,
-    /// Whether velocity-based counter-steering assistance is enabled.
+    /// Whether speed-sensitive range reduction and counter-steering are enabled.
     pub assist: bool,
     /// Drift-correction strength in the range `0.0` through `1.0`.
     ///
