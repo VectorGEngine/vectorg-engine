@@ -27,6 +27,9 @@ const POWERED_SLIP_ENGAGE_RESPONSE: Real = 14.0;
 const POWERED_SLIP_RELEASE_RESPONSE: Real = 3.0;
 const POWERED_SLIP_EFFECTIVE_INERTIA: Real = 12.0;
 const POWERED_SLIP_ROTATIONAL_DAMPING: Real = 0.35;
+const VISUAL_WHEEL_REGRIP_RESPONSE: Real = 24.0;
+const VISUAL_WHEEL_BRAKE_RESPONSE: Real = 30.0;
+const VISUAL_WHEEL_SYNC_TOLERANCE: Real = 0.05;
 const TRACTION_CONTROL_MIN_BODY_SPEED: Real = 0.75;
 const TRACTION_CONTROL_LOW_SPEED_GAP_START: Real = 0.5;
 const TRACTION_CONTROL_LOW_SPEED_GAP_FULL: Real = 3.0;
@@ -214,6 +217,9 @@ pub struct Wheel {
     powered_angular_velocity: Real,
     powered_slip: Real,
     powered_slip_timer: Real,
+    powered_spin_requested: bool,
+    visual_angular_velocity: Real,
+    visual_regrip_active: bool,
     previous_rolling_surface_speed: Real,
     wheel_coupling_torque: Real,
     wheel_limit_velocity: Real,
@@ -305,6 +311,9 @@ impl Wheel {
             powered_angular_velocity: 0.0,
             powered_slip: 0.0,
             powered_slip_timer: 0.0,
+            powered_spin_requested: false,
+            visual_angular_velocity: 0.0,
+            visual_regrip_active: false,
             previous_rolling_surface_speed: 0.0,
             wheel_coupling_torque: 0.0,
             wheel_limit_velocity: 0.0,
@@ -350,6 +359,8 @@ impl Wheel {
         self.wheel_axle_ws = self.axle_cs;
         self.rotation = 0.0;
         self.delta_rotation = 0.0;
+        self.visual_angular_velocity = 0.0;
+        self.visual_regrip_active = false;
         self.target_rotation = 0.0;
         self.clear_powered_spin_state();
         self.previous_rolling_surface_speed = 0.0;
@@ -384,6 +395,7 @@ impl Wheel {
         self.powered_angular_velocity = 0.0;
         self.powered_slip = 0.0;
         self.powered_slip_timer = 0.0;
+        self.powered_spin_requested = false;
     }
 
     /// Information about suspension and the ground obtained from the ray-casting
@@ -508,6 +520,7 @@ fn update_powered_wheel_rotation(
         wheel.drive_slip_demand.clamp(0.0, 1.0)
     };
     let spin_requested = powered && requested_slip > Real::EPSILON;
+    wheel.powered_spin_requested = spin_requested;
     let response = if spin_requested {
         POWERED_SLIP_ENGAGE_RESPONSE
     } else {
@@ -546,21 +559,57 @@ fn update_powered_wheel_rotation(
 }
 
 fn update_wheel_rotation(wheel: &mut Wheel, rolling_angular_velocity: Real, dt: Real) {
-    if wheel.lock {
-        wheel.delta_rotation = 0.0;
+    let dt = dt.max(Real::EPSILON);
+    let was_powered_spin_requested = wheel.powered_spin_requested;
+    let is_grounded = wheel.raycast_info.is_in_contact;
+
+    let physical_angular_velocity = if wheel.lock {
         wheel.clear_powered_spin_state();
-    } else if wheel.raycast_info.is_in_contact {
-        wheel.delta_rotation =
-            update_powered_wheel_rotation(wheel, rolling_angular_velocity, dt) * dt;
+        0.0
+    } else if is_grounded {
+        update_powered_wheel_rotation(wheel, rolling_angular_velocity, dt)
     } else {
-        let rolling_angular_velocity = wheel.delta_rotation / dt.max(Real::EPSILON);
-        wheel.delta_rotation =
-            update_powered_wheel_rotation(wheel, rolling_angular_velocity, dt) * dt;
-        wheel.delta_rotation *= 1.0 - wheel.brake.clamp(0.0, 1.0);
+        let previous_angular_velocity = wheel.delta_rotation / dt;
+        update_powered_wheel_rotation(wheel, previous_angular_velocity, dt)
+            * (1.0 - wheel.brake.clamp(0.0, 1.0))
+    };
+
+    if was_powered_spin_requested && !wheel.powered_spin_requested && is_grounded && !wheel.lock {
+        wheel.visual_regrip_active = true;
     }
 
-    wheel.rotation += wheel.delta_rotation;
-    wheel.delta_rotation *= 0.99;
+    if wheel.lock {
+        wheel.visual_regrip_active = false;
+        let blend = 1.0 - (-VISUAL_WHEEL_BRAKE_RESPONSE * dt).exp();
+        wheel.visual_angular_velocity += (0.0 - wheel.visual_angular_velocity) * blend;
+        if wheel.visual_angular_velocity.abs() <= VISUAL_WHEEL_SYNC_TOLERANCE {
+            wheel.visual_angular_velocity = 0.0;
+        }
+    } else if is_grounded && wheel.powered_spin_requested {
+        wheel.visual_regrip_active = false;
+        wheel.visual_angular_velocity = physical_angular_velocity;
+    } else if is_grounded && wheel.visual_regrip_active {
+        let blend = 1.0 - (-VISUAL_WHEEL_REGRIP_RESPONSE * dt).exp();
+        wheel.visual_angular_velocity +=
+            (rolling_angular_velocity - wheel.visual_angular_velocity) * blend;
+        if (wheel.visual_angular_velocity - rolling_angular_velocity).abs()
+            <= VISUAL_WHEEL_SYNC_TOLERANCE
+        {
+            wheel.visual_angular_velocity = rolling_angular_velocity;
+            wheel.visual_regrip_active = false;
+        }
+    } else if is_grounded {
+        wheel.visual_angular_velocity = rolling_angular_velocity;
+    } else if wheel.brake > Real::EPSILON {
+        let blend = 1.0 - (-VISUAL_WHEEL_BRAKE_RESPONSE * dt).exp();
+        wheel.visual_angular_velocity +=
+            (physical_angular_velocity - wheel.visual_angular_velocity) * blend;
+    } else {
+        wheel.visual_angular_velocity = physical_angular_velocity;
+    }
+
+    wheel.rotation += wheel.visual_angular_velocity * dt;
+    wheel.delta_rotation = physical_angular_velocity * dt * 0.99;
 }
 
 fn smoothstep(edge0: Real, edge1: Real, value: Real) -> Real {
@@ -2519,6 +2568,7 @@ mod tests {
         let mut wheel = powered_test_wheel();
         wheel.rotation = 4.0;
         wheel.delta_rotation = 0.5;
+        wheel.visual_angular_velocity = 30.0;
         wheel.powered_angular_velocity = 30.0;
         wheel.powered_slip = 1.0;
         wheel.powered_slip_timer = POWERED_SLIP_RESISTANCE_DELAY;
@@ -2526,11 +2576,18 @@ mod tests {
 
         update_wheel_rotation(&mut wheel, 0.0, 1.0 / 60.0);
 
-        assert_eq!(wheel.rotation, 4.0);
+        assert!(wheel.rotation > 4.0);
+        assert!(wheel.visual_angular_velocity > 0.0);
+        assert!(wheel.visual_angular_velocity < 30.0);
         assert_eq!(wheel.delta_rotation, 0.0);
         assert_eq!(wheel.powered_angular_velocity, 0.0);
         assert_eq!(wheel.powered_slip, 0.0);
         assert_eq!(wheel.powered_slip_timer, 0.0);
+
+        for _ in 0..30 {
+            update_wheel_rotation(&mut wheel, 0.0, 1.0 / 60.0);
+        }
+        assert_eq!(wheel.visual_angular_velocity, 0.0);
     }
 
     #[test]
@@ -2573,6 +2630,30 @@ mod tests {
 
         assert!(wheel.powered_slip < 1.0e-5);
         assert!((rotation - rolling_angular_velocity).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn visual_wheel_regrips_before_legacy_powered_slip_finishes_releasing() {
+        let mut wheel = powered_test_wheel();
+        wheel.powered_angular_velocity = 30.0;
+        wheel.powered_slip = 1.0;
+        wheel.powered_slip_timer = POWERED_SLIP_RESISTANCE_DELAY;
+        wheel.powered_spin_requested = true;
+        wheel.visual_angular_velocity = 30.0;
+        wheel.drive_throttle = 0.0;
+        wheel.wheel_coupling_torque = 0.0;
+        let dt = 1.0 / 60.0;
+        let rolling_angular_velocity = 5.0;
+
+        for _ in 0..20 {
+            update_wheel_rotation(&mut wheel, rolling_angular_velocity, dt);
+        }
+
+        let physical_angular_velocity = wheel.delta_rotation / (dt * 0.99);
+        assert_eq!(wheel.visual_angular_velocity, rolling_angular_velocity);
+        assert!(!wheel.visual_regrip_active);
+        assert!(physical_angular_velocity > rolling_angular_velocity);
+        assert!(wheel.powered_slip > 0.0);
     }
 
     #[test]
@@ -3011,6 +3092,9 @@ mod tests {
         wheel.powered_angular_velocity = 20.0;
         wheel.powered_slip = 1.0;
         wheel.powered_slip_timer = 1.0;
+        wheel.powered_spin_requested = true;
+        wheel.visual_angular_velocity = 15.0;
+        wheel.visual_regrip_active = true;
         wheel.drive_slip_demand = 1.0;
         wheel.traction_control = 0.35;
         wheel.engine_force = 100.0;
@@ -3040,6 +3124,9 @@ mod tests {
         assert_eq!(wheel.powered_angular_velocity, 0.0);
         assert_eq!(wheel.powered_slip, 0.0);
         assert_eq!(wheel.powered_slip_timer, 0.0);
+        assert!(!wheel.powered_spin_requested);
+        assert_eq!(wheel.visual_angular_velocity, 0.0);
+        assert!(!wheel.visual_regrip_active);
         assert_eq!(wheel.drive_slip_demand, 0.0);
         assert_eq!(wheel.traction_control, 0.35);
         assert_eq!(wheel.engine_force, 0.0);

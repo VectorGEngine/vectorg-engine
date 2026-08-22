@@ -590,6 +590,7 @@ impl VehiclePowertrain {
             signed_drivetrain_rpm,
             driven_wheel_radius,
             drive_throttle,
+            service_brake,
             drivetrain_engine_torque,
         );
 
@@ -778,11 +779,7 @@ impl VehiclePowertrain {
 
         let stall_protection_rpm =
             self.config.engine.idle_rpm * STALL_RPM_RATIO + STALL_PROTECTION_RPM_MARGIN;
-        if self.uses_automatic_clutch()
-            && self.state.engine_running
-            && self.state.engine_rpm <= stall_protection_rpm
-            && torque > 0.0
-        {
+        if self.uses_automatic_clutch() && self.state.engine_running && torque > 0.0 {
             let stall_angular_velocity = stall_protection_rpm * TAU / 60.0;
             let available_load = engine_source_torque
                 + self.config.engine.inertia * (engine_angular_velocity - stall_angular_velocity)
@@ -805,6 +802,7 @@ impl VehiclePowertrain {
         signed_drivetrain_rpm: Real,
         driven_wheel_radius: Real,
         drive_throttle: Real,
+        service_brake: Real,
         drivetrain_engine_torque: Real,
     ) -> Real {
         if ratio == 0.0 {
@@ -827,6 +825,7 @@ impl VehiclePowertrain {
             ground_drivetrain_rpm,
             target_rpm,
             drive_throttle,
+            service_brake,
         );
 
         let target = match self.automatic_clutch_phase {
@@ -886,6 +885,7 @@ impl VehiclePowertrain {
         ground_drivetrain_rpm: Real,
         target_rpm: Real,
         drive_throttle: Real,
+        service_brake: Real,
     ) -> AutomaticClutchPhase {
         if !self.state.engine_running {
             return if signed_drivetrain_rpm > 0.0 {
@@ -903,6 +903,13 @@ impl VehiclePowertrain {
             || self.automatic_clutch_phase == AutomaticClutchPhase::AntiStall
                 && self.state.engine_rpm < anti_stall_exit_rpm
         {
+            return AutomaticClutchPhase::AntiStall;
+        }
+        let driven_wheels_stopped_while_braking = (service_brake > Real::EPSILON
+            || self.input.handbrake > Real::EPSILON)
+            && signed_drivetrain_rpm < anti_stall_enter_rpm
+            && ground_drivetrain_rpm >= target_rpm - AUTO_CLUTCH_LOCK_RPM_TOLERANCE;
+        if driven_wheels_stopped_while_braking {
             return AutomaticClutchPhase::AntiStall;
         }
         if ground_drivetrain_rpm >= target_rpm - AUTO_CLUTCH_LOCK_RPM_TOLERANCE {
@@ -949,11 +956,8 @@ impl VehiclePowertrain {
         signed_drivetrain_rpm: Real,
         drivetrain_engine_torque: Real,
     ) -> Real {
-        let anti_stall_enter_rpm =
-            self.config.engine.idle_rpm * AUTO_CLUTCH_ANTISTALL_ENTER_RPM_RATIO;
         if !self.state.engine_running
             || dt <= Real::EPSILON
-            || self.state.engine_rpm > anti_stall_enter_rpm
             || signed_drivetrain_rpm >= self.state.engine_rpm
         {
             return 1.0;
@@ -2176,6 +2180,29 @@ mod tests {
         VehiclePowertrain::new(config)
     }
 
+    fn low_inertia_auto_clutch_powertrain() -> VehiclePowertrain {
+        let mut config = VehicleControllerConfig::default();
+        config.engine.horsepower = 1000.0;
+        config.engine.idle_rpm = 4500.0;
+        config.engine.max_rpm = 15000.0;
+        config.engine.rev_limit_rpm = 15000.0;
+        config.engine.inertia = 0.06;
+        config.engine.torque_curve = vec![(1000.0, 550.0), (8000.0, 700.0), (15000.0, 545.0)];
+        config.transmission.automatic = false;
+        config.transmission.auto_clutch = true;
+        config.transmission.forward_ratios = vec![3.5];
+        config.transmission.final_drive_ratio = 4.0;
+        config.transmission.clutch_response = 22.0;
+        config.transmission.shift_cooldown = 0.0;
+        let mut powertrain = VehiclePowertrain::new(config);
+        powertrain.state.current_gear = 1;
+        powertrain.shift_target = 1;
+        powertrain.state.engine_rpm = 3000.0;
+        powertrain.automatic_clutch_phase = AutomaticClutchPhase::Locked;
+        powertrain.automatic_clutch_engagement = 1.0;
+        powertrain
+    }
+
     fn select_manual_gear(powertrain: &mut VehiclePowertrain, gear: i32) {
         powertrain.set_input(VehicleInput {
             clutch: 1.0,
@@ -2509,6 +2536,51 @@ mod tests {
         assert!(
             powertrain.state().engine_rpm >= powertrain.config.engine.idle_rpm * STALL_RPM_RATIO
         );
+    }
+
+    #[test]
+    fn low_inertia_auto_clutch_survives_driven_wheel_lock_under_braking() {
+        for (dt, steps) in [(1.0 / 30.0, 15), (1.0 / 60.0, 30), (1.0 / 120.0, 60)] {
+            for input in [
+                VehicleInput {
+                    brake: 1.0,
+                    ..VehicleInput::default()
+                },
+                VehicleInput {
+                    handbrake: 1.0,
+                    ..VehicleInput::default()
+                },
+            ] {
+                let mut powertrain = low_inertia_auto_clutch_powertrain();
+                powertrain.set_input(input);
+
+                for _ in 0..steps {
+                    powertrain.update(dt, 10.0, 0.0, 0.335);
+                    assert!(powertrain.state().engine_running);
+                }
+
+                assert_eq!(
+                    powertrain.automatic_clutch_phase,
+                    AutomaticClutchPhase::AntiStall
+                );
+                assert_eq!(powertrain.automatic_clutch_engagement, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn projected_rpm_protection_survives_unbraked_drivetrain_speed_collapse() {
+        for dt in [1.0 / 30.0, 1.0 / 60.0, 1.0 / 120.0] {
+            let mut powertrain = low_inertia_auto_clutch_powertrain();
+
+            powertrain.update(dt, 10.0, 0.0, 0.335);
+
+            assert!(powertrain.state().engine_running);
+            assert!(
+                powertrain.state().engine_rpm
+                    >= powertrain.config.engine.idle_rpm * STALL_RPM_RATIO
+            );
+        }
     }
 
     #[test]
