@@ -7,6 +7,12 @@ const TRANSMISSION_MANUAL_OVERRIDE: Real = 1.5;
 const MANUAL_SHIFT_CLUTCH_DISENGAGEMENT: Real = 0.8;
 const STALL_RPM_RATIO: Real = 0.55;
 const STALL_PROTECTION_RPM_MARGIN: Real = 1.0;
+const ENGINE_START_DURATION: Real = 1.0;
+const ENGINE_START_TIME_EPSILON: Real = 1.0e-5;
+const ENGINE_START_CRANK_END: Real = 0.5;
+const ENGINE_START_CATCH_END: Real = 0.72;
+const ENGINE_START_CRANK_RPM_RATIO: Real = 0.35;
+const ENGINE_START_FLARE_RPM_RATIO: Real = 1.8;
 const CLUTCH_CAPACITY_MULTIPLIER: Real = 2.0;
 const AUTO_BLIP_CLUTCH_DISENGAGE_DURATION: Real = 0.05;
 const AUTO_BLIP_CLUTCH_REENGAGE_DURATION: Real = 0.12;
@@ -261,6 +267,10 @@ pub struct VehicleState {
     pub engine_rpm: Real,
     /// Whether the engine is currently producing combustion torque.
     pub engine_running: bool,
+    /// Whether the electric starter is currently cranking the engine.
+    pub engine_starting: bool,
+    /// Normalized progress through the active starter sequence.
+    pub engine_start_progress: Real,
     /// Current gear, where -1 is reverse and 0 is neutral.
     pub current_gear: i32,
     /// Whether reverse gear is currently selected.
@@ -370,6 +380,7 @@ pub(crate) struct VehiclePowertrain {
     turbo_load: Real,
     previous_throttle: Real,
     restart_armed: bool,
+    engine_start_elapsed: Real,
     automatic_clutch_engagement: Real,
     automatic_clutch_phase: AutomaticClutchPhase,
 }
@@ -402,6 +413,7 @@ impl VehiclePowertrain {
             turbo_load: 0.0,
             previous_throttle: 0.0,
             restart_armed: true,
+            engine_start_elapsed: 0.0,
             automatic_clutch_engagement: 0.0,
             automatic_clutch_phase: AutomaticClutchPhase::Open,
         }
@@ -438,6 +450,7 @@ impl VehiclePowertrain {
         self.turbo_load = 0.0;
         self.previous_throttle = 0.0;
         self.restart_armed = true;
+        self.engine_start_elapsed = 0.0;
         self.automatic_clutch_engagement = 0.0;
         self.automatic_clutch_phase = AutomaticClutchPhase::Open;
     }
@@ -531,9 +544,16 @@ impl VehiclePowertrain {
         self.state.driven_wheel_speed = driven_wheel_speed.abs();
         self.update_shift_sequence(dt, driven_wheel_speed.abs(), driven_wheel_radius);
 
-        let (mut drive_throttle, service_brake) = self.effective_pedals();
-        drive_throttle = drive_throttle.max(self.shift_throttle_override());
-        self.update_engine_start_state(drive_throttle);
+        let (requested_drive_throttle, service_brake) = self.effective_pedals();
+        self.update_engine_start_state(dt, requested_drive_throttle);
+        let mut drive_throttle = if self.state.engine_starting {
+            0.0
+        } else {
+            requested_drive_throttle
+        };
+        if !self.state.engine_starting {
+            drive_throttle = drive_throttle.max(self.shift_throttle_override());
+        }
         if self.state.engine_running {
             self.update_turbo(dt, drive_throttle);
         } else {
@@ -579,7 +599,7 @@ impl VehiclePowertrain {
             * (1.0 - drive_throttle);
         let free_engine_torque = combustion_torque - friction_torque;
         let drivetrain_engine_torque = if self.state.engine_running {
-            available_torque * drive_throttle * boost - engine_braking_torque
+            combustion_torque - engine_braking_torque
         } else {
             0.0
         };
@@ -623,7 +643,9 @@ impl VehiclePowertrain {
             .rev_limit_rpm
             .min(self.config.engine.max_rpm);
         let stall_rpm = self.config.engine.idle_rpm * STALL_RPM_RATIO;
-        if self.state.engine_running && drivetrain_connected && next_rpm < stall_rpm {
+        if self.state.engine_starting {
+            // The starter owns engine RPM and the clutch stays open until ignition completes.
+        } else if self.state.engine_running && drivetrain_connected && next_rpm < stall_rpm {
             self.state.engine_running = false;
             self.state.engine_rpm = 0.0;
             self.turbo_load = 0.0;
@@ -805,6 +827,12 @@ impl VehiclePowertrain {
         service_brake: Real,
         drivetrain_engine_torque: Real,
     ) -> Real {
+        if self.state.engine_starting {
+            self.automatic_clutch_engagement = 0.0;
+            self.automatic_clutch_phase = AutomaticClutchPhase::Open;
+            return 0.0;
+        }
+
         if ratio == 0.0 {
             self.automatic_clutch_engagement = 0.0;
             self.automatic_clutch_phase = AutomaticClutchPhase::Open;
@@ -971,18 +999,62 @@ impl VehiclePowertrain {
         (available_load / capacity.max(Real::EPSILON)).clamp(0.0, 1.0)
     }
 
-    fn update_engine_start_state(&mut self, drive_throttle: Real) {
+    fn update_engine_start_state(&mut self, dt: Real, drive_throttle: Real) {
         if self.state.engine_running {
+            self.state.engine_starting = false;
+            self.state.engine_start_progress = 0.0;
+            self.engine_start_elapsed = 0.0;
             self.restart_armed = drive_throttle <= TRANSMISSION_PEDAL_RELEASE;
+            return;
+        }
+
+        if self.state.engine_starting {
+            self.engine_start_elapsed = (self.engine_start_elapsed + dt).min(ENGINE_START_DURATION);
+            self.state.engine_start_progress = self.engine_start_elapsed / ENGINE_START_DURATION;
+            self.state.engine_rpm = self.engine_start_rpm(self.state.engine_start_progress);
+
+            if self.engine_start_elapsed >= ENGINE_START_DURATION - ENGINE_START_TIME_EPSILON {
+                self.state.engine_running = true;
+                self.state.engine_starting = false;
+                self.state.engine_start_progress = 0.0;
+                self.state.engine_rpm = self.config.engine.idle_rpm;
+                self.engine_start_elapsed = 0.0;
+            }
             return;
         }
 
         if drive_throttle <= TRANSMISSION_PEDAL_RELEASE {
             self.restart_armed = true;
         } else if self.restart_armed && drive_throttle > TRANSMISSION_PEDAL_ENGAGE {
-            self.state.engine_running = true;
-            self.state.engine_rpm = self.config.engine.idle_rpm;
+            self.state.engine_starting = true;
+            self.state.engine_start_progress = 0.0;
+            self.state.engine_rpm = 0.0;
+            self.engine_start_elapsed = 0.0;
             self.restart_armed = false;
+        }
+    }
+
+    fn engine_start_rpm(&self, progress: Real) -> Real {
+        let smooth_step = |value: Real| value * value * (3.0 - 2.0 * value);
+        let idle_rpm = self.config.engine.idle_rpm;
+        let crank_rpm = idle_rpm * ENGINE_START_CRANK_RPM_RATIO;
+        let flare_rpm = (idle_rpm * ENGINE_START_FLARE_RPM_RATIO)
+            .min(self.config.engine.max_rpm * 0.75)
+            .max(idle_rpm);
+
+        if progress <= ENGINE_START_CRANK_END {
+            let amount = smooth_step(progress / ENGINE_START_CRANK_END);
+            crank_rpm * amount
+        } else if progress <= ENGINE_START_CATCH_END {
+            let amount = smooth_step(
+                (progress - ENGINE_START_CRANK_END)
+                    / (ENGINE_START_CATCH_END - ENGINE_START_CRANK_END),
+            );
+            crank_rpm + (flare_rpm - crank_rpm) * amount
+        } else {
+            let amount =
+                smooth_step((progress - ENGINE_START_CATCH_END) / (1.0 - ENGINE_START_CATCH_END));
+            flare_rpm + (idle_rpm - flare_rpm) * amount
         }
     }
 
@@ -1668,6 +1740,8 @@ mod tests {
         powertrain.state = VehicleState {
             engine_rpm: 5000.0,
             engine_running: false,
+            engine_starting: true,
+            engine_start_progress: 0.5,
             current_gear: 3,
             reverse_direction: true,
             vehicle_speed: 30.0,
@@ -1696,6 +1770,7 @@ mod tests {
         powertrain.turbo_load = 0.9;
         powertrain.previous_throttle = 1.0;
         powertrain.restart_armed = false;
+        powertrain.engine_start_elapsed = 0.5;
         powertrain.automatic_clutch_engagement = 0.75;
         powertrain.automatic_clutch_phase = AutomaticClutchPhase::Launch;
 
@@ -1724,6 +1799,7 @@ mod tests {
         assert_eq!(powertrain.turbo_load, 0.0);
         assert_eq!(powertrain.previous_throttle, 0.0);
         assert!(powertrain.restart_armed);
+        assert_eq!(powertrain.engine_start_elapsed, 0.0);
         assert_eq!(powertrain.automatic_clutch_engagement, 0.0);
         assert_eq!(
             powertrain.automatic_clutch_phase,
@@ -2456,6 +2532,44 @@ mod tests {
     }
 
     #[test]
+    fn engaged_clutch_transmits_idle_combustion_torque_at_matching_wheel_speed() {
+        let wheel_radius = 0.35;
+        let mut powertrain = manual_powertrain();
+        engage_first_gear(&mut powertrain, VehicleInput::default());
+        powertrain.state.engine_rpm = powertrain.config.engine.idle_rpm;
+        let wheel_speed =
+            wheel_speed_for_crank_rpm(&powertrain, powertrain.config.engine.idle_rpm, wheel_radius);
+
+        for _ in 0..120 {
+            let output = powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
+            assert!(output.drive_torque > 0.0);
+            assert!(powertrain.state().engine_running);
+        }
+
+        assert!((powertrain.state().engine_rpm - powertrain.config.engine.idle_rpm).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn idle_combustion_torque_does_not_drive_in_neutral_or_with_the_clutch_disengaged() {
+        let wheel_radius = 0.35;
+        let mut neutral = manual_powertrain();
+        let neutral_output = neutral.update(1.0 / 60.0, 0.0, 0.0, wheel_radius);
+        assert_eq!(neutral_output.drive_torque, 0.0);
+
+        let mut disengaged = manual_powertrain();
+        let input = VehicleInput {
+            clutch: 1.0,
+            ..VehicleInput::default()
+        };
+        engage_first_gear(&mut disengaged, input);
+        let wheel_speed =
+            wheel_speed_for_crank_rpm(&disengaged, disengaged.config.engine.idle_rpm, wheel_radius);
+        let disengaged_output =
+            disengaged.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
+        assert_eq!(disengaged_output.drive_torque, 0.0);
+    }
+
+    #[test]
     fn engaged_clutch_transmits_idle_torque_and_can_stall_the_engine() {
         let mut powertrain = manual_powertrain();
         assert!(!powertrain.config.transmission.auto_clutch);
@@ -2617,7 +2731,7 @@ mod tests {
     }
 
     #[test]
-    fn stalled_engine_restarts_only_after_a_fresh_drive_pedal_press() {
+    fn stalled_engine_starts_a_timed_sequence_after_a_fresh_drive_pedal_press() {
         let mut powertrain = manual_powertrain();
         engage_first_gear(&mut powertrain, VehicleInput::default());
         for _ in 0..30 {
@@ -2630,14 +2744,42 @@ mod tests {
 
         powertrain.set_input(VehicleInput {
             throttle: 1.0,
+            clutch: 1.0,
             ..VehicleInput::default()
         });
-        powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        let output = powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
 
+        assert!(powertrain.state().engine_starting);
+        assert!(!powertrain.state().engine_running);
+        assert_eq!(powertrain.state().engine_rpm, 0.0);
+        assert_eq!(output.drive_throttle, 0.0);
+        assert_eq!(output.drive_torque, 0.0);
+
+        let mut crank_rpm = 0.0;
+        let mut flare_rpm = 0.0;
+        for frame in 1..=59 {
+            let output = powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+            assert!(powertrain.state().engine_starting);
+            assert!(!powertrain.state().engine_running);
+            assert_eq!(output.drive_throttle, 0.0);
+            assert_eq!(output.drive_torque, 0.0);
+            if frame == 30 {
+                crank_rpm = powertrain.state().engine_rpm;
+            }
+            if frame == 43 {
+                flare_rpm = powertrain.state().engine_rpm;
+            }
+        }
+
+        assert!(crank_rpm > 0.0);
+        assert!(crank_rpm < powertrain.config.engine.idle_rpm);
+        assert!(flare_rpm > powertrain.config.engine.idle_rpm);
+
+        let output = powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
         assert!(powertrain.state().engine_running);
-        assert!(
-            powertrain.state().engine_rpm > powertrain.config.engine.idle_rpm * STALL_RPM_RATIO
-        );
+        assert!(!powertrain.state().engine_starting);
+        assert!(powertrain.state().engine_rpm >= powertrain.config.engine.idle_rpm);
+        assert_eq!(output.drive_throttle, 1.0);
     }
 
     #[test]
@@ -2648,6 +2790,7 @@ mod tests {
         powertrain.restart_armed = false;
         powertrain.set_input(VehicleInput {
             throttle: 1.0,
+            clutch: 1.0,
             ..VehicleInput::default()
         });
 
@@ -2658,11 +2801,20 @@ mod tests {
         powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
         powertrain.set_input(VehicleInput {
             throttle: 1.0,
+            clutch: 1.0,
             ..VehicleInput::default()
         });
         powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
 
+        assert!(powertrain.state().engine_starting);
+        assert!(!powertrain.state().engine_running);
+
+        for _ in 0..60 {
+            powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        }
+
         assert!(powertrain.state().engine_running);
+        assert!(!powertrain.state().engine_starting);
     }
 
     #[test]
