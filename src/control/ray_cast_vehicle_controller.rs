@@ -6,7 +6,8 @@ use crate::utils::{SimdCross, SimdDot};
 use std::collections::HashMap;
 
 use super::vehicle_powertrain::{
-    VehicleControllerConfig, VehicleInput, VehiclePowertrain, VehicleState, WheelAxle, WheelRole,
+    VehicleControllerConfig, VehicleEngineState, VehicleInput, VehiclePowertrain,
+    VehicleShiftOutcome, VehicleState, WheelAxle, WheelRole,
 };
 
 const DRIFT_ASSIST_MIN_SPEED: Real = 5.0;
@@ -819,6 +820,11 @@ impl DynamicRayCastVehicleController {
         self.powertrain.state()
     }
 
+    /// The current discrete engine lifecycle state.
+    pub fn engine_state(&self) -> VehicleEngineState {
+        self.powertrain.engine_state()
+    }
+
     /// Restores all transient simulation state while preserving vehicle configuration and tuning.
     pub fn reset(&mut self) {
         self.powertrain.reset();
@@ -836,18 +842,18 @@ impl DynamicRayCastVehicleController {
     }
 
     /// Requests the next higher gear.
-    pub fn shift_up(&mut self) {
-        self.powertrain.shift_up();
+    pub fn shift_up(&mut self) -> VehicleShiftOutcome {
+        self.powertrain.shift_up()
     }
 
     /// Requests the next lower gear.
-    pub fn shift_down(&mut self) {
-        self.powertrain.shift_down();
+    pub fn shift_down(&mut self) -> VehicleShiftOutcome {
+        self.powertrain.shift_down()
     }
 
     /// Selects a specific gear, where -1 is reverse and 0 is neutral.
-    pub fn set_gear(&mut self, gear: i32) {
-        self.powertrain.set_gear(gear);
+    pub fn set_gear(&mut self, gear: i32) -> VehicleShiftOutcome {
+        self.powertrain.set_gear(gear)
     }
 
     /// Enables or disables all steering assistance, including speed-sensitive

@@ -11,7 +11,8 @@ pub use self::ray_cast_vehicle_controller::{DynamicRayCastVehicleController, Whe
 #[cfg(feature = "dim3")]
 pub use self::vehicle_powertrain::{
     EngineConfig, SteeringConfig, TransmissionConfig, TurboConfig, VehicleControllerConfig,
-    VehicleDynamicsConfig, VehicleInput, VehicleState, WheelAxle, WheelRole,
+    VehicleDynamicsConfig, VehicleEngineState, VehicleInput, VehicleShiftOutcome, VehicleState,
+    WheelAxle, WheelRole,
 };
 
 mod character_controller;

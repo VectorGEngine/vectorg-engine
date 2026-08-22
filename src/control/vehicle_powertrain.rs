@@ -271,6 +271,16 @@ pub struct VehicleState {
     pub engine_starting: bool,
     /// Normalized progress through the active starter sequence.
     pub engine_start_progress: Real,
+    /// Sequence incremented whenever the engine lifecycle state changes.
+    pub engine_state_sequence: u32,
+    /// Sequence incremented for every driver-requested shift.
+    pub gear_shift_sequence: u32,
+    /// Sequence incremented whenever a driver-requested shift is accepted.
+    pub gear_shift_accepted_sequence: u32,
+    /// Sequence incremented whenever a driver-requested shift is ignored.
+    pub gear_shift_ignored_sequence: u32,
+    /// Sequence incremented whenever a driver-requested shift is rejected by the clutch gate.
+    pub gear_shift_rejected_sequence: u32,
     /// Current gear, where -1 is reverse and 0 is neutral.
     pub current_gear: i32,
     /// Whether reverse gear is currently selected.
@@ -299,6 +309,28 @@ pub struct VehicleState {
     pub force_feedback: Real,
     /// Normalized steering-wheel friction output.
     pub steering_friction: Real,
+}
+
+/// Result of a driver-requested gear change.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VehicleShiftOutcome {
+    /// The request was accepted by the transmission controller.
+    Accepted,
+    /// The request was ignored because another shift is active or cooling down.
+    Ignored,
+    /// The request failed because a manual clutch was not sufficiently disengaged.
+    ClutchRejected,
+}
+
+/// Discrete lifecycle state of the combustion engine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VehicleEngineState {
+    /// The engine is not producing torque and the starter is inactive.
+    Stopped,
+    /// The starter sequence is actively cranking the engine.
+    Starting,
+    /// The engine is producing combustion torque.
+    Running,
 }
 
 /// Logical axle used for brake and handbrake distribution.
@@ -467,47 +499,52 @@ impl VehiclePowertrain {
         &mut self.state
     }
 
-    pub fn shift_up(&mut self) {
+    pub fn shift_up(&mut self) -> VehicleShiftOutcome {
         if self.shift_phase != ShiftPhase::Idle {
-            return;
+            return self.record_shift_outcome(VehicleShiftOutcome::Ignored);
         }
 
         let max_gear = self.config.transmission.forward_ratios.len() as i32;
         let gear = (self.shift_target + 1).min(max_gear);
         if self.reject_manual_shift_without_clutch(gear) {
-            return;
+            return self.record_shift_outcome(VehicleShiftOutcome::ClutchRejected);
         }
 
         if self.shift_cooldown > 0.0 {
-            return;
+            return self.record_shift_outcome(VehicleShiftOutcome::Ignored);
         }
 
         self.set_manual_shift_target(gear, false);
+        self.record_shift_outcome(VehicleShiftOutcome::Accepted)
     }
 
-    pub fn shift_down(&mut self) {
+    pub fn shift_down(&mut self) -> VehicleShiftOutcome {
         if self.shift_phase != ShiftPhase::Idle {
-            return;
+            return self.record_shift_outcome(VehicleShiftOutcome::Ignored);
         }
 
         let gear = (self.shift_target - 1).max(-1);
         if self.reject_manual_shift_without_clutch(gear) {
-            return;
+            return self.record_shift_outcome(VehicleShiftOutcome::ClutchRejected);
         }
 
         if self.shift_cooldown > 0.0 {
-            return;
+            return self.record_shift_outcome(VehicleShiftOutcome::Ignored);
         }
 
         self.set_manual_shift_target(gear, true);
+        self.record_shift_outcome(VehicleShiftOutcome::Accepted)
     }
 
-    pub fn set_gear(&mut self, gear: i32) {
+    pub fn set_gear(&mut self, gear: i32) -> VehicleShiftOutcome {
         let max_gear = self.config.transmission.forward_ratios.len() as i32;
         let gear = gear.clamp(-1, max_gear);
-        if !self.reject_manual_shift_without_clutch(gear) {
-            self.set_manual_shift_target(gear, false);
+        if self.reject_manual_shift_without_clutch(gear) {
+            return self.record_shift_outcome(VehicleShiftOutcome::ClutchRejected);
         }
+
+        self.set_manual_shift_target(gear, false);
+        self.record_shift_outcome(VehicleShiftOutcome::Accepted)
     }
 
     fn reject_manual_shift_without_clutch(&mut self, gear: i32) -> bool {
@@ -522,6 +559,27 @@ impl VehiclePowertrain {
         self.set_manual_shift_target(0, false);
         self.shift_cooldown = 0.0;
         true
+    }
+
+    fn record_shift_outcome(&mut self, outcome: VehicleShiftOutcome) -> VehicleShiftOutcome {
+        self.state.gear_shift_sequence = self.state.gear_shift_sequence.wrapping_add(1);
+        let sequence = match outcome {
+            VehicleShiftOutcome::Accepted => &mut self.state.gear_shift_accepted_sequence,
+            VehicleShiftOutcome::Ignored => &mut self.state.gear_shift_ignored_sequence,
+            VehicleShiftOutcome::ClutchRejected => &mut self.state.gear_shift_rejected_sequence,
+        };
+        *sequence = sequence.wrapping_add(1);
+        outcome
+    }
+
+    pub fn engine_state(&self) -> VehicleEngineState {
+        if self.state.engine_starting {
+            VehicleEngineState::Starting
+        } else if self.state.engine_running {
+            VehicleEngineState::Running
+        } else {
+            VehicleEngineState::Stopped
+        }
     }
 
     fn set_manual_shift_target(&mut self, gear: i32, allows_blip: bool) {
@@ -540,6 +598,7 @@ impl VehiclePowertrain {
         driven_wheel_radius: Real,
     ) -> PowertrainOutput {
         let dt = dt.clamp(0.0, 0.05);
+        let previous_engine_state = self.engine_state();
         self.state.vehicle_speed = vehicle_speed;
         self.state.driven_wheel_speed = driven_wheel_speed.abs();
         self.update_shift_sequence(dt, driven_wheel_speed.abs(), driven_wheel_radius);
@@ -729,6 +788,9 @@ impl VehiclePowertrain {
             driven_wheel_speed.abs(),
             driven_wheel_radius,
         );
+        if self.engine_state() != previous_engine_state {
+            self.state.engine_state_sequence = self.state.engine_state_sequence.wrapping_add(1);
+        }
 
         PowertrainOutput {
             drive_torque,
@@ -1742,6 +1804,11 @@ mod tests {
             engine_running: false,
             engine_starting: true,
             engine_start_progress: 0.5,
+            engine_state_sequence: 6,
+            gear_shift_sequence: 6,
+            gear_shift_accepted_sequence: 7,
+            gear_shift_ignored_sequence: 8,
+            gear_shift_rejected_sequence: 9,
             current_gear: 3,
             reverse_direction: true,
             vehicle_speed: 30.0,
@@ -1795,6 +1862,11 @@ mod tests {
         assert_eq!(powertrain.shift_phase_timer, 0.0);
         assert_eq!(powertrain.shift_to, 0);
         assert_eq!(powertrain.shift_overshoot_rpm, 0.0);
+        assert_eq!(powertrain.state().gear_shift_accepted_sequence, 0);
+        assert_eq!(powertrain.state().gear_shift_ignored_sequence, 0);
+        assert_eq!(powertrain.state().gear_shift_rejected_sequence, 0);
+        assert_eq!(powertrain.state().gear_shift_sequence, 0);
+        assert_eq!(powertrain.state().engine_state_sequence, 0);
         assert!(!powertrain.reverse_brake_armed);
         assert_eq!(powertrain.turbo_load, 0.0);
         assert_eq!(powertrain.previous_throttle, 0.0);
@@ -2366,9 +2438,12 @@ mod tests {
             ..VehicleInput::default()
         });
 
-        powertrain.set_gear(1);
+        let outcome = powertrain.set_gear(1);
         powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
 
+        assert_eq!(outcome, VehicleShiftOutcome::Accepted);
+        assert_eq!(powertrain.state().gear_shift_sequence, 1);
+        assert_eq!(powertrain.state().gear_shift_accepted_sequence, 1);
         assert_eq!(powertrain.state().current_gear, 1);
     }
 
@@ -2386,9 +2461,11 @@ mod tests {
             clutch: MANUAL_SHIFT_CLUTCH_DISENGAGEMENT - 0.01,
             ..VehicleInput::default()
         });
-        powertrain.shift_up();
+        let outcome = powertrain.shift_up();
         powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
 
+        assert_eq!(outcome, VehicleShiftOutcome::ClutchRejected);
+        assert_eq!(powertrain.state().gear_shift_rejected_sequence, 1);
         assert_eq!(powertrain.state().current_gear, 0);
     }
 
@@ -2403,9 +2480,10 @@ mod tests {
         powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
 
         powertrain.set_input(VehicleInput::default());
-        powertrain.shift_down();
+        let outcome = powertrain.shift_down();
         powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
 
+        assert_eq!(outcome, VehicleShiftOutcome::ClutchRejected);
         assert_eq!(powertrain.state().current_gear, 0);
     }
 
@@ -2424,10 +2502,32 @@ mod tests {
         assert_eq!(powertrain.state().current_gear, 1);
 
         powertrain.set_input(VehicleInput::default());
-        powertrain.set_gear(-1);
+        let outcome = powertrain.set_gear(-1);
         powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
 
+        assert_eq!(outcome, VehicleShiftOutcome::ClutchRejected);
         assert_eq!(powertrain.state().current_gear, 0);
+    }
+
+    #[test]
+    fn shift_during_cooldown_is_ignored_without_a_clutch_rejection() {
+        let mut config = VehicleControllerConfig::default();
+        config.transmission.automatic = false;
+        config.transmission.shift_cooldown = 1.0;
+        let mut powertrain = VehiclePowertrain::new(config);
+        powertrain.set_input(VehicleInput {
+            clutch: 1.0,
+            ..VehicleInput::default()
+        });
+        powertrain.set_gear(1);
+        powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+
+        let outcome = powertrain.shift_up();
+
+        assert_eq!(outcome, VehicleShiftOutcome::Ignored);
+        assert_eq!(powertrain.state().gear_shift_sequence, 2);
+        assert_eq!(powertrain.state().gear_shift_ignored_sequence, 1);
+        assert_eq!(powertrain.state().current_gear, 1);
     }
 
     #[test]
@@ -2441,9 +2541,10 @@ mod tests {
         powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
 
         powertrain.set_input(VehicleInput::default());
-        powertrain.set_gear(0);
+        let outcome = powertrain.set_gear(0);
         powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
 
+        assert_eq!(outcome, VehicleShiftOutcome::Accepted);
         assert_eq!(powertrain.state().current_gear, 0);
     }
 
@@ -2741,6 +2842,8 @@ mod tests {
             }
         }
         assert!(!powertrain.state().engine_running);
+        assert_eq!(powertrain.engine_state(), VehicleEngineState::Stopped);
+        assert_eq!(powertrain.state().engine_state_sequence, 1);
 
         powertrain.set_input(VehicleInput {
             throttle: 1.0,
@@ -2751,6 +2854,8 @@ mod tests {
 
         assert!(powertrain.state().engine_starting);
         assert!(!powertrain.state().engine_running);
+        assert_eq!(powertrain.engine_state(), VehicleEngineState::Starting);
+        assert_eq!(powertrain.state().engine_state_sequence, 2);
         assert_eq!(powertrain.state().engine_rpm, 0.0);
         assert_eq!(output.drive_throttle, 0.0);
         assert_eq!(output.drive_torque, 0.0);
@@ -2778,6 +2883,8 @@ mod tests {
         let output = powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
         assert!(powertrain.state().engine_running);
         assert!(!powertrain.state().engine_starting);
+        assert_eq!(powertrain.engine_state(), VehicleEngineState::Running);
+        assert_eq!(powertrain.state().engine_state_sequence, 3);
         assert!(powertrain.state().engine_rpm >= powertrain.config.engine.idle_rpm);
         assert_eq!(output.drive_throttle, 1.0);
     }
