@@ -1830,7 +1830,7 @@ impl DynamicRayCastVehicleController {
             let raw_drive_impulse = wheel.engine_force * dt * (1.0 - esc_engine_cut);
             let raw_drive_demand = (raw_drive_impulse * wheel.fwd_factor).abs();
             let capacity_excess = if powered_acceleration && raw_drive_demand > Real::EPSILON {
-                drive_capacity_excess(raw_drive_demand, forward_friction_limit)
+                drive_capacity_excess(raw_drive_demand, remaining_forward_limit)
             } else {
                 0.0
             };
@@ -2248,6 +2248,17 @@ mod tests {
         assert!((cuts[2] - 0.3).abs() < 1.0e-5);
         assert!((cuts[3] - 0.45).abs() < 1.0e-5);
         assert!((cuts[4] - 0.6).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn traction_control_uses_capacity_remaining_after_cornering() {
+        let raw_drive_demand = 10.0;
+        let remaining_forward_capacity = 6.0;
+        let capacity_excess = drive_capacity_excess(raw_drive_demand, remaining_forward_capacity);
+        let cut = traction_control_target(1.0, 10.0, 10.0, 1.0, capacity_excess, false);
+
+        assert!((cut - 0.4).abs() < 1.0e-5);
+        assert!((raw_drive_demand * (1.0 - cut) - remaining_forward_capacity).abs() < 1.0e-5);
     }
 
     #[test]
