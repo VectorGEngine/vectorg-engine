@@ -205,6 +205,10 @@ impl Default for VehicleDynamicsConfig {
 pub struct SteeringConfig {
     /// Maximum central steering angle in radians.
     pub max_angle: Real,
+    /// Linear-to-cubic driver steering blend applied before steering assistance.
+    ///
+    /// A value of `0.0` is linear while `1.0` is fully cubic.
+    pub road_wheel_curve: Real,
     /// Speed where assisted steering reaches its minimum multiplier.
     pub speed_sensitivity: Real,
     /// Assisted steering multiplier retained at and above the sensitivity speed.
@@ -222,6 +226,7 @@ impl Default for SteeringConfig {
     fn default() -> Self {
         Self {
             max_angle: (35.0 as Real).to_radians(),
+            road_wheel_curve: 0.0,
             speed_sensitivity: 35.0,
             minimum_speed_factor: 0.25,
             assist: false,
@@ -291,6 +296,8 @@ pub struct VehicleState {
     pub driven_wheel_speed: Real,
     /// Current central steering angle in radians.
     pub steering_angle: Real,
+    /// Uncurved, speed-adjusted driver steering angle in road-wheel radians.
+    pub driver_steering_angle: Real,
     /// Normalized engine load.
     pub engine_load: Real,
     /// Normalized proximity to or activity of the rev limiter.
@@ -1458,6 +1465,7 @@ fn sanitize_config(config: &mut VehicleControllerConfig) {
         config.dynamics.traction_control_strength.clamp(0.0, 1.0);
     config.dynamics.esc_strength = config.dynamics.esc_strength.clamp(0.0, 1.0);
     config.steering.max_angle = config.steering.max_angle.abs();
+    config.steering.road_wheel_curve = config.steering.road_wheel_curve.clamp(0.0, 1.0);
     config.steering.minimum_speed_factor = config.steering.minimum_speed_factor.clamp(0.0, 1.0);
     config.steering.drift_correction = config.steering.drift_correction.clamp(0.0, 1.0);
 }
@@ -1497,6 +1505,18 @@ mod tests {
         let powertrain = VehiclePowertrain::new(VehicleControllerConfig::default());
         assert!(powertrain.peak_torque > 0.0);
         assert_eq!(powertrain.config.engine.torque_curve.len(), 3);
+    }
+
+    #[test]
+    fn clamps_road_wheel_curve_to_normalized_range() {
+        let mut config = VehicleControllerConfig::default();
+        config.steering.road_wheel_curve = -1.0;
+        let linear = VehiclePowertrain::new(config.clone());
+        assert_eq!(linear.config.steering.road_wheel_curve, 0.0);
+
+        config.steering.road_wheel_curve = 2.0;
+        let cubic = VehiclePowertrain::new(config);
+        assert_eq!(cubic.config.steering.road_wheel_curve, 1.0);
     }
 
     #[test]
@@ -1814,6 +1834,7 @@ mod tests {
             vehicle_speed: 30.0,
             driven_wheel_speed: 35.0,
             steering_angle: 0.4,
+            driver_steering_angle: 0.3,
             engine_load: 0.8,
             rev_limiter_amount: 0.6,
             turbo_load: 0.9,

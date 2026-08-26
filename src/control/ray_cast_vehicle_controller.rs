@@ -57,6 +57,11 @@ fn drift_assist_speed_activation(forward_speed: Real) -> Real {
     normalized * normalized * (3.0 - 2.0 * normalized)
 }
 
+fn curved_steering_input(input: Real, road_wheel_curve: Real) -> Real {
+    let normalized = input.clamp(-1.0, 1.0);
+    (1.0 - road_wheel_curve) * normalized + road_wheel_curve * normalized.powi(3)
+}
+
 /// A character controller to simulate vehicles using ray-casting for the wheels.
 pub struct DynamicRayCastVehicleController {
     wheels: Vec<Wheel>,
@@ -1193,7 +1198,11 @@ impl DynamicRayCastVehicleController {
                 + (1.0 - normalized).powi(2) * (1.0 - steering_config.minimum_speed_factor)
         };
         let max_angle = steering_config.max_angle;
-        let player_angle = input.steering * max_angle * speed_factor;
+        let normalized_input = input.steering.clamp(-1.0, 1.0);
+        let driver_steering_angle = normalized_input * max_angle * speed_factor;
+        let curved_input =
+            curved_steering_input(normalized_input, steering_config.road_wheel_curve);
+        let player_angle = curved_input * max_angle * speed_factor;
         let correction_strength = steering_config.drift_correction.clamp(0.0, 1.0);
         let assist_speed_activation = drift_assist_speed_activation(self.current_vehicle_speed);
         let mut target_assist_offset = None;
@@ -1282,7 +1291,9 @@ impl DynamicRayCastVehicleController {
         let mut center_angle = player_angle + self.drift_assist_offset;
 
         center_angle = center_angle.clamp(-max_angle, max_angle);
-        self.powertrain.state_mut().steering_angle = center_angle;
+        let state = self.powertrain.state_mut();
+        state.driver_steering_angle = driver_steering_angle;
+        state.steering_angle = center_angle;
 
         let side_axis = self.side_axis();
         let mut steered_forward_sum = 0.0;
@@ -2733,6 +2744,51 @@ mod tests {
     }
 
     #[test]
+    fn road_wheel_curve_blends_linear_and_cubic_input_symmetrically() {
+        assert_eq!(curved_steering_input(0.5, 0.0), 0.5);
+        assert_eq!(curved_steering_input(0.5, 1.0), 0.125);
+
+        let blended = curved_steering_input(0.5, 0.25);
+        assert!((blended - 0.40625).abs() < 1.0e-5);
+        assert!((curved_steering_input(-0.5, 0.25) + blended).abs() < 1.0e-5);
+        assert_eq!(curved_steering_input(0.0, 0.25), 0.0);
+        assert_eq!(curved_steering_input(1.0, 0.25), 1.0);
+        assert_eq!(curved_steering_input(-1.0, 0.25), -1.0);
+    }
+
+    #[test]
+    fn road_wheel_curve_is_applied_before_wheel_steering_geometry() {
+        let mut config = VehicleControllerConfig::default();
+        config.steering.max_angle = 0.6;
+        config.steering.road_wheel_curve = 0.25;
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
+        controller.index_forward_axis = 2;
+        controller.index_up_axis = 1;
+        controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            0.4,
+            0.35,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Front, false, true),
+        );
+        controller.set_input(VehicleInput {
+            steering: 0.5,
+            ..VehicleInput::default()
+        });
+
+        let chassis = RigidBodyBuilder::dynamic().build();
+        controller.update_steering(&chassis, 1.0 / 60.0);
+
+        let expected = 0.40625 * 0.6;
+        assert!((controller.state().driver_steering_angle - 0.3).abs() < 1.0e-5);
+        assert!((controller.state().steering_angle - expected).abs() < 1.0e-5);
+        assert!((controller.wheels[0].steering - expected).abs() < 1.0e-5);
+    }
+
+    #[test]
     fn disabling_steering_assist_restores_the_full_steering_range_at_speed() {
         let mut config = VehicleControllerConfig::default();
         config.steering.assist = true;
@@ -2874,6 +2930,7 @@ mod tests {
             let mut config = VehicleControllerConfig::default();
             config.steering.assist = true;
             config.steering.drift_correction = strength;
+            config.steering.road_wheel_curve = 0.25;
             let mut controller =
                 DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
             controller.index_forward_axis = 2;
@@ -2902,7 +2959,9 @@ mod tests {
         let normalized = 10.0 / steering.speed_sensitivity;
         let speed_factor = steering.minimum_speed_factor
             + (1.0 - normalized).powi(2) * (1.0 - steering.minimum_speed_factor);
-        let player_angle = 0.2 * steering.max_angle * speed_factor;
+        let player_angle = curved_steering_input(0.2, steering.road_wheel_curve)
+            * steering.max_angle
+            * speed_factor;
         let velocity_dir = chassis.linvel().normalize();
         let drift_angle = Vector::y()
             .dot(&velocity_dir.cross(&Vector::z()))
@@ -2910,6 +2969,10 @@ mod tests {
         let correction_angle = -drift_angle;
 
         assert!((full.state().steering_angle - correction_angle).abs() < 1.0e-4);
+        assert!(
+            (full.state().driver_steering_angle - 0.2 * steering.max_angle * speed_factor).abs()
+                < 1.0e-4
+        );
         assert!(
             (half.state().steering_angle - (player_angle + correction_angle) * 0.5).abs() < 1.0e-4
         );
