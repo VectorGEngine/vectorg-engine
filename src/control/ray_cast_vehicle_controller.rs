@@ -1805,22 +1805,6 @@ impl DynamicRayCastVehicleController {
                 wheel.contact_damping,
             );
 
-            if contact.side_speed.abs() < 1.0 {
-                let side_hold = resolve_ground_impulse(
-                    bodies,
-                    colliders,
-                    self.chassis,
-                    contact.ground_object,
-                    &wheel.raycast_info.contact_point_ws,
-                    &contact.side_dir,
-                    1.0,
-                );
-
-                if side_hold.abs() > wheel.side_impulse.abs() {
-                    wheel.side_impulse = side_hold;
-                }
-            }
-
             wheel.side_impulse *= wheel.side_friction_stiffness * lateral_grip_scale;
             let side_total = wheel.side_impulse * wheel.side_factor;
             let forward_friction_limit = contact.friction_limit * forward_grip_scale;
