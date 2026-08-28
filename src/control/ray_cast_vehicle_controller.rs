@@ -45,10 +45,16 @@ const TRACTION_CONTROL_STEERING_OVERRIDE_FULL: Real = 0.8;
 const TRACTION_CONTROL_ENGAGE_RESPONSE: Real = 18.0;
 const TRACTION_CONTROL_RELEASE_RESPONSE: Real = 8.0;
 const LONGITUDINAL_SLIP_REFERENCE_SPEED: Real = 10.0;
-const LONGITUDINAL_SLIP_START: Real = 0.05;
+const LONGITUDINAL_SLIP_START: Real = 0.15;
 const LONGITUDINAL_SLIP_FULL: Real = 0.30;
-const LONGITUDINAL_SLIP_LATERAL_GRIP_MIN: Real = 0.2;
 const LONGITUDINAL_SLIP_FORWARD_GRIP_MIN: Real = 0.75;
+const DYNAMIC_FRICTION_RATIO: Real = 0.85;
+// Equivalent to the legacy static clamp producing skid_info below approximately 0.3.
+const DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED: Real = 11.111_111;
+const CONTACT_DAMPING_SPEED_START: Real = 16.666_667; // 60 km/h.
+const CONTACT_DAMPING_FRONT_MAX: Real = 0.65;
+const CONTACT_DAMPING_REAR_MAX: Real = 0.8;
+const TAU: Real = 6.283_185_307_179_586 as Real;
 
 fn drift_assist_speed_activation(forward_speed: Real) -> Real {
     let normalized = ((forward_speed - DRIFT_ASSIST_MIN_SPEED)
@@ -275,6 +281,8 @@ pub struct Wheel {
 
     clipped_inv_contact_dot_suspension: Real,
     suspension_relative_velocity: Real,
+    contact_forward_speed: Real,
+    contact_side_speed: Real,
     /// The force applied by the suspension.
     pub wheel_suspension_force: Real,
     /// The amount of skid information for this wheel.
@@ -336,6 +344,8 @@ impl Wheel {
             anti_roll: 0.8,
             clipped_inv_contact_dot_suspension: 0.0,
             suspension_relative_velocity: 0.0,
+            contact_forward_speed: 0.0,
+            contact_side_speed: 0.0,
             wheel_suspension_force: 0.0,
             max_suspension_force: info.max_suspension_force,
             skid_info: 0.0,
@@ -388,6 +398,8 @@ impl Wheel {
         self.lock = false;
         self.clipped_inv_contact_dot_suspension = 0.0;
         self.suspension_relative_velocity = 0.0;
+        self.contact_forward_speed = 0.0;
+        self.contact_side_speed = 0.0;
         self.wheel_suspension_force = 0.0;
         self.skid_info = 0.0;
         self.last_skid_info = 0.0;
@@ -484,6 +496,25 @@ fn aligned_wheel_forward(
     }
 
     forward
+}
+
+#[cfg(feature = "dim3")]
+fn steering_positive_side(
+    contact_normal: &Vector<Real>,
+    wheel_forward: &Vector<Real>,
+) -> Vector<Real> {
+    contact_normal
+        .cross(wheel_forward)
+        .try_normalize(1.0e-5)
+        .unwrap_or_else(Vector::zeros)
+}
+
+#[cfg(feature = "dim2")]
+fn steering_positive_side(
+    _contact_normal: &Vector<Real>,
+    wheel_forward: &Vector<Real>,
+) -> Vector<Real> {
+    Vector::new(wheel_forward.y, -wheel_forward.x)
 }
 
 fn update_powered_wheel_rotation(
@@ -623,6 +654,64 @@ fn smoothstep(edge0: Real, edge1: Real, value: Real) -> Real {
     rate * rate * (3.0 - 2.0 * rate)
 }
 
+fn theoretical_max_speed(config: &VehicleControllerConfig, wheel_radius: Real) -> Real {
+    let highest_gear_ratio = config
+        .transmission
+        .forward_ratios
+        .last()
+        .copied()
+        .unwrap_or(1.0)
+        .abs()
+        .max(0.01);
+
+    config.engine.max_rpm
+        / (highest_gear_ratio * config.transmission.final_drive_ratio.max(0.01))
+        / 60.0
+        * TAU
+        * wheel_radius.max(0.01)
+}
+
+fn speed_adjusted_contact_damping(
+    base: Real,
+    axle: WheelAxle,
+    body_speed: Real,
+    maximum_speed: Real,
+) -> Real {
+    let speed_factor = smoothstep(
+        CONTACT_DAMPING_SPEED_START,
+        maximum_speed.max(CONTACT_DAMPING_SPEED_START + Real::EPSILON),
+        body_speed.abs(),
+    );
+    let maximum = match axle {
+        WheelAxle::Front => CONTACT_DAMPING_FRONT_MAX,
+        WheelAxle::Rear => CONTACT_DAMPING_REAR_MAX,
+    }
+    .max(base);
+
+    base + (maximum - base) * speed_factor
+}
+
+fn tire_slip(wheel_surface_speed: Real, forward_speed: Real, side_speed: Real) -> (Real, Real) {
+    let reference_speed = forward_speed.abs().max(2.0);
+    let longitudinal_slip = (wheel_surface_speed - forward_speed).abs() / reference_speed;
+    let lateral_slip_angle = side_speed.abs().atan2(reference_speed);
+    (longitudinal_slip, lateral_slip_angle)
+}
+
+fn tire_grip_ratio(
+    impulse_utilization_squared: Real,
+    longitudinal_slip: Real,
+    lateral_slip_angle: Real,
+) -> Real {
+    if impulse_utilization_squared > DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED
+        && (longitudinal_slip >= 0.12 || lateral_slip_angle >= (5.0 as Real).to_radians())
+    {
+        DYNAMIC_FRICTION_RATIO
+    } else {
+        1.0
+    }
+}
+
 fn traction_control_speed_factor(body_speed: Real) -> Real {
     smoothstep(
         TRACTION_CONTROL_SPEED_OFF,
@@ -671,15 +760,6 @@ fn drive_capacity_excess(drive_demand: Real, forward_capacity: Real) -> Real {
     } else {
         ((drive_demand - forward_capacity.max(0.0)) / drive_demand).clamp(0.0, 1.0)
     }
-}
-
-fn powered_slip_forward_capacity(
-    longitudinal_capacity: Real,
-    remaining_forward_capacity: Real,
-    body_speed: Real,
-) -> Real {
-    let speed_factor = traction_control_speed_factor(body_speed);
-    remaining_forward_capacity + (longitudinal_capacity - remaining_forward_capacity) * speed_factor
 }
 
 fn residual_drive_slip_demand(
@@ -740,10 +820,7 @@ fn driven_wheel_longitudinal_slip(
 fn longitudinal_slip_grip_scales(longitudinal_slip: Real) -> (Real, Real) {
     let activation = longitudinal_slip.clamp(0.0, 1.0);
     let loss = activation * activation;
-    (
-        1.0 + (LONGITUDINAL_SLIP_LATERAL_GRIP_MIN - 1.0) * loss,
-        1.0 + (LONGITUDINAL_SLIP_FORWARD_GRIP_MIN - 1.0) * loss,
-    )
+    (1.0, 1.0 + (LONGITUDINAL_SLIP_FORWARD_GRIP_MIN - 1.0) * loss)
 }
 
 fn traction_control_target(
@@ -1715,6 +1792,8 @@ impl DynamicRayCastVehicleController {
             wheel.engine_force_feedback = 0.0;
             wheel.drive_slip_demand = 0.0;
             wheel.contact_damping = wheel.base_contact_damping;
+            wheel.contact_forward_speed = 0.0;
+            wheel.contact_side_speed = 0.0;
         }
 
         for wheel_id in 0..num_wheels {
@@ -1737,9 +1816,12 @@ impl DynamicRayCastVehicleController {
                 Some(ground_object),
                 &wheel.raycast_info.contact_point_ws,
             );
+            let positive_side = steering_positive_side(&contact_normal, &forward_dir);
 
             self.axle[wheel_id] = side_dir;
             self.forward_ws[wheel_id] = forward_dir;
+            wheel.contact_forward_speed = forward_dir.dot(&contact_velocity);
+            wheel.contact_side_speed = positive_side.dot(&contact_velocity);
 
             wheel.ground_type = colliders[ground_object].material.name.clone();
             wheel.ground_friction = self
@@ -1753,7 +1835,7 @@ impl DynamicRayCastVehicleController {
                 ground_object: Some(ground_object),
                 forward_dir,
                 side_dir,
-                forward_speed: forward_dir.dot(&contact_velocity),
+                forward_speed: wheel.contact_forward_speed,
                 side_speed: side_dir.dot(&contact_velocity),
                 friction_limit: wheel.wheel_suspension_force
                     * dt
@@ -1773,6 +1855,13 @@ impl DynamicRayCastVehicleController {
 
             let drive_direction = wheel.target_rotation.signum();
             let wheel_surface_speed = wheel.delta_rotation / dt.max(Real::EPSILON) * wheel.radius;
+            let maximum_speed = theoretical_max_speed(&self.powertrain.config, wheel.radius);
+            wheel.contact_damping = speed_adjusted_contact_damping(
+                wheel.base_contact_damping,
+                wheel.role.axle,
+                body_speed,
+                maximum_speed,
+            );
             let (lateral_grip_scale, forward_grip_scale) = if wheel.role.driven {
                 let longitudinal_slip = driven_wheel_longitudinal_slip(
                     wheel_surface_speed,
@@ -1805,6 +1894,22 @@ impl DynamicRayCastVehicleController {
                 wheel.contact_damping,
             );
 
+            // if contact.side_speed.abs() < 1.0 {
+            //     let side_hold = resolve_ground_impulse(
+            //         bodies,
+            //         colliders,
+            //         self.chassis,
+            //         contact.ground_object,
+            //         &wheel.raycast_info.contact_point_ws,
+            //         &contact.side_dir,
+            //         1.0,
+            //     );
+
+            //     if side_hold.abs() > wheel.side_impulse.abs() {
+            //         wheel.side_impulse = side_hold;
+            //     }
+            // }
+
             wheel.side_impulse *= wheel.side_friction_stiffness * lateral_grip_scale;
             let side_total = wheel.side_impulse * wheel.side_factor;
             let forward_friction_limit = contact.friction_limit * forward_grip_scale;
@@ -1825,7 +1930,7 @@ impl DynamicRayCastVehicleController {
             let raw_drive_impulse = wheel.engine_force * dt * (1.0 - esc_engine_cut);
             let raw_drive_demand = (raw_drive_impulse * wheel.fwd_factor).abs();
             let capacity_excess = if powered_acceleration && raw_drive_demand > Real::EPSILON {
-                drive_capacity_excess(raw_drive_demand, forward_friction_limit)
+                drive_capacity_excess(raw_drive_demand, remaining_forward_limit)
             } else {
                 0.0
             };
@@ -1869,14 +1974,9 @@ impl DynamicRayCastVehicleController {
             wheel.drive_slip_demand = if powered_acceleration && traction_control_bypass {
                 1.0
             } else if powered_acceleration {
-                let powered_slip_capacity = powered_slip_forward_capacity(
-                    forward_friction_limit,
-                    remaining_forward_limit,
-                    body_speed,
-                );
                 traction_controlled_drive_slip_demand(
                     raw_drive_demand,
-                    powered_slip_capacity,
+                    remaining_forward_limit,
                     effective_strength,
                 )
             } else {
@@ -1974,11 +2074,22 @@ impl DynamicRayCastVehicleController {
             };
             let impulse_utilization_squared =
                 forward_utilization_squared + side_utilization_squared;
+            let (longitudinal_slip, lateral_slip_angle) = tire_slip(
+                wheel_surface_speed,
+                contact.forward_speed,
+                contact.side_speed,
+            );
+            let grip_ratio = tire_grip_ratio(
+                impulse_utilization_squared,
+                longitudinal_slip,
+                lateral_slip_angle,
+            );
+            let available_utilization_squared = grip_ratio * grip_ratio;
 
             wheel.skid_info = 1.0;
 
-            if impulse_utilization_squared > 1.0 {
-                let factor = crate::utils::inv(impulse_utilization_squared.sqrt());
+            if impulse_utilization_squared > available_utilization_squared {
+                let factor = grip_ratio * crate::utils::inv(impulse_utilization_squared.sqrt());
                 wheel.skid_info = factor;
                 wheel.forward_impulse *= factor;
                 wheel.brake_impulse *= factor;
@@ -2046,6 +2157,105 @@ mod tests {
 
         assert!(positive_axle.dot(&chassis_forward) > 0.999);
         assert!(negative_axle.dot(&chassis_forward) > 0.999);
+    }
+
+    #[test]
+    fn contact_damping_increases_smoothly_with_speed_and_axle_target() {
+        let base = 0.15;
+        let maximum_speed = 60.0;
+        let midpoint_speed = (CONTACT_DAMPING_SPEED_START + maximum_speed) * 0.5;
+
+        assert_eq!(
+            speed_adjusted_contact_damping(
+                base,
+                WheelAxle::Rear,
+                CONTACT_DAMPING_SPEED_START,
+                maximum_speed,
+            ),
+            base
+        );
+        assert!(
+            (speed_adjusted_contact_damping(base, WheelAxle::Front, midpoint_speed, maximum_speed,)
+                - 0.4)
+                .abs()
+                < 1.0e-6
+        );
+        assert!(
+            (speed_adjusted_contact_damping(base, WheelAxle::Rear, midpoint_speed, maximum_speed,)
+                - 0.475)
+                .abs()
+                < 1.0e-6
+        );
+        assert!(
+            (speed_adjusted_contact_damping(base, WheelAxle::Front, maximum_speed, maximum_speed,)
+                - CONTACT_DAMPING_FRONT_MAX)
+                .abs()
+                < 1.0e-6
+        );
+        assert!(
+            (speed_adjusted_contact_damping(base, WheelAxle::Rear, maximum_speed, maximum_speed,)
+                - CONTACT_DAMPING_REAR_MAX)
+                .abs()
+                < 1.0e-6
+        );
+    }
+
+    #[test]
+    fn contact_damping_maximum_speed_matches_highest_gear_redline() {
+        let config = VehicleControllerConfig::default();
+        let maximum_speed = theoretical_max_speed(&config, 0.35);
+
+        assert!(maximum_speed > 75.0 && maximum_speed < 76.0);
+    }
+
+    #[test]
+    fn contact_damping_speed_adjustment_never_reduces_a_higher_base() {
+        assert_eq!(
+            speed_adjusted_contact_damping(0.9, WheelAxle::Rear, 100.0, 60.0),
+            0.9
+        );
+    }
+
+    #[test]
+    fn low_surface_grip_does_not_trigger_dynamic_friction_without_tire_slip() {
+        assert_eq!(tire_grip_ratio(12.0, 0.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn tire_slip_uses_wheel_and_contact_motion() {
+        assert_eq!(tire_slip(10.0, 10.0, 0.0), (0.0, 0.0));
+
+        let (longitudinal_slip, lateral_slip_angle) = tire_slip(12.0, 10.0, 1.0);
+        assert!((longitudinal_slip - 0.2).abs() < 1.0e-6);
+        assert!((lateral_slip_angle - 0.099_668_65).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn saturated_tire_switches_to_dynamic_grip_after_actual_slip_begins() {
+        assert_eq!(
+            tire_grip_ratio(DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED, 0.12, 0.0),
+            1.0
+        );
+        assert_eq!(
+            tire_grip_ratio(DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED + 0.01, 0.12, 0.0,),
+            DYNAMIC_FRICTION_RATIO
+        );
+        assert_eq!(
+            tire_grip_ratio(
+                DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED + 0.01,
+                0.0,
+                (5.0 as Real).to_radians(),
+            ),
+            DYNAMIC_FRICTION_RATIO
+        );
+    }
+
+    #[test]
+    fn tire_regains_static_grip_when_actual_slip_ends() {
+        assert_eq!(
+            tire_grip_ratio(DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED + 1.0, 0.0, 0.0),
+            1.0
+        );
     }
 
     #[test]
@@ -2350,7 +2560,7 @@ mod tests {
     #[test]
     fn longitudinal_slip_uses_wheel_speed_relative_to_the_contact() {
         assert_eq!(driven_wheel_longitudinal_slip(10.0, 10.0, 1.0), 0.0);
-        assert_eq!(driven_wheel_longitudinal_slip(10.5, 10.0, 1.0), 0.0);
+        assert_eq!(driven_wheel_longitudinal_slip(11.5, 10.0, 1.0), 0.0);
 
         let partial_slip = driven_wheel_longitudinal_slip(12.0, 10.0, 1.0);
         assert!(partial_slip > 0.0 && partial_slip < 1.0);
@@ -2382,17 +2592,17 @@ mod tests {
     }
 
     #[test]
-    fn longitudinal_slip_activation_reduces_grip_quadratically() {
+    fn longitudinal_slip_activation_reduces_only_forward_grip_quadratically() {
         let (full_lateral, full_forward) = longitudinal_slip_grip_scales(1.0);
-        assert!((full_lateral - LONGITUDINAL_SLIP_LATERAL_GRIP_MIN).abs() < 1.0e-6);
+        assert_eq!(full_lateral, 1.0);
         assert!((full_forward - LONGITUDINAL_SLIP_FORWARD_GRIP_MIN).abs() < 1.0e-6);
 
         let (low_slip_lateral, low_slip_forward) = longitudinal_slip_grip_scales(0.25);
-        assert!((low_slip_lateral - 0.95).abs() < 1.0e-6);
+        assert_eq!(low_slip_lateral, 1.0);
         assert!((low_slip_forward - 0.984_375).abs() < 1.0e-6);
 
         let (partial_lateral, partial_forward) = longitudinal_slip_grip_scales(0.5);
-        assert!((partial_lateral - 0.8).abs() < 1.0e-6);
+        assert_eq!(partial_lateral, 1.0);
         assert!((partial_forward - 0.9375).abs() < 1.0e-6);
 
         assert_eq!(longitudinal_slip_grip_scales(0.0), (1.0, 1.0));
@@ -2409,30 +2619,20 @@ mod tests {
         assert_eq!(grip_scales(21.0, 21.0), (1.0, 1.0));
 
         let (lateral, forward) = grip_scales(3.0, 0.0);
-        assert!((lateral - LONGITUDINAL_SLIP_LATERAL_GRIP_MIN).abs() < 1.0e-6);
+        assert_eq!(lateral, 1.0);
         assert!((forward - LONGITUDINAL_SLIP_FORWARD_GRIP_MIN).abs() < 1.0e-6);
     }
 
     #[test]
-    fn high_speed_steering_does_not_change_powered_slip_capacity() {
-        let up = Vector::ith(1, 1.0);
-        let velocity = Vector::ith(0, 20.0) + Vector::ith(2, 1.0);
-        let body_speed = planar_speed(&velocity, &up);
-        let longitudinal_capacity = 10.0;
-        let straight_capacity =
-            powered_slip_forward_capacity(longitudinal_capacity, longitudinal_capacity, body_speed);
-        let cornering_capacity =
-            powered_slip_forward_capacity(longitudinal_capacity, 2.0, body_speed);
-
-        assert!(body_speed > TRACTION_CONTROL_SPEED_FULL);
-        assert_eq!(straight_capacity, longitudinal_capacity);
-        assert_eq!(cornering_capacity, longitudinal_capacity);
+    fn cornering_capacity_increases_drive_excess() {
+        assert_eq!(drive_capacity_excess(8.0, 10.0), 0.0);
+        assert_eq!(drive_capacity_excess(8.0, 2.0), 0.75);
     }
 
     #[test]
     fn zero_traction_control_preserves_real_high_speed_longitudinal_wheelspin() {
         let raw_drive_demand = 12.0;
-        let forward_capacity = powered_slip_forward_capacity(10.0, 2.0, 20.0);
+        let forward_capacity = 2.0;
         let mut wheel = powered_test_wheel();
         wheel.drive_slip_demand =
             residual_drive_slip_demand(raw_drive_demand, forward_capacity, raw_drive_demand);
@@ -2446,10 +2646,8 @@ mod tests {
 
     #[test]
     fn low_speed_lateral_capacity_still_supports_donuts() {
-        let longitudinal_capacity = 10.0;
         let remaining_cornering_capacity = 2.0;
-        let capacity =
-            powered_slip_forward_capacity(longitudinal_capacity, remaining_cornering_capacity, 0.0);
+        let capacity = remaining_cornering_capacity;
 
         assert_eq!(capacity, remaining_cornering_capacity);
         assert!(residual_drive_slip_demand(8.0, capacity, 8.0) > 0.0);
