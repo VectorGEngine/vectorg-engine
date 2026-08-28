@@ -2004,7 +2004,8 @@ impl DynamicRayCastVehicleController {
             } else {
                 0.0
             };
-            let brake = (wheel.brake + esc_brake).clamp(0.0, 1.0);
+            // Make the brake response quadratic to make it less sensitive at low values and more sensitive at high values.
+            let brake = (wheel.brake.powi(2) + esc_brake).clamp(0.0, 1.0);
 
             wheel.brake_impulse = rolling_friction - wheel.forward_impulse;
             if brake > 0.0 && contact.forward_speed.abs() < 1.0 {
@@ -2031,7 +2032,7 @@ impl DynamicRayCastVehicleController {
 
                 let anti_lock_brake = wheel.anti_lock_brake.clamp(0.0, 1.0);
                 if anti_lock_brake > 0.0 && self.current_vehicle_speed.abs() > 1.0 {
-                    let slip = ((0.98 - wheel.last_skid_info) / 0.98).clamp(0.0, 1.0);
+                    let slip = ((0.3 - wheel.last_skid_info) / 0.3).clamp(0.0, 1.0);
                     let speed_factor =
                         ((self.current_vehicle_speed.abs() - 1.0) / 4.0).clamp(0.0, 1.0);
                     let slip_release = anti_lock_brake * slip * speed_factor * 1.15;
@@ -2041,11 +2042,12 @@ impl DynamicRayCastVehicleController {
                         * brake
                         * speed_factor
                         * steering_factor.max(lateral_factor)
-                        * 0.55;
+                        * 0.55
+                        * slip;
                     let brake_release = (slip_release + lateral_release).clamp(0.0, 0.92);
                     max_brake_impulse *= 1.0 - brake_release;
 
-                    if brake_release > 0.0 {
+                    if brake_release > 0.01 {
                         wheel.lock = false;
                         wheel.is_anti_lock_brake = true;
                     }
