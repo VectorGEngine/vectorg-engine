@@ -54,6 +54,7 @@ const DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED: Real = 11.111_111;
 const CONTACT_DAMPING_SPEED_START: Real = 16.666_667; // 60 km/h.
 const CONTACT_DAMPING_FRONT_MAX: Real = 0.65;
 const CONTACT_DAMPING_REAR_MAX: Real = 0.8;
+const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
 const TAU: Real = 6.283_185_307_179_586 as Real;
 
 fn drift_assist_speed_activation(forward_speed: Real) -> Real {
@@ -477,6 +478,27 @@ impl Default for WheelContactState {
             forward_speed: 0.0,
             side_speed: 0.0,
             friction_limit: 0.0,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct EscIntervention {
+    activity: Real,
+    engine_cut: Real,
+    brake_strength: Real,
+    brake_axle: Option<WheelAxle>,
+    brake_side: Real,
+}
+
+impl Default for EscIntervention {
+    fn default() -> Self {
+        Self {
+            activity: 0.0,
+            engine_cut: 0.0,
+            brake_strength: 0.0,
+            brake_axle: None,
+            brake_side: 0.0,
         }
     }
 }
@@ -1017,12 +1039,12 @@ impl DynamicRayCastVehicleController {
         chassis.angvel().dot(&up)
     }
 
-    fn esc_intervention(&self, chassis: &RigidBody) -> (Real, Real, Real) {
+    fn esc_intervention(&self, chassis: &RigidBody) -> EscIntervention {
         let esc = self.esc.clamp(0.0, 1.0);
         let speed = self.current_vehicle_speed;
 
         if esc == 0.0 || speed.abs() <= 1.0 {
-            return (0.0, 0.0, 0.0);
+            return EscIntervention::default();
         }
 
         let mut steering = 0.0;
@@ -1041,30 +1063,64 @@ impl DynamicRayCastVehicleController {
             max_forward = max_forward.max(forward);
         }
 
-        if num_steered_wheels == 0 {
-            return (0.0, 0.0, 0.0);
+        if num_steered_wheels > 0 {
+            steering /= num_steered_wheels as Real;
         }
-
-        steering /= num_steered_wheels as Real;
 
         let wheelbase = (max_forward - min_forward).abs().max(1.0);
         let desired_yaw_rate = speed * steering.tan() / wheelbase;
-        let yaw_error = desired_yaw_rate - self.chassis_yaw_rate(chassis);
-        let yaw_error_abs = yaw_error.abs();
-        let yaw_factor = ((yaw_error_abs - 0.14) / 0.75).clamp(0.0, 1.0);
+        let actual_yaw_rate = self.chassis_yaw_rate(chassis);
+        let rotation = chassis.position().rotation;
+        let local_up = Vector::ith(self.index_up_axis, 1.0);
+        let local_forward = Vector::ith(self.index_forward_axis, 1.0);
+        let local_positive_yaw_side = local_up
+            .cross(&local_forward)
+            .try_normalize(1.0e-5)
+            .unwrap_or_else(Vector::zeros);
+        let positive_yaw_side = rotation * local_positive_yaw_side;
+        let side_speed = positive_yaw_side.dot(chassis.linvel());
+        let sideslip_angle = side_speed.atan2(speed.abs().max(1.0));
+        let yaw_error = desired_yaw_rate - actual_yaw_rate;
+        let correction_error = yaw_error + sideslip_angle * ESC_SIDESLIP_YAW_GAIN;
+        let is_understeer = desired_yaw_rate.abs() > Real::EPSILON
+            && desired_yaw_rate * actual_yaw_rate >= 0.0
+            && yaw_error * desired_yaw_rate > 0.0
+            && correction_error * yaw_error > 0.0;
+        let control_error = if is_understeer {
+            yaw_error
+        } else {
+            correction_error
+        };
+        let yaw_factor = ((control_error.abs() - 0.14) / 0.75).clamp(0.0, 1.0);
         let steering_factor = (steering.abs() / 0.55).clamp(0.0, 1.0);
         let speed_factor = ((speed.abs() - 2.0) / 10.0).clamp(0.0, 1.0);
-        let strength = esc * yaw_factor * steering_factor * speed_factor;
+        let mode_factor = if is_understeer { steering_factor } else { 1.0 };
+        let strength = esc * yaw_factor * speed_factor * mode_factor;
 
         if strength == 0.0 {
-            return (0.0, 0.0, 0.0);
+            return EscIntervention::default();
         }
 
         let engine_cut = strength * 0.45;
         let brake_strength = strength * 0.45;
-        let brake_side = -yaw_error.signum();
+        let (brake_axle, brake_direction) = if is_understeer {
+            // Understeer: create yaw with the inside rear wheel.
+            (WheelAxle::Rear, desired_yaw_rate)
+        } else {
+            // Oversteer, counter-yaw, or a straight-line spin: stabilize with a front wheel.
+            (WheelAxle::Front, correction_error)
+        };
+        let side_axis = self.side_axis();
+        let side_orientation = local_positive_yaw_side[side_axis].signum();
+        let brake_side = brake_direction.signum() * speed.signum() * side_orientation;
 
-        (engine_cut, brake_strength, brake_side)
+        EscIntervention {
+            activity: strength,
+            engine_cut,
+            brake_strength,
+            brake_axle: Some(brake_axle),
+            brake_side,
+        }
     }
 
     /// Adds a surface to an existing tire type
@@ -1749,6 +1805,7 @@ impl DynamicRayCastVehicleController {
     fn update_friction(&mut self, bodies: &mut RigidBodySet, colliders: &ColliderSet, dt: Real) {
         let num_wheels = self.wheels.len();
         let steering_input = self.powertrain.input().steering;
+        self.powertrain.state_mut().esc_activity = 0.0;
         if num_wheels == 0 {
             return;
         }
@@ -1757,28 +1814,20 @@ impl DynamicRayCastVehicleController {
         self.axle.resize(num_wheels, Default::default());
         let mut contacts = vec![WheelContactState::default(); num_wheels];
 
-        let (
-            esc_engine_cut,
-            esc_brake_strength,
-            esc_brake_side,
-            esc_side_axis,
-            chassis_forward,
-            body_speed,
-        ) = {
+        let (esc_intervention, esc_side_axis, chassis_forward, body_speed) = {
             let chassis = &bodies[self.chassis];
-            let (engine_cut, brake_strength, brake_side) = self.esc_intervention(chassis);
+            let intervention = self.esc_intervention(chassis);
             let rotation = chassis.position().rotation;
             let chassis_forward = rotation * Vector::ith(self.index_forward_axis, 1.0);
             let chassis_up = rotation * Vector::ith(self.index_up_axis, 1.0);
             (
-                engine_cut,
-                brake_strength,
-                brake_side,
+                intervention,
                 self.side_axis(),
                 chassis_forward,
                 planar_speed(chassis.linvel(), &chassis_up),
             )
         };
+        self.powertrain.state_mut().esc_activity = esc_intervention.activity;
 
         for wheel in &mut self.wheels {
             wheel.brake_impulse = 0.0;
@@ -1927,7 +1976,7 @@ impl DynamicRayCastVehicleController {
                 && wheel.drivetrain_connected
                 && wheel.drive_throttle > 0.1
                 && wheel.engine_force * drive_direction > Real::EPSILON;
-            let raw_drive_impulse = wheel.engine_force * dt * (1.0 - esc_engine_cut);
+            let raw_drive_impulse = wheel.engine_force * dt * (1.0 - esc_intervention.engine_cut);
             let raw_drive_demand = (raw_drive_impulse * wheel.fwd_factor).abs();
             let capacity_excess = if powered_acceleration && raw_drive_demand > Real::EPSILON {
                 drive_capacity_excess(raw_drive_demand, remaining_forward_limit)
@@ -1983,7 +2032,7 @@ impl DynamicRayCastVehicleController {
                 0.0
             };
 
-            let esc_brake = if esc_brake_strength > 0.0 {
+            let esc_brake = if esc_intervention.brake_strength > 0.0 {
                 let side = wheel.chassis_connection_point_cs.coords[esc_side_axis];
                 let wheel_side = if side > 0.0 {
                     1.0
@@ -1993,11 +2042,11 @@ impl DynamicRayCastVehicleController {
                     0.0
                 };
 
-                if wheel.steering.abs() > Real::EPSILON
+                if esc_intervention.brake_axle == Some(wheel.role.axle)
                     && wheel_side != 0.0
-                    && wheel_side == esc_brake_side
+                    && wheel_side == esc_intervention.brake_side
                 {
-                    esc_brake_strength
+                    esc_intervention.brake_strength
                 } else {
                     0.0
                 }
@@ -2148,6 +2197,132 @@ impl DynamicRayCastVehicleController {
 mod tests {
     use super::*;
     use crate::dynamics::RigidBodyBuilder;
+
+    fn esc_test_controller() -> DynamicRayCastVehicleController {
+        let mut controller = DynamicRayCastVehicleController::new(
+            RigidBodyHandle::invalid(),
+            VehicleControllerConfig::default(),
+        );
+        controller.index_forward_axis = 2;
+        controller.index_up_axis = 1;
+        controller.current_vehicle_speed = 20.0;
+
+        for (position, axle) in [
+            (Point::new(0.8, 0.0, 1.25), WheelAxle::Front),
+            (Point::new(-0.8, 0.0, 1.25), WheelAxle::Front),
+            (Point::new(0.8, 0.0, -1.25), WheelAxle::Rear),
+            (Point::new(-0.8, 0.0, -1.25), WheelAxle::Rear),
+        ] {
+            controller.add_wheel(
+                position,
+                -Vector::y(),
+                -Vector::x(),
+                0.4,
+                0.35,
+                &WheelTuning::default(),
+                WheelRole::new(axle, true, axle == WheelAxle::Front),
+            );
+        }
+
+        controller
+    }
+
+    #[test]
+    fn esc_understeer_targets_inside_rear_wheel() {
+        let mut controller = esc_test_controller();
+        controller.wheels[0].steering = 0.2;
+        controller.wheels[1].steering = 0.2;
+        let chassis = RigidBodyBuilder::dynamic()
+            .linvel(Vector::z() * 20.0)
+            .build();
+
+        let intervention = controller.esc_intervention(&chassis);
+
+        assert!(intervention.brake_strength > 0.0);
+        assert!(intervention.activity > 0.0);
+        assert_eq!(intervention.brake_axle, Some(WheelAxle::Rear));
+        assert_eq!(intervention.brake_side, 1.0);
+    }
+
+    #[test]
+    fn esc_oversteer_targets_outside_front_wheel() {
+        let mut controller = esc_test_controller();
+        controller.wheels[0].steering = 0.2;
+        controller.wheels[1].steering = 0.2;
+        let chassis = RigidBodyBuilder::dynamic()
+            .linvel(Vector::z() * 20.0)
+            .angvel(Vector::y() * 3.0)
+            .build();
+
+        let intervention = controller.esc_intervention(&chassis);
+
+        assert!(intervention.brake_strength > 0.0);
+        assert_eq!(intervention.brake_axle, Some(WheelAxle::Front));
+        assert_eq!(intervention.brake_side, -1.0);
+    }
+
+    #[test]
+    fn esc_steering_reversal_stabilizes_with_front_wheel() {
+        let mut controller = esc_test_controller();
+        controller.wheels[0].steering = -0.2;
+        controller.wheels[1].steering = -0.2;
+        let chassis = RigidBodyBuilder::dynamic()
+            .linvel(Vector::z() * 20.0 + Vector::x() * 4.0)
+            .angvel(Vector::y())
+            .build();
+
+        let intervention = controller.esc_intervention(&chassis);
+
+        assert!(intervention.brake_strength > 0.0);
+        assert_eq!(intervention.brake_axle, Some(WheelAxle::Front));
+        assert_eq!(intervention.brake_side, -1.0);
+    }
+
+    #[test]
+    fn esc_sideslip_opposing_yaw_demand_uses_front_wheel() {
+        let mut controller = esc_test_controller();
+        controller.wheels[0].steering = 0.2;
+        controller.wheels[1].steering = 0.2;
+        let chassis = RigidBodyBuilder::dynamic()
+            .linvel(Vector::z() * 20.0 - Vector::x() * 10.0)
+            .angvel(Vector::y())
+            .build();
+
+        let intervention = controller.esc_intervention(&chassis);
+
+        assert!(intervention.brake_strength > 0.0);
+        assert_eq!(intervention.brake_axle, Some(WheelAxle::Front));
+        assert_eq!(intervention.brake_side, -1.0);
+    }
+
+    #[test]
+    fn esc_detects_sideslip_without_steering_or_yaw_rate() {
+        let controller = esc_test_controller();
+        let chassis = RigidBodyBuilder::dynamic()
+            .linvel(Vector::z() * 20.0 + Vector::x() * 4.0)
+            .build();
+
+        let intervention = controller.esc_intervention(&chassis);
+
+        assert!(intervention.brake_strength > 0.0);
+        assert_eq!(intervention.brake_axle, Some(WheelAxle::Front));
+        assert_eq!(intervention.brake_side, 1.0);
+    }
+
+    #[test]
+    fn esc_detects_spin_without_steering_or_sideslip() {
+        let controller = esc_test_controller();
+        let chassis = RigidBodyBuilder::dynamic()
+            .linvel(Vector::z() * 20.0)
+            .angvel(Vector::y())
+            .build();
+
+        let intervention = controller.esc_intervention(&chassis);
+
+        assert!(intervention.brake_strength > 0.0);
+        assert_eq!(intervention.brake_axle, Some(WheelAxle::Front));
+        assert_eq!(intervention.brake_side, -1.0);
+    }
 
     #[test]
     fn wheel_forward_matches_configured_chassis_forward_for_either_axle_direction() {

@@ -310,6 +310,8 @@ pub struct VehicleState {
     pub wheels_in_contact: usize,
     /// Fraction of wheels currently receiving ABS intervention.
     pub abs_activity: Real,
+    /// Normalized electronic stability-control intervention.
+    pub esc_activity: Real,
     /// Normalized traction-control intervention estimate.
     pub traction_control_activity: Real,
     /// Normalized steering force-feedback output.
@@ -1841,6 +1843,7 @@ mod tests {
             turbo_release_sequence: 7,
             wheels_in_contact: 4,
             abs_activity: 0.5,
+            esc_activity: 0.6,
             traction_control_activity: 0.4,
             force_feedback: 0.3,
             steering_friction: 0.2,
