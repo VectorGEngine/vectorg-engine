@@ -1548,7 +1548,7 @@ impl DynamicRayCastVehicleController {
         let chassis = bodies
             .get_mut_internal_with_modification_tracking(self.chassis)
             .unwrap();
-        let transform = chassis.position();
+        let transform = *chassis.position();
         let forward = transform.rotation * Vector::ith(self.index_forward_axis, 1.0);
         let up = transform.rotation * Vector::ith(self.index_up_axis, 1.0);
         let speed = self.current_vehicle_speed;
@@ -1561,10 +1561,22 @@ impl DynamicRayCastVehicleController {
             0.0
         };
         chassis.apply_impulse(-forward * (drag + rolling) * dt, false);
-        chassis.apply_impulse(
-            -up * dynamics.downforce_coefficient * speed_abs * speed_abs * dt,
-            false,
-        );
+        let downforce_scale = speed_abs * speed_abs * dt;
+        if dynamics.downforce_points.is_empty() {
+            chassis.apply_impulse(
+                -up * dynamics.downforce_coefficient * downforce_scale,
+                false,
+            );
+        } else {
+            for point in &dynamics.downforce_points {
+                let world_point = transform * Point::from(point.position);
+                chassis.apply_impulse_at_point(
+                    -up * point.coefficient * downforce_scale,
+                    world_point,
+                    false,
+                );
+            }
+        }
         chassis.set_linear_damping(
             dynamics.base_linear_damping + dynamics.linear_damping_per_speed * speed_abs,
         );

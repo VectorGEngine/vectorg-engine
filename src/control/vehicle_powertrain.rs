@@ -1,4 +1,4 @@
-use crate::math::Real;
+use crate::math::{Real, Vector};
 
 const TAU: Real = 6.283_185_307_179_586 as Real;
 const TRANSMISSION_PEDAL_ENGAGE: Real = 0.1;
@@ -154,6 +154,15 @@ impl Default for TurboConfig {
 
 /// Braking, stability, aerodynamics, and chassis-damping parameters.
 #[derive(Clone, Debug)]
+pub struct VehicleDownforcePoint {
+    /// Application point in chassis-local coordinates.
+    pub position: Vector<Real>,
+    /// Downforce in newtons per squared meter-per-second.
+    pub coefficient: Real,
+}
+
+/// Braking, stability, aerodynamics, and chassis-damping parameters.
+#[derive(Clone, Debug)]
 pub struct VehicleDynamicsConfig {
     /// Fraction of service braking assigned to the front axle.
     pub brake_bias: Real,
@@ -171,6 +180,8 @@ pub struct VehicleDynamicsConfig {
     pub rolling_resistance: Real,
     /// Downforce in newtons per squared meter-per-second.
     pub downforce_coefficient: Real,
+    /// Optional chassis-local application points. An empty list preserves center-of-mass downforce.
+    pub downforce_points: Vec<VehicleDownforcePoint>,
     /// Chassis linear damping at rest.
     pub base_linear_damping: Real,
     /// Additional linear damping per meter-per-second.
@@ -192,6 +203,7 @@ impl Default for VehicleDynamicsConfig {
             frontal_area: 2.0,
             rolling_resistance: 0.015,
             downforce_coefficient: 0.0,
+            downforce_points: Vec::new(),
             base_linear_damping: 0.02,
             linear_damping_per_speed: 0.002,
             base_angular_damping: 0.02,
