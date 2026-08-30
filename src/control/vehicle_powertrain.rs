@@ -172,6 +172,10 @@ pub struct VehicleDynamicsConfig {
     pub traction_control_strength: Real,
     /// Electronic stability-control strength.
     pub esc_strength: Real,
+    /// Linear front-axle anti-roll coupling stiffness.
+    pub front_anti_roll_bar_stiffness: Real,
+    /// Linear rear-axle anti-roll coupling stiffness.
+    pub rear_anti_roll_bar_stiffness: Real,
     /// Aerodynamic drag coefficient.
     pub drag_coefficient: Real,
     /// Vehicle frontal area in square meters.
@@ -199,6 +203,8 @@ impl Default for VehicleDynamicsConfig {
             abs_strength: 1.0,
             traction_control_strength: 0.8,
             esc_strength: 0.8,
+            front_anti_roll_bar_stiffness: 0.0,
+            rear_anti_roll_bar_stiffness: 0.0,
             drag_coefficient: 0.35,
             frontal_area: 2.0,
             rolling_resistance: 0.015,
@@ -1481,10 +1487,22 @@ fn sanitize_config(config: &mut VehicleControllerConfig) {
     config.dynamics.traction_control_strength =
         config.dynamics.traction_control_strength.clamp(0.0, 1.0);
     config.dynamics.esc_strength = config.dynamics.esc_strength.clamp(0.0, 1.0);
+    config.dynamics.front_anti_roll_bar_stiffness =
+        non_negative_finite(config.dynamics.front_anti_roll_bar_stiffness);
+    config.dynamics.rear_anti_roll_bar_stiffness =
+        non_negative_finite(config.dynamics.rear_anti_roll_bar_stiffness);
     config.steering.max_angle = config.steering.max_angle.abs();
     config.steering.road_wheel_curve = config.steering.road_wheel_curve.clamp(0.0, 1.0);
     config.steering.minimum_speed_factor = config.steering.minimum_speed_factor.clamp(0.0, 1.0);
     config.steering.drift_correction = config.steering.drift_correction.clamp(0.0, 1.0);
+}
+
+fn non_negative_finite(value: Real) -> Real {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 fn prepare_torque_curve(engine: &mut EngineConfig) -> Real {

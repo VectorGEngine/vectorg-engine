@@ -241,7 +241,7 @@ pub struct Wheel {
     drivetrain_connected: bool,
     drive_slip_demand: Real,
     traction_control_cut: Real,
-    /// The influence of the roll on the wheel’s suspension.
+    /// Fraction of the lateral impulse application height moved toward the chassis center of mass.
     pub anti_roll: Real,
     /// The maximum force applied by the suspension.
     pub max_suspension_force: Real,
@@ -343,7 +343,7 @@ impl Wheel {
             is_anti_lock_brake: false,
             traction_control: 0.0,
             engine_force_feedback: 0.0,
-            anti_roll: 0.8,
+            anti_roll: 0.0,
             clipped_inv_contact_dot_suspension: 0.0,
             suspension_relative_velocity: 0.0,
             contact_forward_speed: 0.0,
@@ -712,6 +712,22 @@ fn speed_adjusted_contact_damping(
     .max(base);
 
     base + (maximum - base) * speed_factor
+}
+
+fn anti_roll_bar_transfer(
+    left_compression: Real,
+    right_compression: Real,
+    stiffness: Real,
+    chassis_mass: Real,
+    left_force: Real,
+    right_force: Real,
+    left_max_force: Real,
+    right_max_force: Real,
+) -> Real {
+    let maximum_leftward_transfer = left_force.min((right_max_force - right_force).max(0.0));
+    let maximum_rightward_transfer = right_force.min((left_max_force - left_force).max(0.0));
+    ((left_compression - right_compression) * stiffness * chassis_mass)
+        .clamp(-maximum_leftward_transfer, maximum_rightward_transfer)
 }
 
 fn tire_slip(wheel_surface_speed: Real, forward_speed: Real, side_speed: Real) -> (Real, Real) {
@@ -1712,6 +1728,7 @@ impl DynamicRayCastVehicleController {
 
         let chassis_mass = chassis.mass();
         self.update_suspension(chassis_mass);
+        self.apply_anti_roll_bars(chassis_mass);
 
         let chassis = bodies
             .get_mut_internal_with_modification_tracking(self.chassis)
@@ -1812,6 +1829,87 @@ impl DynamicRayCastVehicleController {
             } else {
                 wheels.wheel_suspension_force = 0.0;
             }
+        }
+    }
+
+    fn apply_anti_roll_bars(&mut self, chassis_mass: Real) {
+        let side_axis = self.side_axis();
+
+        for axle in [WheelAxle::Front, WheelAxle::Rear] {
+            let stiffness = match axle {
+                WheelAxle::Front => {
+                    self.powertrain
+                        .config
+                        .dynamics
+                        .front_anti_roll_bar_stiffness
+                }
+                WheelAxle::Rear => self.powertrain.config.dynamics.rear_anti_roll_bar_stiffness,
+            };
+            if stiffness <= 0.0 || chassis_mass <= 0.0 {
+                continue;
+            }
+
+            let mut first = None;
+            let mut second = None;
+            let mut has_extra_wheel = false;
+            for (wheel_id, wheel) in self
+                .wheels
+                .iter()
+                .enumerate()
+                .filter(|(_, wheel)| wheel.role.axle == axle)
+            {
+                let entry = (
+                    wheel_id,
+                    wheel.chassis_connection_point_cs.coords[side_axis],
+                );
+                if first.is_none() {
+                    first = Some(entry);
+                } else if second.is_none() {
+                    second = Some(entry);
+                } else {
+                    has_extra_wheel = true;
+                    break;
+                }
+            }
+            let (Some(first), Some(second)) = (first, second) else {
+                continue;
+            };
+            if has_extra_wheel {
+                continue;
+            }
+
+            let ((left_id, left_side), (right_id, right_side)) = if first.1 <= second.1 {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            if right_side - left_side <= Real::EPSILON {
+                continue;
+            }
+
+            let left = &self.wheels[left_id];
+            let right = &self.wheels[right_id];
+            if !left.raycast_info.is_in_contact || !right.raycast_info.is_in_contact {
+                continue;
+            }
+
+            let left_compression =
+                left.suspension_rest_length - left.raycast_info.suspension_length;
+            let right_compression =
+                right.suspension_rest_length - right.raycast_info.suspension_length;
+            let transfer = anti_roll_bar_transfer(
+                left_compression,
+                right_compression,
+                stiffness,
+                chassis_mass,
+                left.wheel_suspension_force,
+                right.wheel_suspension_force,
+                left.max_suspension_force,
+                right.max_suspension_force,
+            );
+
+            self.wheels[left_id].wheel_suspension_force += transfer;
+            self.wheels[right_id].wheel_suspension_force -= transfer;
         }
     }
 
@@ -2475,6 +2573,67 @@ mod tests {
 
         assert!((speed - physical_angular_velocity * radius).abs() < 1.0e-6);
         assert_eq!(radius, 0.35);
+    }
+
+    #[test]
+    fn anti_roll_bar_transfers_load_without_changing_axle_total() {
+        let mut controller = esc_test_controller();
+        controller
+            .powertrain
+            .config
+            .dynamics
+            .front_anti_roll_bar_stiffness = 20.0;
+        for wheel in &mut controller.wheels {
+            wheel.raycast_info.is_in_contact = true;
+            wheel.raycast_info.suspension_length = wheel.suspension_rest_length;
+            wheel.wheel_suspension_force = 1_000.0;
+        }
+        controller.wheels[1].raycast_info.suspension_length = 0.35;
+
+        controller.apply_anti_roll_bars(1_000.0);
+
+        assert_eq!(controller.wheels[0].wheel_suspension_force, 0.0);
+        assert_eq!(controller.wheels[1].wheel_suspension_force, 2_000.0);
+        assert_eq!(controller.wheels[2].wheel_suspension_force, 1_000.0);
+        assert_eq!(controller.wheels[3].wheel_suspension_force, 1_000.0);
+    }
+
+    #[test]
+    fn anti_roll_bar_respects_each_wheel_suspension_force_limit() {
+        assert_eq!(
+            anti_roll_bar_transfer(0.2, 0.0, 40.0, 1_000.0, 950.0, 500.0, 1_000.0, 1_000.0),
+            50.0,
+        );
+        assert_eq!(
+            anti_roll_bar_transfer(0.0, 0.2, 40.0, 1_000.0, 500.0, 950.0, 1_000.0, 1_000.0),
+            -50.0,
+        );
+    }
+
+    #[test]
+    fn anti_roll_bar_does_not_act_without_two_grounded_axle_wheels() {
+        let mut controller = esc_test_controller();
+        controller
+            .powertrain
+            .config
+            .dynamics
+            .front_anti_roll_bar_stiffness = 20.0;
+        for wheel in &mut controller.wheels {
+            wheel.raycast_info.suspension_length = wheel.suspension_rest_length;
+            wheel.wheel_suspension_force = 1_000.0;
+        }
+        controller.wheels[0].raycast_info.is_in_contact = true;
+        controller.wheels[0].raycast_info.suspension_length = 0.35;
+
+        controller.apply_anti_roll_bars(1_000.0);
+
+        assert_eq!(controller.wheels[0].wheel_suspension_force, 1_000.0);
+        assert_eq!(controller.wheels[1].wheel_suspension_force, 1_000.0);
+    }
+
+    #[test]
+    fn legacy_wheel_anti_roll_defaults_to_disabled() {
+        assert_eq!(powered_test_wheel().anti_roll, 0.0);
     }
 
     fn powered_test_wheel() -> Wheel {
