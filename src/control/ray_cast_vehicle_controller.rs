@@ -28,6 +28,7 @@ const POWERED_SLIP_ENGAGE_RESPONSE: Real = 14.0;
 const POWERED_SLIP_RELEASE_RESPONSE: Real = 3.0;
 const POWERED_SLIP_EFFECTIVE_INERTIA: Real = 12.0;
 const POWERED_SLIP_ROTATIONAL_DAMPING: Real = 0.35;
+const WHEEL_ROTATION_RETENTION: Real = 0.99;
 const VISUAL_WHEEL_REGRIP_RESPONSE: Real = 24.0;
 const VISUAL_WHEEL_BRAKE_RESPONSE: Real = 30.0;
 const VISUAL_WHEEL_SYNC_TOLERANCE: Real = 0.05;
@@ -52,8 +53,8 @@ const DYNAMIC_FRICTION_RATIO: Real = 0.85;
 // Equivalent to the legacy static clamp producing skid_info below approximately 0.3.
 const DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED: Real = 11.111_111;
 const CONTACT_DAMPING_SPEED_START: Real = 16.666_667; // 60 km/h.
-const CONTACT_DAMPING_FRONT_MAX: Real = 0.65;
-const CONTACT_DAMPING_REAR_MAX: Real = 0.8;
+const CONTACT_DAMPING_FRONT_MAX: Real = 0.3;
+const CONTACT_DAMPING_REAR_MAX: Real = 0.4;
 const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
 const TAU: Real = 6.283_185_307_179_586 as Real;
 
@@ -668,7 +669,7 @@ fn update_wheel_rotation(wheel: &mut Wheel, rolling_angular_velocity: Real, dt: 
     }
 
     wheel.rotation += wheel.visual_angular_velocity * dt;
-    wheel.delta_rotation = physical_angular_velocity * dt * 0.99;
+    wheel.delta_rotation = physical_angular_velocity * dt * WHEEL_ROTATION_RETENTION;
 }
 
 fn smoothstep(edge0: Real, edge1: Real, value: Real) -> Real {
@@ -1300,7 +1301,8 @@ impl DynamicRayCastVehicleController {
 
         for wheel in &self.wheels {
             if wheel.role.driven {
-                let speed = wheel.delta_rotation * wheel.radius / dt;
+                let speed = wheel.delta_rotation * wheel.radius
+                    / (dt * WHEEL_ROTATION_RETENTION.max(Real::EPSILON));
                 if speed.abs() > driven_speed.abs() {
                     driven_speed = speed;
                 }
@@ -2341,6 +2343,8 @@ mod tests {
         let base = 0.15;
         let maximum_speed = 60.0;
         let midpoint_speed = (CONTACT_DAMPING_SPEED_START + maximum_speed) * 0.5;
+        let expected_front_midpoint = base + (CONTACT_DAMPING_FRONT_MAX - base) * 0.5;
+        let expected_rear_midpoint = base + (CONTACT_DAMPING_REAR_MAX - base) * 0.5;
 
         assert_eq!(
             speed_adjusted_contact_damping(
@@ -2353,13 +2357,13 @@ mod tests {
         );
         assert!(
             (speed_adjusted_contact_damping(base, WheelAxle::Front, midpoint_speed, maximum_speed,)
-                - 0.4)
+                - expected_front_midpoint)
                 .abs()
                 < 1.0e-6
         );
         assert!(
             (speed_adjusted_contact_damping(base, WheelAxle::Rear, midpoint_speed, maximum_speed,)
-                - 0.475)
+                - expected_rear_midpoint)
                 .abs()
                 < 1.0e-6
         );
@@ -2450,11 +2454,14 @@ mod tests {
             &WheelTuning::default(),
             WheelRole::new(WheelAxle::Rear, true, false),
         );
-        controller.wheels[0].delta_rotation = -0.5;
+        let dt = 0.1;
+        let physical_angular_velocity = -5.0;
+        controller.wheels[0].delta_rotation =
+            physical_angular_velocity * dt * WHEEL_ROTATION_RETENTION;
 
-        let (speed, radius) = controller.driven_wheel_speed_and_radius(0.1);
+        let (speed, radius) = controller.driven_wheel_speed_and_radius(dt);
 
-        assert!(speed < 0.0);
+        assert!((speed - physical_angular_velocity * radius).abs() < 1.0e-6);
         assert_eq!(radius, 0.35);
     }
 

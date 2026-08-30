@@ -730,12 +730,15 @@ impl VehiclePowertrain {
             self.state.engine_rpm = 0.0;
         }
 
-        let at_limit = self.state.engine_rpm >= limit - 0.5;
+        let limiter_rpm = self.state.engine_rpm.max(signed_drivetrain_rpm.max(0.0));
         self.state.rev_limiter_amount = if self.state.engine_running {
-            ((self.state.engine_rpm - limit * 0.97) / (limit * 0.03).max(1.0)).clamp(0.0, 1.0)
+            ((limiter_rpm - limit * 0.97) / (limit * 0.03).max(1.0)).clamp(0.0, 1.0)
         } else {
             0.0
         };
+        let limiter_blend = self.state.rev_limiter_amount;
+        let limiter_torque_factor =
+            1.0 - limiter_blend * limiter_blend * (3.0 - 2.0 * limiter_blend);
 
         let available_torque = self.torque_at(self.state.engine_rpm);
         let rpm_rate =
@@ -745,15 +748,15 @@ impl VehiclePowertrain {
             * self.config.transmission.final_drive_ratio
             * self.config.engine.drivetrain_efficiency;
         let wheel_torque_scale = mechanical_wheel_torque_scale * self.config.engine.force_scale;
-        let wheel_coupling_torque = if clutch_torque < 0.0
-            || (self.state.engine_running && !at_limit && clutch_torque > 0.0)
-        {
+        let wheel_coupling_torque = if clutch_torque < 0.0 {
             clutch_torque * mechanical_wheel_torque_scale * ratio.signum()
+        } else if self.state.engine_running && clutch_torque > 0.0 {
+            clutch_torque * limiter_torque_factor * mechanical_wheel_torque_scale * ratio.signum()
         } else {
             0.0
         };
-        let drive_torque = if self.state.engine_running && !at_limit && clutch_torque > 0.0 {
-            clutch_torque * wheel_torque_scale * ratio.signum()
+        let drive_torque = if self.state.engine_running && clutch_torque > 0.0 {
+            clutch_torque * limiter_torque_factor * wheel_torque_scale * ratio.signum()
         } else {
             0.0
         };
@@ -1601,6 +1604,73 @@ mod tests {
                 powertrain.state.engine_rpm
             );
         }
+    }
+
+    #[test]
+    fn rev_limiter_smoothly_reduces_positive_torque_and_reaches_zero() {
+        fn output_at_rpm(rpm_fraction: Real) -> (PowertrainOutput, Real) {
+            let mut config = VehicleControllerConfig::default();
+            config.transmission.automatic = false;
+            config.transmission.auto_clutch = false;
+            config.transmission.shift_cooldown = 0.0;
+            let mut powertrain = VehiclePowertrain::new(config);
+            powertrain.state.current_gear = 1;
+            powertrain.shift_target = 1;
+            let limit = powertrain
+                .config
+                .engine
+                .rev_limit_rpm
+                .min(powertrain.config.engine.max_rpm);
+            let rpm = limit * rpm_fraction;
+            powertrain.state.engine_rpm = rpm;
+            powertrain.set_input(VehicleInput {
+                throttle: 1.0,
+                ..VehicleInput::default()
+            });
+            let wheel_radius = 0.35;
+            let wheel_speed = wheel_speed_for_crank_rpm(&powertrain, rpm, wheel_radius);
+
+            let output = powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
+            (output, powertrain.state.rev_limiter_amount)
+        }
+
+        let (below_taper, below_amount) = output_at_rpm(0.96);
+        let (inside_taper, inside_amount) = output_at_rpm(0.985);
+        let (at_limit, limit_amount) = output_at_rpm(1.0);
+
+        assert_eq!(below_amount, 0.0);
+        assert!(inside_amount > 0.0 && inside_amount < 1.0);
+        assert_eq!(limit_amount, 1.0);
+        assert!(below_taper.drive_torque > inside_taper.drive_torque);
+        assert!(inside_taper.drive_torque > 0.0);
+        assert_eq!(at_limit.drive_torque, 0.0);
+        assert_eq!(at_limit.wheel_coupling_torque, 0.0);
+    }
+
+    #[test]
+    fn driven_wheel_rpm_can_activate_the_rev_limiter_without_engine_rpm_lag() {
+        let mut config = VehicleControllerConfig::default();
+        config.transmission.automatic = false;
+        config.transmission.auto_clutch = false;
+        let mut powertrain = VehiclePowertrain::new(config);
+        powertrain.state.current_gear = 1;
+        powertrain.shift_target = 1;
+        let limit = powertrain
+            .config
+            .engine
+            .rev_limit_rpm
+            .min(powertrain.config.engine.max_rpm);
+        powertrain.state.engine_rpm = limit * 0.98;
+        powertrain.set_input(VehicleInput {
+            throttle: 1.0,
+            ..VehicleInput::default()
+        });
+        let wheel_radius = 0.35;
+        let wheel_speed = wheel_speed_for_crank_rpm(&powertrain, limit, wheel_radius);
+
+        powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
+
+        assert!((powertrain.state.rev_limiter_amount - 1.0).abs() < 1.0e-12);
     }
 
     #[test]
