@@ -52,11 +52,7 @@ const LONGITUDINAL_SLIP_FORWARD_GRIP_MIN: Real = 0.75;
 const DYNAMIC_FRICTION_RATIO: Real = 0.85;
 // Equivalent to the legacy static clamp producing skid_info below approximately 0.3.
 const DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED: Real = 11.111_111;
-const CONTACT_DAMPING_SPEED_START: Real = 16.666_667; // 60 km/h.
-const CONTACT_DAMPING_FRONT_MAX: Real = 0.3;
-const CONTACT_DAMPING_REAR_MAX: Real = 0.4;
 const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
-const TAU: Real = 6.283_185_307_179_586 as Real;
 
 fn drift_assist_speed_activation(forward_speed: Real) -> Real {
     let normalized = ((forward_speed - DRIFT_ASSIST_MIN_SPEED)
@@ -277,8 +273,6 @@ pub struct Wheel {
     pub brake_factor: Real,
     /// The damping applied to the contact point of the wheel.
     pub contact_damping: Real,
-    /// The configured contact damping before runtime slip adjustment.
-    pub base_contact_damping: Real,
     lock: bool,
 
     clipped_inv_contact_dot_suspension: Real,
@@ -364,8 +358,7 @@ impl Wheel {
             side_factor: 1.0,
             fwd_factor: 1.0,
             brake_factor: 1.0,
-            contact_damping: 0.2, // This is a default value, can be adjusted later
-            base_contact_damping: 0.2,
+            contact_damping: 0.2,
             role: info.role,
         }
     }
@@ -408,7 +401,6 @@ impl Wheel {
         self.ground_friction = 1.0;
         self.ground_type.clear();
         self.suspension_compression_rate = 0.0;
-        self.contact_damping = self.base_contact_damping;
     }
 
     fn clear_powered_spin_state(&mut self) {
@@ -675,43 +667,6 @@ fn update_wheel_rotation(wheel: &mut Wheel, rolling_angular_velocity: Real, dt: 
 fn smoothstep(edge0: Real, edge1: Real, value: Real) -> Real {
     let rate = ((value - edge0) / (edge1 - edge0).max(Real::EPSILON)).clamp(0.0, 1.0);
     rate * rate * (3.0 - 2.0 * rate)
-}
-
-fn theoretical_max_speed(config: &VehicleControllerConfig, wheel_radius: Real) -> Real {
-    let highest_gear_ratio = config
-        .transmission
-        .forward_ratios
-        .last()
-        .copied()
-        .unwrap_or(1.0)
-        .abs()
-        .max(0.01);
-
-    config.engine.max_rpm
-        / (highest_gear_ratio * config.transmission.final_drive_ratio.max(0.01))
-        / 60.0
-        * TAU
-        * wheel_radius.max(0.01)
-}
-
-fn speed_adjusted_contact_damping(
-    base: Real,
-    axle: WheelAxle,
-    body_speed: Real,
-    maximum_speed: Real,
-) -> Real {
-    let speed_factor = smoothstep(
-        CONTACT_DAMPING_SPEED_START,
-        maximum_speed.max(CONTACT_DAMPING_SPEED_START + Real::EPSILON),
-        body_speed.abs(),
-    );
-    let maximum = match axle {
-        WheelAxle::Front => CONTACT_DAMPING_FRONT_MAX,
-        WheelAxle::Rear => CONTACT_DAMPING_REAR_MAX,
-    }
-    .max(base);
-
-    base + (maximum - base) * speed_factor
 }
 
 fn anti_roll_bar_transfer(
@@ -1952,7 +1907,6 @@ impl DynamicRayCastVehicleController {
             wheel.skid_info = 0.0;
             wheel.engine_force_feedback = 0.0;
             wheel.drive_slip_demand = 0.0;
-            wheel.contact_damping = wheel.base_contact_damping;
             wheel.contact_forward_speed = 0.0;
             wheel.contact_side_speed = 0.0;
         }
@@ -2016,13 +1970,6 @@ impl DynamicRayCastVehicleController {
 
             let drive_direction = wheel.target_rotation.signum();
             let wheel_surface_speed = wheel.delta_rotation / dt.max(Real::EPSILON) * wheel.radius;
-            let maximum_speed = theoretical_max_speed(&self.powertrain.config, wheel.radius);
-            wheel.contact_damping = speed_adjusted_contact_damping(
-                wheel.base_contact_damping,
-                wheel.role.axle,
-                body_speed,
-                maximum_speed,
-            );
             let (lateral_grip_scale, forward_grip_scale) = if wheel.role.driven {
                 let longitudinal_slip = driven_wheel_longitudinal_slip(
                     wheel_surface_speed,
@@ -2449,62 +2396,38 @@ mod tests {
     }
 
     #[test]
-    fn contact_damping_increases_smoothly_with_speed_and_axle_target() {
-        let base = 0.15;
-        let maximum_speed = 60.0;
-        let midpoint_speed = (CONTACT_DAMPING_SPEED_START + maximum_speed) * 0.5;
-        let expected_front_midpoint = base + (CONTACT_DAMPING_FRONT_MAX - base) * 0.5;
-        let expected_rear_midpoint = base + (CONTACT_DAMPING_REAR_MAX - base) * 0.5;
+    fn contact_damping_remains_configured_at_high_speed() {
+        let mut bodies = RigidBodySet::new();
+        let chassis = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .linvel(Vector::z() * 100.0)
+                .build(),
+        );
+        let mut colliders = ColliderSet::new();
+        let ground = colliders.insert(crate::geometry::ColliderBuilder::ball(1.0));
+        let mut controller =
+            DynamicRayCastVehicleController::new(chassis, VehicleControllerConfig::default());
+        controller.index_forward_axis = 2;
+        controller.index_up_axis = 1;
+        let wheel = controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            0.4,
+            0.35,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Rear, true, false),
+        );
+        wheel.contact_damping = 0.15;
+        wheel.raycast_info.is_in_contact = true;
+        wheel.raycast_info.ground_object = Some(ground);
+        wheel.raycast_info.contact_normal_ws = Vector::y();
+        wheel.raycast_info.contact_point_ws = Point::origin();
+        wheel.wheel_suspension_force = 1_000.0;
 
-        assert_eq!(
-            speed_adjusted_contact_damping(
-                base,
-                WheelAxle::Rear,
-                CONTACT_DAMPING_SPEED_START,
-                maximum_speed,
-            ),
-            base
-        );
-        assert!(
-            (speed_adjusted_contact_damping(base, WheelAxle::Front, midpoint_speed, maximum_speed,)
-                - expected_front_midpoint)
-                .abs()
-                < 1.0e-6
-        );
-        assert!(
-            (speed_adjusted_contact_damping(base, WheelAxle::Rear, midpoint_speed, maximum_speed,)
-                - expected_rear_midpoint)
-                .abs()
-                < 1.0e-6
-        );
-        assert!(
-            (speed_adjusted_contact_damping(base, WheelAxle::Front, maximum_speed, maximum_speed,)
-                - CONTACT_DAMPING_FRONT_MAX)
-                .abs()
-                < 1.0e-6
-        );
-        assert!(
-            (speed_adjusted_contact_damping(base, WheelAxle::Rear, maximum_speed, maximum_speed,)
-                - CONTACT_DAMPING_REAR_MAX)
-                .abs()
-                < 1.0e-6
-        );
-    }
+        controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
 
-    #[test]
-    fn contact_damping_maximum_speed_matches_highest_gear_redline() {
-        let config = VehicleControllerConfig::default();
-        let maximum_speed = theoretical_max_speed(&config, 0.35);
-
-        assert!(maximum_speed > 75.0 && maximum_speed < 76.0);
-    }
-
-    #[test]
-    fn contact_damping_speed_adjustment_never_reduces_a_higher_base() {
-        assert_eq!(
-            speed_adjusted_contact_damping(0.9, WheelAxle::Rear, 100.0, 60.0),
-            0.9
-        );
+        assert_eq!(controller.wheels[0].contact_damping, 0.15);
     }
 
     #[test]
@@ -3067,7 +2990,6 @@ mod tests {
         );
         let wheel = &mut controller.wheels[0];
         wheel.contact_damping = 0.15;
-        wheel.base_contact_damping = 0.15;
         wheel.delta_rotation = 2.0;
 
         controller.apply_powertrain_output(super::super::vehicle_powertrain::PowertrainOutput {

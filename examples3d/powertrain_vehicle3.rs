@@ -115,7 +115,6 @@ pub fn init_world(testbed: &mut Testbed) {
         wheel.anti_roll = 0.400_000_005_960_464_5;
         wheel.fwd_factor = 1.600_000_023_841_858;
         wheel.contact_damping = 0.150_000_005_960_464_48;
-        wheel.base_contact_damping = wheel.contact_damping;
     }
 
     testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
