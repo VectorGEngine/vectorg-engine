@@ -548,7 +548,6 @@ fn update_powered_wheel_rotation(
         && wheel.drivetrain_connected
         && wheel.drive_throttle > 0.1
         && direction != 0.0;
-    let opposing_motion = rolling_angular_velocity * wheel.target_rotation < 0.0;
     let resisted = powered
         && wheel.raycast_info.is_in_contact
         && rolling_surface_speed.abs() < POWERED_SLIP_RESISTANCE_MAX_ROAD_SPEED
@@ -565,7 +564,7 @@ fn update_powered_wheel_rotation(
 
     let resistance_confirmed =
         resisted && wheel.powered_slip_timer >= POWERED_SLIP_RESISTANCE_DELAY;
-    let unrestricted_slip = opposing_motion || airborne || resistance_confirmed;
+    let unrestricted_slip = airborne || resistance_confirmed;
     let requested_slip = if unrestricted_slip {
         1.0
     } else {
@@ -831,10 +830,6 @@ fn traction_control_target(
     }
 
     let directed_body_speed = body_forward_speed * drive_direction;
-    if directed_body_speed < -TRACTION_CONTROL_MIN_BODY_SPEED {
-        return 0.0;
-    }
-
     let directed_wheel_speed = wheel_surface_speed * drive_direction;
     let powered_overspeed = (directed_wheel_speed - directed_body_speed).max(0.0);
     let low_speed = directed_body_speed <= TRACTION_CONTROL_MIN_BODY_SPEED;
@@ -2044,9 +2039,7 @@ impl DynamicRayCastVehicleController {
             };
             let resistance_confirmed = wheel.powered_slip_timer >= POWERED_SLIP_RESISTANCE_DELAY
                 && contact.forward_speed.abs() < POWERED_SLIP_RESISTANCE_MAX_ROAD_SPEED;
-            let opposing_motion =
-                contact.forward_speed * drive_direction < -TRACTION_CONTROL_MIN_BODY_SPEED;
-            let traction_control_bypass = resistance_confirmed || opposing_motion;
+            let traction_control_bypass = resistance_confirmed;
             let effective_strength = effective_traction_control_strength(
                 wheel.traction_control,
                 body_speed,
@@ -2650,6 +2643,19 @@ mod tests {
     }
 
     #[test]
+    fn opposing_road_motion_does_not_request_powered_spin() {
+        let mut wheel = powered_test_wheel();
+        wheel.drive_slip_demand = 0.0;
+        let rolling_angular_velocity = -5.0;
+
+        let rotation =
+            update_powered_wheel_rotation(&mut wheel, rolling_angular_velocity, 1.0 / 60.0);
+
+        assert_eq!(wheel.powered_slip, 0.0);
+        assert_eq!(rotation, rolling_angular_velocity);
+    }
+
+    #[test]
     fn traction_control_cut_does_not_double_suppress_powered_spin() {
         let mut wheel = powered_test_wheel();
         wheel.drive_slip_demand = 1.0;
@@ -2932,12 +2938,12 @@ mod tests {
     }
 
     #[test]
-    fn traction_control_does_not_block_confirmed_resistance_or_opposing_burnout() {
+    fn traction_control_bypasses_confirmed_resistance_but_not_opposing_motion() {
         let resisted = traction_control_target(0.8, 20.0, 0.0, 1.0, 1.0, true);
-        let opposing = traction_control_target(0.8, 20.0, -5.0, 1.0, 1.0, true);
+        let opposing = traction_control_target(0.8, 20.0, -5.0, 1.0, 1.0, false);
 
         assert_eq!(resisted, 0.0);
-        assert_eq!(opposing, 0.0);
+        assert_eq!(opposing, 0.8);
     }
 
     #[test]
