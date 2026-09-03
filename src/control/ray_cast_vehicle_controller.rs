@@ -45,10 +45,6 @@ const TRACTION_CONTROL_STEERING_OVERRIDE_START: Real = 0.2;
 const TRACTION_CONTROL_STEERING_OVERRIDE_FULL: Real = 0.8;
 const TRACTION_CONTROL_ENGAGE_RESPONSE: Real = 18.0;
 const TRACTION_CONTROL_RELEASE_RESPONSE: Real = 8.0;
-const LONGITUDINAL_SLIP_REFERENCE_SPEED: Real = 10.0;
-const LONGITUDINAL_SLIP_START: Real = 0.15;
-const LONGITUDINAL_SLIP_FULL: Real = 0.30;
-const LONGITUDINAL_SLIP_FORWARD_GRIP_MIN: Real = 0.75;
 const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
 
 fn drift_assist_speed_activation(forward_speed: Real) -> Real {
@@ -765,39 +761,6 @@ fn contact_rolling_angular_velocity(
     wheel_radius: Real,
 ) -> Real {
     wheel_forward.dot(contact_velocity) / wheel_radius.max(Real::EPSILON)
-}
-
-fn driven_wheel_longitudinal_slip(
-    wheel_surface_speed: Real,
-    ground_speed: Real,
-    drive_direction: Real,
-) -> Real {
-    if drive_direction == 0.0 {
-        return 0.0;
-    }
-
-    let directed_wheel_speed = wheel_surface_speed * drive_direction;
-    let directed_ground_speed = ground_speed * drive_direction;
-    let speed_gap = directed_wheel_speed - directed_ground_speed;
-
-    if speed_gap <= 0.0 {
-        return 0.0;
-    }
-
-    let reference_speed = directed_ground_speed
-        .abs()
-        .max(LONGITUDINAL_SLIP_REFERENCE_SPEED);
-    smoothstep(
-        LONGITUDINAL_SLIP_START,
-        LONGITUDINAL_SLIP_FULL,
-        speed_gap / reference_speed,
-    )
-}
-
-fn longitudinal_slip_grip_scales(longitudinal_slip: Real) -> (Real, Real) {
-    let activation = longitudinal_slip.clamp(0.0, 1.0);
-    let loss = activation * activation;
-    (1.0, 1.0 + (LONGITUDINAL_SLIP_FORWARD_GRIP_MIN - 1.0) * loss)
 }
 
 fn traction_control_target(
@@ -1949,16 +1912,6 @@ impl DynamicRayCastVehicleController {
 
             let drive_direction = wheel.target_rotation.signum();
             let wheel_surface_speed = wheel.delta_rotation / dt.max(Real::EPSILON) * wheel.radius;
-            let (lateral_grip_scale, forward_grip_scale) = if wheel.role.driven {
-                let longitudinal_slip = driven_wheel_longitudinal_slip(
-                    wheel_surface_speed,
-                    contact.forward_speed,
-                    drive_direction,
-                );
-                longitudinal_slip_grip_scales(longitudinal_slip)
-            } else {
-                (1.0, 1.0)
-            };
 
             let rolling_friction = resolve_ground_impulse(
                 bodies,
@@ -1997,9 +1950,9 @@ impl DynamicRayCastVehicleController {
             //     }
             // }
 
-            wheel.side_impulse *= wheel.side_friction_stiffness * lateral_grip_scale;
+            wheel.side_impulse *= wheel.side_friction_stiffness;
             let side_total = wheel.side_impulse * wheel.side_factor;
-            let forward_friction_limit = contact.friction_limit * forward_grip_scale;
+            let forward_friction_limit = contact.friction_limit;
             let side_utilization_squared = if contact.friction_limit > Real::EPSILON {
                 (side_total / contact.friction_limit).powi(2)
             } else if side_total.abs() > Real::EPSILON {
@@ -2775,72 +2728,6 @@ mod tests {
 
         assert!((wheel_surface_speed - expected_contact_speed).abs() < 1.0e-5);
         assert!(wheel_surface_speed < contact_velocity[0]);
-    }
-
-    #[test]
-    fn longitudinal_slip_uses_wheel_speed_relative_to_the_contact() {
-        assert_eq!(driven_wheel_longitudinal_slip(10.0, 10.0, 1.0), 0.0);
-        assert_eq!(driven_wheel_longitudinal_slip(11.5, 10.0, 1.0), 0.0);
-
-        let partial_slip = driven_wheel_longitudinal_slip(12.0, 10.0, 1.0);
-        assert!(partial_slip > 0.0 && partial_slip < 1.0);
-        assert_eq!(driven_wheel_longitudinal_slip(13.0, 10.0, 1.0), 1.0);
-    }
-
-    #[test]
-    fn longitudinal_slip_supports_reverse_and_low_speed_wheelspin() {
-        assert_eq!(driven_wheel_longitudinal_slip(-13.0, -10.0, -1.0), 1.0);
-        assert_eq!(driven_wheel_longitudinal_slip(3.0, 0.0, 1.0), 1.0);
-        assert_eq!(driven_wheel_longitudinal_slip(5.0, 10.0, 1.0), 0.0);
-        assert_eq!(driven_wheel_longitudinal_slip(10.0, 0.0, 0.0), 0.0);
-    }
-
-    #[test]
-    fn longitudinal_slip_scales_with_ground_relative_overspeed() {
-        let first_gear_limit = 21.8;
-        assert_eq!(driven_wheel_longitudinal_slip(0.5, 0.0, 1.0), 0.0);
-        assert_eq!(driven_wheel_longitudinal_slip(3.0, 0.0, 1.0), 1.0);
-        assert_eq!(driven_wheel_longitudinal_slip(15.75, 15.0, 1.0), 0.0);
-        assert_eq!(driven_wheel_longitudinal_slip(19.5, 15.0, 1.0), 1.0);
-        assert_eq!(
-            driven_wheel_longitudinal_slip(first_gear_limit, 15.0, 1.0),
-            1.0
-        );
-
-        let near_first_gear_limit = driven_wheel_longitudinal_slip(first_gear_limit, 18.0, 1.0);
-        assert!(near_first_gear_limit > 0.0 && near_first_gear_limit < 1.0);
-    }
-
-    #[test]
-    fn longitudinal_slip_activation_reduces_only_forward_grip_quadratically() {
-        let (full_lateral, full_forward) = longitudinal_slip_grip_scales(1.0);
-        assert_eq!(full_lateral, 1.0);
-        assert!((full_forward - LONGITUDINAL_SLIP_FORWARD_GRIP_MIN).abs() < 1.0e-6);
-
-        let (low_slip_lateral, low_slip_forward) = longitudinal_slip_grip_scales(0.25);
-        assert_eq!(low_slip_lateral, 1.0);
-        assert!((low_slip_forward - 0.984_375).abs() < 1.0e-6);
-
-        let (partial_lateral, partial_forward) = longitudinal_slip_grip_scales(0.5);
-        assert_eq!(partial_lateral, 1.0);
-        assert!((partial_forward - 0.9375).abs() < 1.0e-6);
-
-        assert_eq!(longitudinal_slip_grip_scales(0.0), (1.0, 1.0));
-    }
-
-    #[test]
-    fn wheel_based_grip_loss_requires_only_relative_overspeed() {
-        let grip_scales = |wheel_surface_speed: Real, ground_speed: Real| {
-            let slip = driven_wheel_longitudinal_slip(wheel_surface_speed, ground_speed, 1.0);
-            longitudinal_slip_grip_scales(slip)
-        };
-
-        assert_eq!(grip_scales(21.0, 20.0), (1.0, 1.0));
-        assert_eq!(grip_scales(21.0, 21.0), (1.0, 1.0));
-
-        let (lateral, forward) = grip_scales(3.0, 0.0);
-        assert_eq!(lateral, 1.0);
-        assert!((forward - LONGITUDINAL_SLIP_FORWARD_GRIP_MIN).abs() < 1.0e-6);
     }
 
     #[test]
