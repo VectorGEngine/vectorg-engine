@@ -49,9 +49,6 @@ const LONGITUDINAL_SLIP_REFERENCE_SPEED: Real = 10.0;
 const LONGITUDINAL_SLIP_START: Real = 0.15;
 const LONGITUDINAL_SLIP_FULL: Real = 0.30;
 const LONGITUDINAL_SLIP_FORWARD_GRIP_MIN: Real = 0.75;
-const DYNAMIC_FRICTION_RATIO: Real = 0.85;
-// Equivalent to the legacy static clamp producing skid_info below approximately 0.3.
-const DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED: Real = 11.111_111;
 const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
 
 fn drift_assist_speed_activation(forward_speed: Real) -> Real {
@@ -684,22 +681,9 @@ fn anti_roll_bar_transfer(
         .clamp(-maximum_leftward_transfer, maximum_rightward_transfer)
 }
 
-fn tire_slip(wheel_surface_speed: Real, forward_speed: Real, side_speed: Real) -> (Real, Real) {
-    let reference_speed = forward_speed.abs().max(2.0);
-    let longitudinal_slip = (wheel_surface_speed - forward_speed).abs() / reference_speed;
-    let lateral_slip_angle = side_speed.abs().atan2(reference_speed);
-    (longitudinal_slip, lateral_slip_angle)
-}
-
-fn tire_grip_ratio(
-    impulse_utilization_squared: Real,
-    longitudinal_slip: Real,
-    lateral_slip_angle: Real,
-) -> Real {
-    if impulse_utilization_squared > DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED
-        && (longitudinal_slip >= 0.12 || lateral_slip_angle >= (5.0 as Real).to_radians())
-    {
-        DYNAMIC_FRICTION_RATIO
+fn friction_circle_scale(impulse_utilization_squared: Real) -> Real {
+    if impulse_utilization_squared > 1.0 {
+        crate::utils::inv(impulse_utilization_squared.sqrt())
     } else {
         1.0
     }
@@ -2177,27 +2161,14 @@ impl DynamicRayCastVehicleController {
             };
             let impulse_utilization_squared =
                 forward_utilization_squared + side_utilization_squared;
-            let (longitudinal_slip, lateral_slip_angle) = tire_slip(
-                wheel_surface_speed,
-                contact.forward_speed,
-                contact.side_speed,
-            );
-            let grip_ratio = tire_grip_ratio(
-                impulse_utilization_squared,
-                longitudinal_slip,
-                lateral_slip_angle,
-            );
-            let available_utilization_squared = grip_ratio * grip_ratio;
+            let friction_scale = friction_circle_scale(impulse_utilization_squared);
+            wheel.skid_info = friction_scale;
 
-            wheel.skid_info = 1.0;
-
-            if impulse_utilization_squared > available_utilization_squared {
-                let factor = grip_ratio * crate::utils::inv(impulse_utilization_squared.sqrt());
-                wheel.skid_info = factor;
-                wheel.forward_impulse *= factor;
-                wheel.brake_impulse *= factor;
-                wheel.side_impulse *= factor;
-                wheel.engine_force_feedback *= factor;
+            if friction_scale < 1.0 {
+                wheel.forward_impulse *= friction_scale;
+                wheel.brake_impulse *= friction_scale;
+                wheel.side_impulse *= friction_scale;
+                wheel.engine_force_feedback *= friction_scale;
             }
 
             wheel.last_skid_info = wheel.skid_info;
@@ -2424,45 +2395,10 @@ mod tests {
     }
 
     #[test]
-    fn low_surface_grip_does_not_trigger_dynamic_friction_without_tire_slip() {
-        assert_eq!(tire_grip_ratio(12.0, 0.0, 0.0), 1.0);
-    }
-
-    #[test]
-    fn tire_slip_uses_wheel_and_contact_motion() {
-        assert_eq!(tire_slip(10.0, 10.0, 0.0), (0.0, 0.0));
-
-        let (longitudinal_slip, lateral_slip_angle) = tire_slip(12.0, 10.0, 1.0);
-        assert!((longitudinal_slip - 0.2).abs() < 1.0e-6);
-        assert!((lateral_slip_angle - 0.099_668_65).abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn saturated_tire_switches_to_dynamic_grip_after_actual_slip_begins() {
-        assert_eq!(
-            tire_grip_ratio(DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED, 0.12, 0.0),
-            1.0
-        );
-        assert_eq!(
-            tire_grip_ratio(DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED + 0.01, 0.12, 0.0,),
-            DYNAMIC_FRICTION_RATIO
-        );
-        assert_eq!(
-            tire_grip_ratio(
-                DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED + 0.01,
-                0.0,
-                (5.0 as Real).to_radians(),
-            ),
-            DYNAMIC_FRICTION_RATIO
-        );
-    }
-
-    #[test]
-    fn tire_regains_static_grip_when_actual_slip_ends() {
-        assert_eq!(
-            tire_grip_ratio(DYNAMIC_FRICTION_ENTER_UTILIZATION_SQUARED + 1.0, 0.0, 0.0),
-            1.0
-        );
+    fn combined_tire_impulses_use_static_friction_circle() {
+        assert_eq!(friction_circle_scale(0.0), 1.0);
+        assert_eq!(friction_circle_scale(1.0), 1.0);
+        assert_eq!(friction_circle_scale(4.0), 0.5);
     }
 
     #[test]
