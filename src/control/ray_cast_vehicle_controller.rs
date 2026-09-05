@@ -32,6 +32,10 @@ const TRACTION_CONTROL_MAX_SPEED_GAP: Real = 10.0;
 const WHEELSPIN_LATERAL_START_GAP: Real = 0.1;
 const WHEELSPIN_LATERAL_FULL_GAP: Real = 10.0;
 const WHEELSPIN_LATERAL_MIN_MULTIPLIER: Real = 0.1;
+// Shared sliding-friction approximation, using contact-plane slip speed in m/s.
+const SLIDING_GRIP_START_SPEED: Real = 4.0;
+const SLIDING_GRIP_FULL_SPEED: Real = 8.0;
+const SLIDING_GRIP_MIN_MULTIPLIER: Real = 0.85;
 const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
 
 fn drift_assist_speed_activation(forward_speed: Real) -> Real {
@@ -494,6 +498,15 @@ fn steering_positive_side(
 fn wheel_angular_inertia(radius: Real) -> Real {
     let radius_scale = radius.max(0.01) / WHEEL_REFERENCE_RADIUS;
     (WHEEL_EFFECTIVE_INERTIA * radius_scale * radius_scale).max(Real::EPSILON)
+}
+
+fn sliding_grip_multiplier(forward_slip: Real, sideways_slip: Real) -> Real {
+    let speed = forward_slip.hypot(sideways_slip);
+    let normalized = ((speed - SLIDING_GRIP_START_SPEED)
+        / (SLIDING_GRIP_FULL_SPEED - SLIDING_GRIP_START_SPEED))
+        .clamp(0.0, 1.0);
+    let blend = normalized * normalized * (3.0 - 2.0 * normalized);
+    1.0 - (1.0 - SLIDING_GRIP_MIN_MULTIPLIER) * blend
 }
 
 fn powered_wheelspin_lateral_multiplier(wheel: &Wheel, road_speed: Real, brake: Real) -> Real {
@@ -1809,6 +1822,13 @@ impl DynamicRayCastVehicleController {
                 .map(|tire_type| tire_type.get_friction(&colliders[ground_object].material.name))
                 .unwrap_or(wheel.friction_slip);
 
+            // Use one contact snapshot for both slip axes. Freeze the reduced
+            // capacity for this step's TC/ABS predictions and final force solve.
+            // No throttle/brake gate: coasting and locked tires can still slide.
+            let sliding_grip = sliding_grip_multiplier(
+                wheel.angular_velocity * wheel.radius - wheel.contact_forward_speed,
+                wheel.contact_side_speed,
+            );
             contacts[wheel_id] = WheelContactState {
                 is_grounded: true,
                 ground_object: Some(ground_object),
@@ -1817,7 +1837,8 @@ impl DynamicRayCastVehicleController {
                 friction_limit: wheel.wheel_suspension_force
                     * dt
                     * wheel.ground_friction
-                    * wheel.friction_slip,
+                    * wheel.friction_slip
+                    * sliding_grip,
             };
             // Keep lateral demand on the original contact snapshot.
             wheel.side_impulse = resolve_ground_impulse(
@@ -3457,6 +3478,68 @@ mod tests {
         assert_eq!(friction_circle_scale(0.0), 1.0);
         assert_eq!(friction_circle_scale(1.0), 1.0);
         assert_eq!(friction_circle_scale(4.0), 0.5);
+    }
+
+    #[test]
+    fn sliding_grip_uses_combined_speed_with_symmetric_smooth_recovery() {
+        for (speed, expected) in [
+            (0.0, 1.0),
+            (4.0, 1.0),
+            (6.0, 0.925),
+            (8.0, 0.85),
+            (20.0, 0.85),
+        ] {
+            for (x, y) in [(1.0, 0.0), (0.0, 1.0), (0.6, 0.8), (-0.6, 0.8), (0.6, -0.8)] {
+                assert!((sliding_grip_multiplier(speed * x, speed * y) - expected).abs() < 1.0e-5);
+            }
+        }
+        let mut previous = SLIDING_GRIP_MIN_MULTIPLIER;
+        for step in (0..=100).rev() {
+            let speed = step as Real * 0.1;
+            let grip = sliding_grip_multiplier(speed * 0.6, speed * 0.8);
+            assert!(grip >= previous - 1.0e-5);
+            previous = grip;
+        }
+        assert_eq!(previous, 1.0);
+    }
+
+    #[test]
+    fn sliding_contact_shares_reduced_capacity_during_coasting_and_braking() {
+        for hz in [30, 60, 120] {
+            for (forward, sideways) in [(20.0, 0.0), (0.0, 20.0), (12.0, 16.0)] {
+                for brake in [0.0, 1.0] {
+                    let dt = 1.0 / hz as Real;
+                    let (mut controller, mut bodies, colliders) =
+                        four_wheel_test_vehicle(forward, 0.0);
+                    bodies[controller.chassis]
+                        .set_linvel(Vector::new(sideways, 0.0, forward), true);
+                    for wheel in &mut controller.wheels {
+                        wheel.angular_velocity = 0.0;
+                        wheel.drive_throttle = 0.0;
+                        wheel.wheel_coupling_torque = 0.0;
+                        wheel.brake = brake;
+                        wheel.anti_lock_brake = 0.0;
+                    }
+                    controller.update_friction(&mut bodies, &colliders, dt);
+                    // The first wheel sees the original snapshot without earlier tire impulses.
+                    let wheel = &controller.wheels[0];
+                    let weighted_forward = (wheel.forward_impulse - wheel.brake_impulse)
+                        * wheel.fwd_factor
+                        + wheel.brake_impulse * wheel.brake_factor;
+                    let weighted_side = wheel.side_impulse * wheel.side_factor;
+                    let expected = wheel.wheel_suspension_force
+                        * dt
+                        * wheel.ground_friction
+                        * wheel.friction_slip
+                        * SLIDING_GRIP_MIN_MULTIPLIER;
+                    assert!(wheel.skid_info < 1.0);
+                    assert!(
+                        (weighted_forward.hypot(weighted_side) - expected).abs() < 0.001,
+                        "{hz} Hz, slip ({forward}, {sideways}), brake {brake}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
