@@ -201,6 +201,7 @@ pub struct Wheel {
     pub target_rotation: Real,
     angular_velocity: Real,
     angular_load: Real,
+    drive_torque_transfer: Real,
     wheel_coupling_torque: Real,
     drive_throttle: Real,
     drivetrain_connected: bool,
@@ -290,6 +291,7 @@ impl Wheel {
             target_rotation: 0.0,
             angular_velocity: 0.0,
             angular_load: 0.0,
+            drive_torque_transfer: 0.0,
             wheel_coupling_torque: 0.0,
             drive_throttle: 0.0,
             drivetrain_connected: false,
@@ -337,6 +339,7 @@ impl Wheel {
         self.delta_rotation = 0.0;
         self.angular_velocity = 0.0;
         self.angular_load = 0.0;
+        self.drive_torque_transfer = 0.0;
         self.target_rotation = 0.0;
         self.wheel_coupling_torque = 0.0;
         self.drive_throttle = 0.0;
@@ -1072,7 +1075,10 @@ impl DynamicRayCastVehicleController {
                 let scale = w.radius / radius / wheel_angular_inertia(w.radius);
                 (
                     scale / driven_count as Real,
-                    w.angular_load * scale,
+                    // The base coupling response uses an equal torque split.
+                    // Account for the additive torque actually transferred to
+                    // this wheel, so it is not mistaken for extra clutch load.
+                    (w.angular_load - w.drive_torque_transfer) * scale,
                     if w.traction_control > 0.0 {
                         1.0 - w.traction_control_cut
                     } else {
@@ -1641,6 +1647,67 @@ impl DynamicRayCastVehicleController {
         }
     }
 
+    // Experimental rear-axle drive allocation: balance positive surface-speed
+    // excess over each wheel's own road speed, not the wheel angular velocities.
+    fn redistribute_rear_drive_torque(
+        &self,
+        contacts: &[WheelContactState],
+        drive_torques: &mut [Real],
+        dt: Real,
+    ) {
+        if dt <= Real::EPSILON {
+            return;
+        }
+        let mut rear = self
+            .wheels
+            .iter()
+            .enumerate()
+            .filter(|(_, wheel)| wheel.role.driven && wheel.role.axle == WheelAxle::Rear);
+        let (Some((a, first)), Some((b, second))) = (rear.next(), rear.next()) else {
+            return;
+        };
+        if rear.next().is_some()
+            || !contacts[a].is_grounded
+            || !contacts[b].is_grounded
+            || !first.drivetrain_connected
+            || !second.drivetrain_connected
+            || first.drive_throttle <= 0.0
+            || second.drive_throttle <= 0.0
+            || first.brake > 0.0
+            || second.brake > 0.0
+        {
+            return;
+        }
+        let direction = first.target_rotation.signum();
+        let first_torque = drive_torques[a] * direction;
+        let second_torque = drive_torques[b] * direction;
+        if direction == 0.0
+            || second.target_rotation.signum() != direction
+            || first_torque <= 0.0
+            || second_torque <= 0.0
+        {
+            return;
+        }
+        let first_radius = first.radius.max(0.01);
+        let second_radius = second.radius.max(0.01);
+        let first_excess = ((first.angular_velocity * first_radius - contacts[a].forward_speed)
+            * direction)
+            .max(0.0);
+        let second_excess = ((second.angular_velocity * second_radius - contacts[b].forward_speed)
+            * direction)
+            .max(0.0);
+        let response = dt
+            * (first_radius / wheel_angular_inertia(first_radius)
+                + second_radius / wheel_angular_inertia(second_radius));
+        // Equal and opposite torque changes correct the excess-spin difference.
+        // The only bound is available drive torque: never create donor braking
+        // or additional axle torque. Tire reaction and assists still solve below.
+        let transfer =
+            ((first_excess - second_excess) / response).clamp(-second_torque, first_torque);
+        drive_torques[a] -= transfer * direction;
+        drive_torques[b] += transfer * direction;
+    }
+
     #[profiling::function]
     fn update_friction(&mut self, bodies: &mut RigidBodySet, colliders: &ColliderSet, dt: Real) {
         let num_wheels = self.wheels.len();
@@ -1665,6 +1732,7 @@ impl DynamicRayCastVehicleController {
 
         for wheel in &mut self.wheels {
             wheel.brake_impulse = 0.0;
+            wheel.drive_torque_transfer = 0.0;
             wheel.side_impulse = 0.0;
             wheel.forward_impulse = 0.0;
             wheel.is_anti_lock_brake = false;
@@ -1733,6 +1801,17 @@ impl DynamicRayCastVehicleController {
             ) * wheel.side_friction_stiffness;
         }
 
+        let mut drive_torques: Vec<_> = self
+            .wheels
+            .iter()
+            .map(|wheel| {
+                wheel.wheel_coupling_torque * force_scale * (1.0 - esc_intervention.engine_cut)
+            })
+            .collect();
+        if esc_intervention.brake_strength == 0.0 {
+            self.redistribute_rear_drive_torque(&contacts, &mut drive_torques, dt);
+        }
+
         for wheel_id in 0..num_wheels {
             let contact = &mut contacts[wheel_id];
             let wheel = &mut self.wheels[wheel_id];
@@ -1750,7 +1829,7 @@ impl DynamicRayCastVehicleController {
             let radius = wheel.radius.max(0.01);
             let inertia = wheel_angular_inertia(radius);
             let drive_direction = wheel.target_rotation.signum();
-            let raw_wheel_torque = wheel.wheel_coupling_torque * force_scale;
+            let raw_wheel_torque = drive_torques[wheel_id];
             let powered_acceleration = wheel.role.driven
                 && wheel.drivetrain_connected
                 && raw_wheel_torque * drive_direction > Real::EPSILON;
@@ -1786,8 +1865,7 @@ impl DynamicRayCastVehicleController {
             if !contact.is_grounded {
                 wheel.traction_control_cut = 0.0;
                 wheel.abs_release = 0.0;
-                let drive_angular_impulse =
-                    raw_wheel_torque * (1.0 - esc_intervention.engine_cut) * dt;
+                let drive_angular_impulse = raw_wheel_torque * dt;
                 let mut angular_velocity = wheel.angular_velocity + drive_angular_impulse / inertia;
                 let reference_angular_velocity = angular_velocity;
                 apply_opposing_angular_impulse(
@@ -1826,8 +1904,7 @@ impl DynamicRayCastVehicleController {
                 &contact.forward_dir,
             );
             let rolling_angular_velocity = contact.forward_speed / radius;
-            let raw_drive_angular_impulse =
-                raw_wheel_torque * (1.0 - esc_intervention.engine_cut) * dt;
+            let raw_drive_angular_impulse = raw_wheel_torque * dt;
 
             // Predict TC, ABS, and the final tire impulse with one contact solve.
             // The road reaction resolves the rolling constraint; lateral damping is separate.
@@ -1894,6 +1971,11 @@ impl DynamicRayCastVehicleController {
             let max_brake_impulse = requested_brake_impulse * brake_fraction;
             let cut = drive_cut_for_brake(max_brake_impulse);
             let (drive_angular_velocity, forward, braking) = solve(1.0 - cut, max_brake_impulse);
+            let base_drive_torque =
+                wheel.wheel_coupling_torque * force_scale * (1.0 - esc_intervention.engine_cut);
+            // Record only the transfer that reaches the wheel after TC. The
+            // road/brake angular_load below remains the physical contact load.
+            wheel.drive_torque_transfer = (raw_wheel_torque - base_drive_torque) * (1.0 - cut);
             wheel.is_anti_lock_brake = brake_fraction < 1.0;
             wheel.abs_release = 1.0 - brake_fraction;
             // Limiter/coast torque must not apply TC to negative torque, but a
@@ -3464,6 +3546,125 @@ mod tests {
     }
 
     #[test]
+    fn rear_drive_allocation_preserves_cornering_speed_difference() {
+        let (mut controller, _, _) = four_wheel_test_vehicle(10.0, 0.0);
+        set_test_drive(&mut controller, 500.0);
+        let mut contacts = vec![WheelContactState::default(); 4];
+        for (id, road_speed) in [(2, 8.0), (3, 12.0)] {
+            contacts[id].is_grounded = true;
+            contacts[id].forward_speed = road_speed;
+            controller.wheels[id].angular_velocity = (road_speed + 2.0) / 0.35;
+        }
+        let mut torques = [0.0, 0.0, 500.0, 500.0];
+        controller.redistribute_rear_drive_torque(&contacts, &mut torques, 1.0 / 60.0);
+        assert!((torques[2] - 500.0).abs() < 0.001);
+        assert!((torques[3] - 500.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn rear_drive_allocation_corrects_excess_spin_with_inertia_and_timestep() {
+        for hz in [30, 60, 120] {
+            for direction in [-1.0, 1.0] {
+                let (mut controller, _, _) = four_wheel_test_vehicle(10.0 * direction, 0.0);
+                set_test_drive(&mut controller, 1_000.0 * direction);
+                controller.wheels[3].radius = 0.4;
+                let mut contacts = vec![WheelContactState::default(); 4];
+                for (id, road_speed, excess) in [(2, 8.0, 3.0), (3, 12.0, 1.0)] {
+                    contacts[id].is_grounded = true;
+                    contacts[id].forward_speed = road_speed * direction;
+                    controller.wheels[id].angular_velocity =
+                        (road_speed + excess) * direction / controller.wheels[id].radius;
+                }
+                let dt = 1.0 / hz as Real;
+                let mut torques = [0.0, 0.0, 1_000.0 * direction, 1_000.0 * direction];
+                controller.redistribute_rear_drive_torque(&contacts, &mut torques, dt);
+                let transfer = 1_000.0 - torques[2] * direction;
+                let correction = transfer
+                    * dt
+                    * (0.35 / wheel_angular_inertia(0.35) + 0.4 / wheel_angular_inertia(0.4));
+                assert!(transfer > 0.0);
+                assert!((correction - 2.0).abs() < 0.001);
+                assert!((torques[2] + torques[3] - 2_000.0 * direction).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn rear_drive_allocation_can_transfer_all_drive_but_cannot_create_braking() {
+        for spinning_id in [2, 3] {
+            for direction in [-1.0, 1.0] {
+                let (mut controller, _, _) = four_wheel_test_vehicle(0.0, 0.0);
+                set_test_drive(&mut controller, 100.0 * direction);
+                controller.wheels[spinning_id].angular_velocity = 100.0 * direction;
+                let mut contacts = vec![WheelContactState::default(); 4];
+                contacts[2].is_grounded = true;
+                contacts[3].is_grounded = true;
+                let mut torques = [0.0, 0.0, 100.0 * direction, 100.0 * direction];
+                controller.redistribute_rear_drive_torque(&contacts, &mut torques, 1.0 / 60.0);
+                assert_eq!(torques[spinning_id], 0.0);
+                assert_eq!(torques[5 - spinning_id], 200.0 * direction);
+            }
+        }
+    }
+
+    #[test]
+    fn rear_drive_allocation_bypasses_unpowered_braked_or_ungrounded_pairs() {
+        for case in 0..8 {
+            let (mut controller, _, _) = four_wheel_test_vehicle(0.0, 0.0);
+            set_test_drive(&mut controller, 100.0);
+            controller.wheels[2].angular_velocity = 100.0;
+            let mut contacts = vec![WheelContactState::default(); 4];
+            contacts[2].is_grounded = true;
+            contacts[3].is_grounded = true;
+            let mut torques = [0.0, 0.0, 100.0, 100.0];
+            match case {
+                0 => contacts[2].is_grounded = false,
+                1 => controller.wheels[3].brake = 0.5,
+                2 => controller.wheels[2].drive_throttle = 0.0,
+                3 => controller.wheels[3].drivetrain_connected = false,
+                4 => controller.wheels[3].role.driven = false,
+                5 => controller.wheels[3].target_rotation = -100.0,
+                6 => torques[2] = -100.0,
+                _ => controller.wheels[3].role.axle = WheelAxle::Front,
+            }
+            let original = torques;
+            controller.redistribute_rear_drive_torque(&contacts, &mut torques, 1.0 / 60.0);
+            assert_eq!(torques, original, "case {case}");
+        }
+    }
+
+    #[test]
+    fn rear_drive_allocation_sends_real_contact_force_to_the_loaded_wheel() {
+        for hz in [30, 60, 120] {
+            let mut results = Vec::new();
+            for redistribution in [false, true] {
+                let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(10.0, 0.0);
+                set_test_drive(&mut controller, 1_000.0);
+                controller.wheels[2].angular_velocity += 10.0 / 0.35;
+                controller.wheels[2].wheel_suspension_force = 1_000.0;
+                controller.wheels[3].wheel_suspension_force = 8_000.0;
+                for wheel in &mut controller.wheels[2..] {
+                    wheel.friction_slip = 1.0;
+                    if !redistribution {
+                        // Keep identical wheel torque, bypass only the new allocation.
+                        wheel.drive_throttle = 0.0;
+                    }
+                }
+                controller.update_friction(&mut bodies, &colliders, 1.0 / hz as Real);
+                results.push((
+                    controller.wheels[2].angular_velocity,
+                    controller.wheels[3].forward_impulse,
+                ));
+            }
+            assert!(results[1].0 < results[0].0, "{hz} Hz: donor must spin less");
+            assert!(
+                results[1].1 > results[0].1,
+                "{hz} Hz: recipient must gain tire force"
+            );
+        }
+    }
+
+    #[test]
     fn opposing_angular_impulse_stops_without_reversing_the_wheel() {
         let inertia = wheel_angular_inertia(WHEEL_REFERENCE_RADIUS);
         let mut angular_velocity = 2.0;
@@ -3472,6 +3673,78 @@ mod tests {
 
         assert_eq!(angular_velocity, 0.0);
         assert!((remaining - inertia).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn redistributed_drive_feedback_does_not_create_an_engine_rpm_deficit() {
+        for hz in [30, 60, 120] {
+            for direction in [-1.0, 1.0] {
+                for transfer in [-300.0, 300.0] {
+                    let (mut controller, _, _) = four_wheel_test_vehicle(15.0 * direction, 0.0);
+                    let gear = if direction > 0.0 { 1 } else { -1 };
+                    controller.set_gear(gear);
+                    controller.powertrain.config.transmission.auto_clutch = false;
+                    controller.powertrain.config.turbo.enabled = false;
+                    controller.set_input(VehicleInput {
+                        throttle: 1.0,
+                        ..VehicleInput::default()
+                    });
+                    controller.powertrain.state_mut().engine_rpm = 5_000.0;
+                    let config = &controller.powertrain.config;
+                    let ratio = if gear > 0 {
+                        config.transmission.forward_ratios[0]
+                    } else {
+                        config.transmission.reverse_ratio
+                    };
+                    let gearing = ratio * config.transmission.final_drive_ratio;
+                    let base_torque = 600.0
+                        * ratio.abs().powf(config.engine.gear_force_exponent)
+                        * config.transmission.final_drive_ratio
+                        * config.engine.drivetrain_efficiency
+                        * config.engine.force_scale
+                        * direction
+                        / 2.0;
+                    let omega = 5_000.0 * std::f64::consts::TAU as Real / 60.0 / gearing;
+                    controller.wheels[2].angular_velocity = omega * 0.9;
+                    controller.wheels[3].angular_velocity = omega;
+                    // Steady wheel motion: road load exactly balances the actual
+                    // redistributed torque, including when the fastest wheel donates.
+                    for (id, signed_transfer) in [(2, -transfer), (3, transfer)] {
+                        controller.wheels[id].drive_torque_transfer = signed_transfer * direction;
+                        controller.wheels[id].angular_load =
+                            base_torque + signed_transfer * direction;
+                    }
+                    for _ in 0..hz * 60 {
+                        controller.update_powertrain(1.0 / hz as Real);
+                    }
+                    assert!(
+                        (controller.state().engine_rpm - 5_000.0).abs() < 1.0,
+                        "{hz} Hz direction {direction} transfer {transfer}: RPM {}",
+                        controller.state().engine_rpm
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drive_transfer_feedback_tracks_the_actual_torque_after_tc_and_clears_on_bypass() {
+        for strength in [0.0, 0.5, 1.0] {
+            let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(10.0, strength);
+            set_test_drive(&mut controller, 1_000.0);
+            controller.wheels[2].angular_velocity += 10.0 / 0.35;
+            controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+            for (id, transfer) in [(2, -1_000.0), (3, 1_000.0)] {
+                let wheel = &controller.wheels[id];
+                let expected = transfer * (1.0 - wheel.traction_control_cut);
+                assert!((wheel.drive_torque_transfer - expected).abs() < 0.001);
+            }
+            controller.wheels[2].raycast_info.ground_object = None;
+            controller.wheels[2].raycast_info.is_in_contact = false;
+            controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+            assert_eq!(controller.wheels[2].drive_torque_transfer, 0.0);
+            assert_eq!(controller.wheels[3].drive_torque_transfer, 0.0);
+        }
     }
 
     #[test]
@@ -4060,6 +4333,7 @@ mod tests {
         wheel.delta_rotation = 2.0;
         wheel.target_rotation = 3.0;
         wheel.angular_velocity = 20.0;
+        wheel.drive_torque_transfer = 300.0;
         wheel.abs_release = 0.7;
         wheel.traction_control_cut = 0.6;
         wheel.traction_control = 0.35;
@@ -4088,6 +4362,7 @@ mod tests {
         assert_eq!(wheel.delta_rotation, 0.0);
         assert_eq!(wheel.target_rotation, 0.0);
         assert_eq!(wheel.angular_velocity, 0.0);
+        assert_eq!(wheel.drive_torque_transfer, 0.0);
         assert_eq!(wheel.traction_control, 0.35);
         assert_eq!(wheel.traction_control_cut, 0.0);
         assert_eq!(wheel.abs_release, 0.0);
