@@ -396,7 +396,6 @@ pub(crate) struct PowertrainOutput {
     pub engine_brake_torque: Real,
     pub wheel_coupling_torque: Real,
     pub wheel_target_velocity: Real,
-    pub wheel_limit_velocity: Real,
     pub drive_throttle: Real,
     pub drivetrain_connected: bool,
     pub service_brake: Real,
@@ -789,11 +788,6 @@ impl VehiclePowertrain {
             (self.state.engine_rpm * TAU / 60.0)
                 / (ratio * self.config.transmission.final_drive_ratio)
         };
-        let wheel_limit_velocity = if ratio == 0.0 {
-            0.0
-        } else {
-            (limit * TAU / 60.0) / (ratio * self.config.transmission.final_drive_ratio)
-        };
         let gear_engaged = if ratio == 0.0 { 0.0 } else { clutch_engagement };
         let torque_load = ((available_torque / self.peak_torque) * boost).clamp(0.0, 1.5) / 1.5;
         let combustion_load =
@@ -827,7 +821,6 @@ impl VehiclePowertrain {
             engine_brake_torque,
             wheel_coupling_torque,
             wheel_target_velocity,
-            wheel_limit_velocity,
             drive_throttle,
             drivetrain_connected,
             service_brake,
