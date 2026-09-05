@@ -24,7 +24,7 @@ const WHEEL_REFERENCE_RADIUS: Real = 0.35;
 const WHEEL_EFFECTIVE_INERTIA: Real = 1.5;
 const WHEEL_STOP_EPSILON: Real = 1.0e-4;
 // Numerical allowance for a rolling constraint, in meters per second.
-const ABS_SURFACE_SPEED_TOLERANCE: Real = 0.01;
+const ASSIST_SURFACE_SPEED_TOLERANCE: Real = 0.01;
 const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
 
 fn drift_assist_speed_activation(forward_speed: Real) -> Real {
@@ -198,10 +198,12 @@ pub struct Wheel {
     /// The target angular velocity of the wheel.
     pub target_rotation: Real,
     angular_velocity: Real,
+    angular_load: Real,
     wheel_coupling_torque: Real,
     drive_throttle: Real,
     drivetrain_connected: bool,
     traction_control_cut: Real,
+    abs_release: Real,
     handbrake_overrides_abs: bool,
     /// Fraction of the lateral impulse application height moved toward the chassis center of mass.
     pub anti_roll: Real,
@@ -285,10 +287,12 @@ impl Wheel {
             delta_rotation: 0.0,
             target_rotation: 0.0,
             angular_velocity: 0.0,
+            angular_load: 0.0,
             wheel_coupling_torque: 0.0,
             drive_throttle: 0.0,
             drivetrain_connected: false,
             traction_control_cut: 0.0,
+            abs_release: 0.0,
             handbrake_overrides_abs: false,
             brake: 0.0,
             max_brake_force: 1000.0,
@@ -330,11 +334,13 @@ impl Wheel {
         self.rotation = 0.0;
         self.delta_rotation = 0.0;
         self.angular_velocity = 0.0;
+        self.angular_load = 0.0;
         self.target_rotation = 0.0;
         self.wheel_coupling_torque = 0.0;
         self.drive_throttle = 0.0;
         self.drivetrain_connected = false;
         self.traction_control_cut = 0.0;
+        self.abs_release = 0.0;
         self.handbrake_overrides_abs = false;
         self.forward_impulse = 0.0;
         self.side_impulse = 0.0;
@@ -565,59 +571,36 @@ fn friction_circle_scale(impulse_utilization_squared: Real) -> Real {
     }
 }
 
-// Find the admissible drive impulse using the same brake-aware weighted demand
-// as the friction circle. Bisection also handles the brake's zero-speed clamp.
-fn traction_control_cut(
-    strength: Real,
-    direction: Real,
-    forward_capacity: Real,
-    demand_at_fraction: impl Fn(Real) -> Real,
-) -> Real {
+// Pure preview: callers may evaluate several coupled TC/ABS candidates, but
+// apply the returned fraction to the uncut request only once per simulation step.
+fn assist_torque_fraction(strength: Real, slip_at_fraction: impl Fn(Real) -> Real) -> Real {
     let strength = strength.clamp(0.0, 1.0);
-    if strength == 0.0 || direction == 0.0 {
-        return 0.0;
-    }
-    let capacity = forward_capacity.max(0.0);
-    if direction * demand_at_fraction(1.0) <= capacity {
-        return 0.0;
-    }
-    if direction * demand_at_fraction(0.0) >= capacity {
-        return strength;
-    }
-    let mut allowed = 0.0;
-    let mut rejected = 1.0;
-    for _ in 0..24 {
-        let candidate = (allowed + rejected) * 0.5;
-        if direction * demand_at_fraction(candidate) <= capacity {
-            allowed = candidate;
-        } else {
-            rejected = candidate;
-        }
-    }
-    strength * (1.0 - allowed)
-}
-
-fn anti_lock_brake_fraction(strength: Real, underspeed_at_fraction: impl Fn(Real) -> Real) -> Real {
-    let strength = strength.clamp(0.0, 1.0);
-    if strength == 0.0 || underspeed_at_fraction(1.0) <= ABS_SURFACE_SPEED_TOLERANCE {
+    if strength == 0.0 {
         return 1.0;
     }
-    // Existing lockup may need more than one step of tire reaction to recover.
-    // Release fully at maximum ABS strength, without forcing wheel rotation.
-    if underspeed_at_fraction(0.0) > ABS_SURFACE_SPEED_TOLERANCE {
-        return 1.0 - strength;
-    }
-    let mut allowed = 0.0;
-    let mut rejected = 1.0;
-    for _ in 0..24 {
-        let candidate = (allowed + rejected) * 0.5;
-        if underspeed_at_fraction(candidate) <= ABS_SURFACE_SPEED_TOLERANCE {
-            allowed = candidate;
-        } else {
-            rejected = candidate;
+    let error = |fraction| slip_at_fraction(fraction) - ASSIST_SURFACE_SPEED_TOLERANCE;
+    let controlled_fraction = if error(1.0) <= 0.0 {
+        1.0
+    } else if error(0.0) > 0.0 {
+        // Tire reaction may need multiple steps to recover existing slip.
+        0.0
+    } else {
+        let mut allowed = 0.0;
+        let mut rejected = 1.0;
+        for _ in 0..24 {
+            let candidate = (allowed + rejected) * 0.5;
+            if error(candidate) <= 0.0 {
+                allowed = candidate;
+            } else {
+                rejected = candidate;
+            }
         }
-    }
-    1.0 - strength * (1.0 - allowed)
+        allowed
+    };
+    // Strength scales the required correction, not a slip target or response time.
+    // No previous actuator value feeds this solve: weak assistance cannot accumulate
+    // into full intervention, even when the wheel remains spinning or locked.
+    1.0 - strength * (1.0 - controlled_fraction)
 }
 
 impl DynamicRayCastVehicleController {
@@ -1057,6 +1040,42 @@ impl DynamicRayCastVehicleController {
         (driven_speed, average_radius)
     }
 
+    fn update_powertrain(&mut self, dt: Real) -> super::vehicle_powertrain::PowertrainOutput {
+        let (speed, radius) = self.driven_wheel_speed_and_radius();
+        let driven_count = self.wheels.iter().filter(|w| w.role.driven).count();
+        // Match the wheel used for the existing fastest-driven-wheel RPM signal.
+        let wheel = self.wheels.iter().filter(|w| w.role.driven).reduce(|a, b| {
+            if (b.angular_velocity * b.radius).abs() > (a.angular_velocity * a.radius).abs() {
+                b
+            } else {
+                a
+            }
+        });
+        let (inverse_inertia, load_acceleration, drive_fraction) = wheel
+            .map(|w| {
+                let scale = w.radius / radius / wheel_angular_inertia(w.radius);
+                (
+                    scale / driven_count as Real,
+                    w.angular_load * scale,
+                    if w.traction_control > 0.0 {
+                        1.0 - w.traction_control_cut
+                    } else {
+                        1.0
+                    },
+                )
+            })
+            .unwrap_or((0.0, 0.0, 1.0));
+        self.powertrain.update_with_wheel_dynamics(
+            dt,
+            self.current_vehicle_speed,
+            speed,
+            radius,
+            inverse_inertia,
+            load_acceleration,
+            drive_fraction,
+        )
+    }
+
     fn update_steering(&mut self, chassis: &RigidBody, dt: Real) {
         let steering_config = &self.powertrain.config.steering;
         let input = self.powertrain.input();
@@ -1336,7 +1355,13 @@ impl DynamicRayCastVehicleController {
             self.wheels
                 .iter()
                 .filter(|wheel| wheel.role.driven && wheel.raycast_info.is_in_contact)
-                .map(|wheel| wheel.traction_control_cut)
+                .map(|wheel| {
+                    if wheel.wheel_coupling_torque * wheel.target_rotation.signum() > 0.0 {
+                        wheel.traction_control_cut
+                    } else {
+                        0.0
+                    }
+                })
                 .sum::<Real>()
                 / driven_count as Real
         };
@@ -1418,13 +1443,7 @@ impl DynamicRayCastVehicleController {
 
         let forward_w = chassis.position() * Vector::ith(self.index_forward_axis, 1.0);
         self.current_vehicle_speed = forward_w.dot(chassis.linvel());
-        let (driven_wheel_speed, driven_wheel_radius) = self.driven_wheel_speed_and_radius();
-        let output = self.powertrain.update(
-            dt,
-            self.current_vehicle_speed,
-            driven_wheel_speed,
-            driven_wheel_radius,
-        );
+        let output = self.update_powertrain(dt);
         self.update_steering(chassis, dt);
         self.apply_powertrain_output(output);
         self.apply_chassis_dynamics(dt, bodies);
@@ -1719,6 +1738,10 @@ impl DynamicRayCastVehicleController {
             let powered_acceleration = wheel.role.driven
                 && wheel.drivetrain_connected
                 && raw_wheel_torque * drive_direction > Real::EPSILON;
+            let tc_requested = wheel.role.driven
+                && wheel.drivetrain_connected
+                && wheel.drive_throttle > 0.0
+                && wheel.traction_control > 0.0;
             let esc_brake = if esc_intervention.brake_strength > 0.0 {
                 let side = wheel.chassis_connection_point_cs.coords[esc_side_axis];
                 let wheel_side = if side > 0.0 {
@@ -1746,6 +1769,7 @@ impl DynamicRayCastVehicleController {
 
             if !contact.is_grounded {
                 wheel.traction_control_cut = 0.0;
+                wheel.abs_release = 0.0;
                 let drive_angular_impulse =
                     raw_wheel_torque * (1.0 - esc_intervention.engine_cut) * dt;
                 let mut angular_velocity = wheel.angular_velocity + drive_angular_impulse / inertia;
@@ -1757,6 +1781,11 @@ impl DynamicRayCastVehicleController {
                     requested_brake_impulse * radius,
                 );
                 wheel.angular_velocity = angular_velocity;
+                wheel.angular_load = if dt > Real::EPSILON {
+                    (reference_angular_velocity - angular_velocity) * inertia / dt
+                } else {
+                    0.0
+                };
                 wheel.lock =
                     brake > Real::EPSILON && wheel.angular_velocity.abs() <= WHEEL_STOP_EPSILON;
                 wheel.last_skid_info = wheel.skid_info;
@@ -1772,8 +1801,6 @@ impl DynamicRayCastVehicleController {
             } else {
                 0.0
             };
-            let remaining_forward_limit =
-                forward_friction_limit * (1.0 - side_utilization_squared).max(0.0).sqrt();
             let contact_inverse_mass = ground_impulse_denominator(
                 bodies,
                 colliders,
@@ -1801,17 +1828,35 @@ impl DynamicRayCastVehicleController {
                 );
                 (drive_velocity, forward_impulse, brake_impulse)
             };
+            let predict = |drive_fraction: Real, brake_impulse: Real| {
+                let (drive_velocity, forward, braking) = solve(drive_fraction, brake_impulse);
+                // Predict the same weighted friction-circle scaling applied below.
+                let demand = forward * wheel.fwd_factor + braking * wheel.brake_factor;
+                let forward_utilization = if forward_friction_limit > Real::EPSILON {
+                    (demand / forward_friction_limit).powi(2)
+                } else if demand.abs() > Real::EPSILON {
+                    Real::MAX
+                } else {
+                    0.0
+                };
+                let scale = friction_circle_scale(forward_utilization + side_utilization_squared);
+                let tire_impulse = forward * scale + braking * scale;
+                let mut angular_velocity = drive_velocity - tire_impulse * radius / inertia;
+                apply_opposing_angular_impulse(
+                    &mut angular_velocity,
+                    rolling_angular_velocity,
+                    inertia,
+                    brake_impulse * radius,
+                );
+                let road_speed = contact.forward_speed + tire_impulse * contact_inverse_mass;
+                (angular_velocity * radius, road_speed)
+            };
             let drive_cut_for_brake = |brake_impulse: Real| {
-                if powered_acceleration {
-                    traction_control_cut(
-                        wheel.traction_control,
-                        drive_direction,
-                        remaining_forward_limit,
-                        |fraction| {
-                            let (_, forward, braking) = solve(fraction, brake_impulse);
-                            forward * wheel.fwd_factor + braking * wheel.brake_factor
-                        },
-                    )
+                if powered_acceleration && tc_requested {
+                    1.0 - assist_torque_fraction(wheel.traction_control, |fraction| {
+                        let (wheel_speed, road_speed) = predict(fraction, brake_impulse);
+                        (wheel_speed - road_speed) * drive_direction
+                    })
                 } else {
                     0.0
                 }
@@ -1821,31 +1866,11 @@ impl DynamicRayCastVehicleController {
                 && self.current_vehicle_speed.abs() > 1.0
                 && contact.forward_speed.abs() > 1.0
             {
-                anti_lock_brake_fraction(wheel.anti_lock_brake, |fraction| {
+                assist_torque_fraction(wheel.anti_lock_brake, |fraction| {
                     let brake_impulse = requested_brake_impulse * fraction;
                     let cut = drive_cut_for_brake(brake_impulse);
-                    let (drive_velocity, forward, braking) = solve(1.0 - cut, brake_impulse);
-                    // Predict the same weighted friction-circle scaling applied below.
-                    let demand = forward * wheel.fwd_factor + braking * wheel.brake_factor;
-                    let forward_utilization = if forward_friction_limit > Real::EPSILON {
-                        (demand / forward_friction_limit).powi(2)
-                    } else if demand.abs() > Real::EPSILON {
-                        Real::MAX
-                    } else {
-                        0.0
-                    };
-                    let scale =
-                        friction_circle_scale(forward_utilization + side_utilization_squared);
-                    let tire_impulse = forward * scale + braking * scale;
-                    let mut angular_velocity = drive_velocity - tire_impulse * radius / inertia;
-                    apply_opposing_angular_impulse(
-                        &mut angular_velocity,
-                        rolling_angular_velocity,
-                        inertia,
-                        brake_impulse * radius,
-                    );
-                    let road_speed = contact.forward_speed + tire_impulse * contact_inverse_mass;
-                    (road_speed - angular_velocity * radius) * contact.forward_speed.signum()
+                    let (wheel_speed, road_speed) = predict(1.0 - cut, brake_impulse);
+                    (road_speed - wheel_speed) * contact.forward_speed.signum()
                 })
             } else {
                 1.0
@@ -1854,7 +1879,12 @@ impl DynamicRayCastVehicleController {
             let cut = drive_cut_for_brake(max_brake_impulse);
             let (drive_angular_velocity, forward, braking) = solve(1.0 - cut, max_brake_impulse);
             wheel.is_anti_lock_brake = brake_fraction < 1.0;
-            wheel.traction_control_cut = cut;
+            wheel.abs_release = 1.0 - brake_fraction;
+            // Limiter/coast torque must not apply TC to negative torque, but a
+            // brief interruption under held throttle must retain controller memory.
+            if powered_acceleration || !tc_requested {
+                wheel.traction_control_cut = cut;
+            }
             wheel.forward_impulse = forward;
             wheel.brake_impulse = braking;
             wheel.engine_force_feedback = forward + braking;
@@ -1894,6 +1924,11 @@ impl DynamicRayCastVehicleController {
                 final_angular_velocity = 0.0;
             }
             wheel.angular_velocity = final_angular_velocity;
+            wheel.angular_load = if dt > Real::EPSILON {
+                (drive_angular_velocity - final_angular_velocity) * inertia / dt
+            } else {
+                0.0
+            };
             wheel.lock = brake > Real::EPSILON && final_angular_velocity == 0.0;
             bodies
                 .get_mut_internal_with_modification_tracking(self.chassis)
@@ -2103,13 +2138,7 @@ mod tests {
                 let mut max_overspeed: Real = 0.0;
                 for _ in 0..hz * 2 {
                     controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
-                    let (wheel_speed, radius) = controller.driven_wheel_speed_and_radius();
-                    let output = controller.powertrain.update(
-                        dt,
-                        controller.current_vehicle_speed,
-                        wheel_speed,
-                        radius,
-                    );
+                    let output = controller.update_powertrain(dt);
                     controller.apply_powertrain_output(output);
                     controller.update_friction(&mut bodies, &colliders, dt);
                     max_overspeed =
@@ -2154,7 +2183,7 @@ mod tests {
                     assert_eq!(wheel.traction_control_cut, 0.0);
                 } else {
                     assert!(wheel.traction_control_cut > 0.0);
-                    assert!(wheel.traction_control_cut <= strength);
+                    assert!(wheel.traction_control_cut <= 1.0);
                 }
             }
             assert!(bodies[controller.chassis].linvel().z > 40.2);
@@ -2407,13 +2436,7 @@ mod tests {
                     let mut active = false;
                     for _ in 0..hz * 2 {
                         controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
-                        let (wheel_speed, radius) = controller.driven_wheel_speed_and_radius();
-                        let output = controller.powertrain.update(
-                            dt,
-                            controller.current_vehicle_speed,
-                            wheel_speed,
-                            radius,
-                        );
+                        let output = controller.update_powertrain(dt);
                         controller.apply_powertrain_output(output);
                         controller.update_friction(&mut bodies, &colliders, dt);
                         for wheel in &controller.wheels {
@@ -2493,75 +2516,481 @@ mod tests {
     }
 
     #[test]
-    fn full_abs_keeps_wheels_rotating_during_cornering_with_tc_and_esc() {
+    fn progressive_abs_recovers_during_cornering_with_tc_and_esc() {
         for hz in [30, 60, 120] {
-            let dt = 1.0 / hz as Real;
-            let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(40.0, 1.0);
-            controller.esc = 1.0;
-            controller.set_input(VehicleInput {
-                steering: 0.12,
-                throttle: 0.3,
-                brake: 1.0,
-                ..VehicleInput::default()
-            });
-            bodies[controller.chassis].set_linvel(Vector::new(2.0, 0.0, 40.0), true);
-            bodies[controller.chassis].set_angvel(Vector::y() * 0.1, true);
-            set_test_drive(&mut controller, 600.0);
-            for wheel in &mut controller.wheels {
-                wheel.brake = 1.0;
-                wheel.max_brake_force = 1_000.0 * 60.0 * dt;
-                wheel.friction_slip = 0.6;
-                wheel.last_skid_info = 1.0;
-                if wheel.role.steered {
-                    wheel.steering = 0.12;
-                    wheel.wheel_axle_ws =
-                        Vector::new((0.12 as Real).cos(), 0.0, -(0.12 as Real).sin());
-                }
-                let forward =
-                    aligned_wheel_forward(&Vector::y(), &wheel.wheel_axle_ws, &Vector::z());
-                wheel.angular_velocity = forward.dot(
-                    &bodies[controller.chassis]
-                        .velocity_at_point(&wheel.raycast_info.contact_point_ws),
-                ) / wheel.radius;
-            }
-            let mut abs_active = false;
-            let mut esc_active = false;
-            for _ in 0..hz * 2 {
-                controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
-                controller.update_friction(&mut bodies, &colliders, dt);
-                esc_active |= controller.state().esc_activity > 0.0;
-                for wheel in &controller.wheels {
-                    abs_active |= wheel.is_anti_lock_brake;
+            for strength in [0.2, 0.5, 0.8, 0.99, 1.0] {
+                let dt = 1.0 / hz as Real;
+                let (mut controller, mut bodies, colliders) =
+                    four_wheel_test_vehicle(40.0, strength);
+                controller.esc = 1.0;
+                controller.set_input(VehicleInput {
+                    steering: 0.12,
+                    throttle: 0.3,
+                    brake: 1.0,
+                    ..VehicleInput::default()
+                });
+                bodies[controller.chassis].set_linvel(Vector::new(2.0, 0.0, 40.0), true);
+                bodies[controller.chassis].set_angvel(Vector::y() * 0.1, true);
+                set_test_drive(&mut controller, 600.0);
+                for wheel in &mut controller.wheels {
+                    wheel.anti_lock_brake = strength;
+                    wheel.brake = 1.0;
+                    wheel.max_brake_force = 1_000.0 * 60.0 * dt;
+                    wheel.friction_slip = 0.6;
+                    wheel.last_skid_info = 1.0;
+                    if wheel.role.steered {
+                        wheel.steering = 0.12;
+                        wheel.wheel_axle_ws =
+                            Vector::new((0.12 as Real).cos(), 0.0, -(0.12 as Real).sin());
+                    }
                     let forward =
                         aligned_wheel_forward(&Vector::y(), &wheel.wheel_axle_ws, &Vector::z());
-                    let speed = forward.dot(
+                    wheel.angular_velocity = forward.dot(
                         &bodies[controller.chassis]
                             .velocity_at_point(&wheel.raycast_info.contact_point_ws),
-                    );
-                    let underspeed = speed - wheel.angular_velocity * wheel.radius;
-                    // Later wheels and lateral impulses can change this contact's
-                    // road speed after its solve; bound that transient to 2%.
-                    assert!(
-                        !wheel.lock && underspeed < speed.abs() * 0.02,
-                        "{hz} Hz cornering: underspeed {underspeed}"
-                    );
+                    ) / wheel.radius;
                 }
+                let mut abs_active = false;
+                let mut esc_active = false;
+                for _ in 0..hz * 3 {
+                    controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
+                    controller.update_friction(&mut bodies, &colliders, dt);
+                    esc_active |= controller.state().esc_activity > 0.0;
+                    for wheel in &controller.wheels {
+                        abs_active |= wheel.is_anti_lock_brake;
+                        let forward =
+                            aligned_wheel_forward(&Vector::y(), &wheel.wheel_axle_ws, &Vector::z());
+                        let speed = forward.dot(
+                            &bodies[controller.chassis]
+                                .velocity_at_point(&wheel.raycast_info.contact_point_ws),
+                        );
+                        let underspeed = speed - wheel.angular_velocity * wheel.radius;
+                        assert!(underspeed.is_finite());
+                        assert!(wheel.abs_release <= strength + 0.000001);
+                        assert!(wheel.traction_control_cut <= strength + 0.000001);
+                        // Only full assistance guarantees recovery under excessive demand.
+                        // Allow for later wheels/lateral impulses changing road speed.
+                        if strength == 1.0 {
+                            assert!(
+                                !wheel.lock && underspeed < speed.abs() * 0.03,
+                                "{hz} Hz strength {strength} cornering: underspeed {underspeed}"
+                            );
+                            if wheel.role.driven {
+                                assert!(-underspeed < speed.abs() * 0.03);
+                            }
+                        }
+                    }
+                }
+                assert!(abs_active && esc_active);
+                assert!(bodies[controller.chassis].linvel().z < 38.0);
             }
-            assert!(abs_active && esc_active);
-            assert!(bodies[controller.chassis].linvel().z < 38.0);
         }
     }
 
     #[test]
-    fn abs_strength_blends_torque_release_and_can_release_fully() {
-        let full = anti_lock_brake_fraction(1.0, |fraction| fraction * 10.0 - 4.0);
-        let partial = anti_lock_brake_fraction(0.5, |fraction| fraction * 10.0 - 4.0);
-        assert!((full - 0.401).abs() < 0.0001);
-        assert!((partial - (1.0 + full) * 0.5).abs() < 0.0001);
-        assert_eq!(anti_lock_brake_fraction(0.0, |_| 100.0), 1.0);
-        assert_eq!(anti_lock_brake_fraction(1.0, |_| 100.0), 0.0);
-        assert_eq!(anti_lock_brake_fraction(0.5, |_| 100.0), 0.5);
-        assert_eq!(anti_lock_brake_fraction(1.0, |_| 0.0), 1.0);
+    fn continuous_assist_strengths_reduce_wheelspin_and_braking_lock_duration() {
+        for hz in [30, 60, 120] {
+            for direction in [-1.0, 1.0] {
+                for braking in [false, true] {
+                    let dt = 1.0 / hz as Real;
+                    let mut means = Vec::new();
+                    let mut lock_counts = Vec::new();
+                    for strength in [0.0, 0.05, 0.2, 0.5, 0.8, 0.95, 1.0] {
+                        let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(
+                            40.0 * direction,
+                            if braking { 0.0 } else { strength },
+                        );
+                        if !braking {
+                            set_test_drive(&mut controller, 1_000.0 * direction);
+                        }
+                        for wheel in &mut controller.wheels {
+                            wheel.anti_lock_brake = strength;
+                            if braking {
+                                wheel.brake = 1.0;
+                                wheel.max_brake_force = 100.0 * 60.0 * dt;
+                            }
+                        }
+                        let mut sum = 0.0;
+                        let mut samples = 0;
+                        let mut locked_steps = 0;
+                        for _ in 0..hz * 3 {
+                            controller.current_vehicle_speed =
+                                bodies[controller.chassis].linvel().z;
+                            controller.update_friction(&mut bodies, &colliders, dt);
+                            for wheel in controller
+                                .wheels
+                                .iter()
+                                .filter(|w| braking || w.role.driven)
+                            {
+                                let road = bodies[controller.chassis]
+                                    .velocity_at_point(&wheel.raycast_info.contact_point_ws)
+                                    .z;
+                                let slip = (wheel.angular_velocity * wheel.radius - road)
+                                    * direction
+                                    * if braking { -1.0 } else { 1.0 };
+                                assert!(slip.is_finite());
+                                assert!(wheel.abs_release <= strength + 0.000001);
+                                assert!(wheel.traction_control_cut <= strength + 0.000001);
+                                locked_steps += usize::from(wheel.lock);
+                                if strength == 0.0 {
+                                    assert_eq!(wheel.abs_release, 0.0);
+                                    assert_eq!(wheel.traction_control_cut, 0.0);
+                                }
+                                if strength == 1.0 {
+                                    assert!(slip < 0.1 && !wheel.lock);
+                                }
+                                sum += slip.max(0.0) / road.abs().max(1.0);
+                                samples += 1;
+                            }
+                        }
+                        let speed = bodies[controller.chassis].linvel().z * direction;
+                        assert!(if braking {
+                            speed < 38.0 && speed > 1.0
+                        } else {
+                            speed > 40.2
+                        });
+                        means.push(sum / samples as Real);
+                        lock_counts.push(locked_steps);
+                    }
+                    eprintln!("{hz} Hz direction {direction} braking {braking}: {means:?}");
+                    for pair in means.windows(2) {
+                        assert!(
+                            pair[0] > pair[1] + 0.0001,
+                            "{hz} Hz direction {direction} braking {braking}: {means:?}"
+                        );
+                    }
+                    assert!(means[2] > means[4] + 0.1);
+                    if !braking {
+                        assert!(means[4] < means[0] * 0.5);
+                    }
+                    if braking {
+                        assert!(lock_counts[2] > 0, "weak ABS must still permit lock");
+                        assert_eq!(lock_counts[6], 0);
+                        assert!(
+                            lock_counts.windows(2).all(|pair| pair[0] >= pair[1]),
+                            "{lock_counts:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn assist_preview_scales_required_correction_without_accumulating() {
+        for strength in [0.0, 0.0001, 0.05, 0.2, 0.3, 0.6, 0.8, 0.9999, 1.0] {
+            // Full intervention retains 40% of the uncut requested torque.
+            let preview = || {
+                assist_torque_fraction(strength, |fraction| {
+                    (fraction - 0.4) * 10.0 + ASSIST_SURFACE_SPEED_TOLERANCE
+                })
+            };
+            assert!((preview() - (1.0 - strength * 0.6)).abs() < 0.000001);
+            for _ in 0..1200 {
+                assert_eq!(preview(), preview());
+                // Even unrecoverable slip cannot request more than the selected strength.
+                assert_eq!(assist_torque_fraction(strength, |_| 100.0), 1.0 - strength);
+            }
+            assert_eq!(assist_torque_fraction(strength, |_| 0.0), 1.0);
+            assert_eq!(assist_torque_fraction(strength, |_| -100.0), 1.0);
+        }
+        assert_eq!(
+            assist_torque_fraction(0.0, |_| panic!("disabled assist previewed")),
+            1.0
+        );
+    }
+
+    #[test]
+    fn partial_assists_do_not_prevent_regrip_after_input_release_and_grip_changes() {
+        for hz in [30, 60, 120] {
+            for strength in [0.2, 0.5, 0.8, 1.0] {
+                for braking in [false, true] {
+                    let dt = 1.0 / hz as Real;
+                    let (mut controller, mut bodies, colliders) =
+                        four_wheel_test_vehicle(40.0, strength);
+                    if !braking {
+                        set_test_drive(&mut controller, 1_000.0);
+                    }
+                    for wheel in &mut controller.wheels {
+                        wheel.angular_velocity = if braking { 0.0 } else { 120.0 / wheel.radius };
+                        wheel.anti_lock_brake = strength;
+                        wheel.brake = if braking { 1.0 } else { 0.0 };
+                        wheel.max_brake_force = 1_000.0 * 60.0 * dt;
+                    }
+                    for step in 0..hz * 12 {
+                        let friction = if step < hz * 2 || step >= hz * 4 {
+                            1.0
+                        } else {
+                            0.3
+                        };
+                        for wheel in &mut controller.wheels {
+                            wheel.friction_slip = friction;
+                            if step >= hz * 4 {
+                                wheel.wheel_coupling_torque = 0.0;
+                                wheel.drive_throttle = 0.0;
+                                wheel.brake = 0.0;
+                            }
+                        }
+                        controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
+                        controller.update_friction(&mut bodies, &colliders, dt);
+                        if step == 0 && !braking {
+                            assert!(controller
+                                .wheels
+                                .iter()
+                                .filter(|w| w.role.driven)
+                                .all(|w| w.angular_velocity * w.radius > 80.0));
+                        }
+                    }
+                    for wheel in controller
+                        .wheels
+                        .iter()
+                        .filter(|w| braking || w.role.driven)
+                    {
+                        let road = bodies[controller.chassis]
+                            .velocity_at_point(&wheel.raycast_info.contact_point_ws)
+                            .z;
+                        let slip = (wheel.angular_velocity * wheel.radius - road)
+                            * if braking { -1.0 } else { 1.0 };
+                        assert_eq!(wheel.traction_control_cut, 0.0);
+                        assert_eq!(wheel.abs_release, 0.0);
+                        assert!(road.abs() <= 1.0 || (!wheel.lock && slip.abs() < 0.1),
+                            "{hz} Hz strength {strength} braking {braking}: recovery slip {slip}, road {road}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn assist_actuator_memory_clears_on_disable_input_release_and_airborne() {
+        for transition in 0..4 {
+            let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(20.0, 0.5);
+            set_test_drive(&mut controller, 1_000.0);
+            controller.current_vehicle_speed = 20.0;
+            for wheel in &mut controller.wheels {
+                wheel.abs_release = 0.8;
+                wheel.traction_control_cut = 0.8;
+                wheel.anti_lock_brake = 0.5;
+                wheel.brake = 1.0;
+                match transition {
+                    0 => {
+                        wheel.anti_lock_brake = 0.0;
+                        wheel.traction_control = 0.0;
+                    }
+                    1 => {
+                        wheel.brake = 0.0;
+                        wheel.wheel_coupling_torque = 0.0;
+                        wheel.drive_throttle = 0.0;
+                    }
+                    2 => {
+                        wheel.raycast_info.ground_object = None;
+                    }
+                    _ => {
+                        wheel.handbrake_overrides_abs = true;
+                        wheel.wheel_coupling_torque = 0.0;
+                        wheel.drive_throttle = 0.0;
+                    }
+                }
+            }
+            controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+            for wheel in &controller.wheels {
+                assert_eq!(wheel.abs_release, 0.0);
+                assert_eq!(wheel.traction_control_cut, 0.0);
+                assert!(!wheel.is_anti_lock_brake);
+            }
+        }
+    }
+
+    #[test]
+    fn tc_launch_wheelspin_reduces_progressively_through_first_gear() {
+        for hz in [30, 60, 120] {
+            let dt = 1.0 / hz as Real;
+            let mut launch_slip = Vec::new();
+            for strength in [0.0, 0.0001, 0.2, 0.3, 0.6, 0.8, 0.95, 1.0] {
+                let (mut controller, mut bodies, colliders) =
+                    four_wheel_test_vehicle(0.0, strength);
+                controller.powertrain.set_gear(1);
+                controller.powertrain.state_mut().current_gear = 1;
+                controller.set_input(VehicleInput {
+                    throttle: 1.0,
+                    ..VehicleInput::default()
+                });
+                let mut early_slip = 0.0;
+                let mut early_samples = 0;
+                let mut max_slip: Real = 0.0;
+                let mut spin_onset_rpm = None;
+                for step in 0..hz * 24 {
+                    controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
+                    let output = controller.update_powertrain(dt);
+                    controller.apply_powertrain_output(output);
+                    controller.update_friction(&mut bodies, &colliders, dt);
+                    let slip = driven_overspeed(&controller, &bodies, 1.0);
+                    if slip > 0.5 && spin_onset_rpm.is_none() {
+                        spin_onset_rpm = Some(controller.state().engine_rpm);
+                    }
+                    max_slip = max_slip.max(slip);
+                    if step < hz {
+                        early_slip += slip;
+                        early_samples += 1;
+                    }
+                    for wheel in controller.wheels.iter().filter(|w| w.role.driven) {
+                        assert!(wheel.traction_control_cut <= strength + 0.000001);
+                    }
+                }
+                let road_speed = bodies[controller.chassis].linvel().z;
+                let first_gear_max = controller.powertrain.config.engine.rev_limit_rpm
+                    * std::f64::consts::TAU as Real
+                    / 60.0
+                    * 0.35
+                    / (controller.powertrain.config.transmission.forward_ratios[0]
+                        * controller.powertrain.config.transmission.final_drive_ratio);
+                assert!(
+                    road_speed > first_gear_max * 0.95,
+                    "{hz} Hz TC {strength}: first gear stalled at {road_speed}"
+                );
+                assert_eq!(controller.state().current_gear, 1);
+                if strength <= 0.6 {
+                    assert!(
+                        spin_onset_rpm.is_some_and(
+                            |rpm| rpm < controller.powertrain.config.engine.max_rpm * 0.6
+                        ),
+                        "{hz} Hz TC {strength}: spin delayed until {spin_onset_rpm:?} RPM"
+                    );
+                }
+                if strength == 1.0 {
+                    assert!(max_slip < 0.1);
+                }
+                launch_slip.push(early_slip / early_samples as Real);
+            }
+            eprintln!("{hz} Hz launch slip: {launch_slip:?}");
+            assert!(
+                launch_slip[2] > 1.0,
+                "weak TC must not eliminate launch spin"
+            );
+            assert!(
+                (launch_slip[0] - launch_slip[1]).abs() < 0.01,
+                "near-zero TC must behave continuously with off"
+            );
+            for pair in launch_slip.windows(2) {
+                assert!(pair[0] > pair[1], "{hz} Hz launch slip: {launch_slip:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn sustained_acceleration_with_wheel_inertia_reaches_automatic_upshifts() {
+        for hz in [30, 60, 120] {
+            for strength in [0.0, 0.2, 0.5, 0.8, 1.0] {
+                let dt = 1.0 / hz as Real;
+                let (mut controller, mut bodies, colliders) =
+                    four_wheel_test_vehicle(0.0, strength);
+                controller.powertrain.config.transmission.automatic = true;
+                controller.set_input(VehicleInput {
+                    throttle: 1.0,
+                    ..VehicleInput::default()
+                });
+                let mut max_gear = 0;
+                let mut negative_power_steps = 0;
+                for _ in 0..hz * 40 {
+                    controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
+                    let output = controller.update_powertrain(dt);
+                    if output.wheel_coupling_torque < 0.0 {
+                        negative_power_steps += 1;
+                    }
+                    controller.apply_powertrain_output(output);
+                    controller.update_friction(&mut bodies, &colliders, dt);
+                    max_gear = max_gear.max(controller.state().current_gear);
+                }
+                let speed = bodies[controller.chassis].linvel().z;
+                eprintln!("{hz} Hz TC {strength}: speed {speed}, gear {max_gear}, negative steps {negative_power_steps}");
+                assert!(
+                    negative_power_steps < hz / 2,
+                    "sustained drive/brake oscillation"
+                );
+                assert!(
+                    speed > 30.0 && max_gear >= 3,
+                    "{hz} Hz TC {strength}: speed {speed}, gear {max_gear}"
+                );
+                if strength >= 0.8 {
+                    let (wheel_speed, radius) = controller.driven_wheel_speed_and_radius();
+                    let ratio = controller.powertrain.config.transmission.forward_ratios
+                        [(controller.state().current_gear - 1) as usize];
+                    let shaft_rpm = wheel_speed / radius
+                        * ratio
+                        * controller.powertrain.config.transmission.final_drive_ratio
+                        * 60.0
+                        / std::f64::consts::TAU as Real;
+                    assert!((controller.state().engine_rpm - shaft_rpm).abs() < 200.0,
+                        "TC must not leave the engine free-revving against controlled wheels: {} / {shaft_rpm}", controller.state().engine_rpm);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tc_memory_survives_limiter_and_overrun_without_cutting_negative_torque() {
+        let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(20.0, 0.5);
+        controller.current_vehicle_speed = 20.0;
+        set_test_drive(&mut controller, 1000.0);
+        for wheel in controller.wheels.iter_mut().filter(|w| w.role.driven) {
+            wheel.traction_control_cut = 0.6;
+            wheel.wheel_coupling_torque = 0.0;
+        }
+        controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+        for wheel in controller.wheels.iter_mut().filter(|w| w.role.driven) {
+            assert_eq!(wheel.traction_control_cut, 0.6);
+            wheel.wheel_coupling_torque = -100.0;
+        }
+        controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+        assert!(controller
+            .wheels
+            .iter()
+            .filter(|w| w.role.driven)
+            .all(|w| w.traction_control_cut == 0.6));
+    }
+
+    #[test]
+    fn progressive_tc_operates_through_powertrain_in_first_sixth_and_reverse() {
+        for hz in [30, 60, 120] {
+            for strength in [0.05, 0.2, 0.5, 0.8, 0.99, 1.0] {
+                for (gear, speed, ratio) in [(1, 0.0, 3.2), (6, 40.0, 0.7), (-1, 0.0, -3.2)] {
+                    let dt = 1.0 / hz as Real;
+                    let (mut controller, mut bodies, colliders) =
+                        four_wheel_test_vehicle(speed, strength);
+                    controller.powertrain.set_gear(gear);
+                    controller.powertrain.state_mut().current_gear = gear;
+                    controller.powertrain.state_mut().engine_rpm =
+                        (speed / 0.35 * ratio * 3.7 * 60.0 / std::f64::consts::TAU as Real)
+                            .max(900.0);
+                    controller.set_input(VehicleInput {
+                        throttle: 1.0,
+                        ..VehicleInput::default()
+                    });
+                    let mut active = false;
+                    for _ in 0..hz * 3 {
+                        controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
+                        let output = controller.update_powertrain(dt);
+                        controller.apply_powertrain_output(output);
+                        controller.update_friction(&mut bodies, &colliders, dt);
+                        for wheel in controller.wheels.iter().filter(|w| w.role.driven) {
+                            active |= wheel.traction_control_cut > 0.0;
+                            assert!(wheel.angular_velocity.is_finite());
+                            if strength == 1.0 {
+                                let road = bodies[controller.chassis]
+                                    .velocity_at_point(&wheel.raycast_info.contact_point_ws)
+                                    .z;
+                                assert!(
+                                    (wheel.angular_velocity * wheel.radius - road) * ratio.signum()
+                                        < 0.1
+                                );
+                            }
+                        }
+                    }
+                    assert!(active);
+                    assert!((bodies[controller.chassis].linvel().z - speed) * ratio.signum() > 0.2);
+                }
+            }
+        }
     }
 
     #[test]
@@ -3547,6 +3976,8 @@ mod tests {
         wheel.delta_rotation = 2.0;
         wheel.target_rotation = 3.0;
         wheel.angular_velocity = 20.0;
+        wheel.abs_release = 0.7;
+        wheel.traction_control_cut = 0.6;
         wheel.traction_control = 0.35;
         wheel.engine_force = 100.0;
         wheel.brake = 0.5;
@@ -3574,6 +4005,8 @@ mod tests {
         assert_eq!(wheel.target_rotation, 0.0);
         assert_eq!(wheel.angular_velocity, 0.0);
         assert_eq!(wheel.traction_control, 0.35);
+        assert_eq!(wheel.traction_control_cut, 0.0);
+        assert_eq!(wheel.abs_release, 0.0);
         assert_eq!(wheel.engine_force, 0.0);
         assert_eq!(wheel.brake, 0.0);
         assert_eq!(wheel.steering, 0.0);

@@ -616,12 +616,35 @@ impl VehiclePowertrain {
         self.manual_override = TRANSMISSION_MANUAL_OVERRIDE;
     }
 
+    #[cfg(test)]
     pub fn update(
         &mut self,
         dt: Real,
         vehicle_speed: Real,
         driven_wheel_speed: Real,
         driven_wheel_radius: Real,
+    ) -> PowertrainOutput {
+        // Callers supplying a prescribed wheel speed do not integrate a wheel inertia.
+        self.update_with_wheel_dynamics(
+            dt,
+            vehicle_speed,
+            driven_wheel_speed,
+            driven_wheel_radius,
+            0.0,
+            0.0,
+            1.0,
+        )
+    }
+
+    pub(super) fn update_with_wheel_dynamics(
+        &mut self,
+        dt: Real,
+        vehicle_speed: Real,
+        driven_wheel_speed: Real,
+        driven_wheel_radius: Real,
+        wheel_inverse_inertia: Real,
+        wheel_load_acceleration: Real,
+        wheel_drive_fraction: Real,
     ) -> PowertrainOutput {
         let dt = dt.clamp(0.0, 0.05);
         let previous_engine_state = self.engine_state();
@@ -650,6 +673,19 @@ impl VehiclePowertrain {
         let signed_wheel_rpm = (driven_wheel_speed / (TAU * driven_wheel_radius.max(0.01))) * 60.0;
         let signed_drivetrain_rpm =
             signed_wheel_rpm * ratio * self.config.transmission.final_drive_ratio;
+        let limit = self
+            .config
+            .engine
+            .rev_limit_rpm
+            .min(self.config.engine.max_rpm);
+        // Limit the torque source before exchanging clutch torque. Cutting only
+        // the wheel output leaves the engine and wheel integrations inconsistent.
+        let limiter_blend = ((self.state.engine_rpm.max(signed_drivetrain_rpm.max(0.0))
+            - limit * 0.97)
+            / (limit * 0.03).max(1.0))
+        .clamp(0.0, 1.0);
+        let limiter_torque_factor =
+            1.0 - limiter_blend * limiter_blend * (3.0 - 2.0 * limiter_blend);
         let available_torque = self.torque_at(self.state.engine_rpm);
         let boost = if self.config.turbo.enabled {
             1.0 + (self.config.turbo.max_boost - 1.0) * self.turbo_load
@@ -668,7 +704,7 @@ impl VehiclePowertrain {
         let idle_combustion_torque = friction_scale * 0.2 * 2.5;
         let combustion_torque = if self.state.engine_running {
             idle_combustion_torque * (1.0 - drive_throttle)
-                + available_torque * drive_throttle * boost
+                + available_torque * drive_throttle * boost * limiter_torque_factor
         } else {
             0.0
         };
@@ -710,6 +746,15 @@ impl VehiclePowertrain {
             signed_drivetrain_rpm,
             clutch_engagement,
             engine_source_torque,
+            ratio.abs()
+                * self.config.transmission.final_drive_ratio
+                * ratio.abs().powf(self.config.engine.gear_force_exponent)
+                * self.config.transmission.final_drive_ratio
+                * self.config.engine.drivetrain_efficiency
+                * self.config.engine.force_scale
+                * wheel_inverse_inertia,
+            ratio * self.config.transmission.final_drive_ratio * wheel_load_acceleration,
+            wheel_drive_fraction,
         );
         let angular_acceleration =
             (engine_source_torque - clutch_torque) / self.config.engine.inertia;
@@ -722,11 +767,6 @@ impl VehiclePowertrain {
             next_rpm = next_rpm.max(self.config.engine.idle_rpm);
         }
 
-        let limit = self
-            .config
-            .engine
-            .rev_limit_rpm
-            .min(self.config.engine.max_rpm);
         let stall_rpm = self.config.engine.idle_rpm * STALL_RPM_RATIO;
         if self.state.engine_starting {
             // The starter owns engine RPM and the clutch stays open until ignition completes.
@@ -753,9 +793,6 @@ impl VehiclePowertrain {
         } else {
             0.0
         };
-        let limiter_blend = self.state.rev_limiter_amount;
-        let limiter_torque_factor =
-            1.0 - limiter_blend * limiter_blend * (3.0 - 2.0 * limiter_blend);
 
         let available_torque = self.torque_at(self.state.engine_rpm);
         let rpm_rate =
@@ -768,12 +805,12 @@ impl VehiclePowertrain {
         let wheel_coupling_torque = if clutch_torque < 0.0 {
             clutch_torque * mechanical_wheel_torque_scale * ratio.signum()
         } else if self.state.engine_running && clutch_torque > 0.0 {
-            clutch_torque * limiter_torque_factor * mechanical_wheel_torque_scale * ratio.signum()
+            clutch_torque * mechanical_wheel_torque_scale * ratio.signum()
         } else {
             0.0
         };
         let drive_torque = if self.state.engine_running && clutch_torque > 0.0 {
-            clutch_torque * limiter_torque_factor * wheel_torque_scale * ratio.signum()
+            clutch_torque * wheel_torque_scale * ratio.signum()
         } else {
             0.0
         };
@@ -862,6 +899,9 @@ impl VehiclePowertrain {
         signed_drivetrain_rpm: Real,
         clutch_engagement: Real,
         engine_source_torque: Real,
+        driveline_inverse_inertia: Real,
+        driveline_load_acceleration: Real,
+        drive_fraction: Real,
     ) -> Real {
         if clutch_engagement <= Real::EPSILON {
             return 0.0;
@@ -880,9 +920,27 @@ impl VehiclePowertrain {
             (1.0 - (-response * dt).exp()) / dt
         };
         let slip = engine_angular_velocity - drivetrain_angular_velocity;
-        let synchronization_torque = self.config.engine.inertia * slip * synchronization_rate;
+        // Both ends of the clutch move. Using engine inertia alone over-corrects
+        // light wheels by the square of the gearing and can reverse torque each tick.
+        let engine_inverse_inertia = 1.0 / self.config.engine.inertia;
+        let correction = engine_source_torque * engine_inverse_inertia
+            + driveline_load_acceleration
+            + slip * synchronization_rate;
+        // TC reduces positive wheel torque, not negative clutch torque. Reflect
+        // that actuator in the wheel response seen by the engine as well.
+        let wheel_response = if correction > 0.0 {
+            drive_fraction.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let coupled_inverse_inertia =
+            engine_inverse_inertia + driveline_inverse_inertia * wheel_response;
+        let synchronization_torque = slip * synchronization_rate / coupled_inverse_inertia;
+        let load_torque = (engine_source_torque * engine_inverse_inertia
+            + driveline_load_acceleration)
+            / coupled_inverse_inertia;
         let capacity = self.peak_torque * CLUTCH_CAPACITY_MULTIPLIER * clutch_engagement;
-        let mut torque = (engine_source_torque + synchronization_torque).clamp(-capacity, capacity);
+        let mut torque = (load_torque + synchronization_torque).clamp(-capacity, capacity);
 
         let stall_protection_rpm =
             self.config.engine.idle_rpm * STALL_RPM_RATIO + STALL_PROTECTION_RPM_MARGIN;
@@ -1630,6 +1688,66 @@ mod tests {
     }
 
     #[test]
+    fn clutch_synchronization_accounts_for_both_inertias_without_overshoot() {
+        let mut powertrain = VehiclePowertrain::new(VehicleControllerConfig::default());
+        for hz in [30, 60, 120] {
+            for wheel_inertia in [1.5, 3.0, 12.0] {
+                for gearing in [2.0, 8.0, 12.0] {
+                    for slip in [-100.0, 100.0] {
+                        let dt = 1.0 / hz as Real;
+                        let engine_speed = 300.0;
+                        let shaft_speed = engine_speed - slip;
+                        powertrain.state.engine_rpm = engine_speed * 60.0 / TAU;
+                        let inverse = gearing * gearing / wheel_inertia;
+                        let torque = powertrain.clutch_torque(
+                            dt,
+                            shaft_speed * 60.0 / TAU,
+                            1.0,
+                            0.0,
+                            inverse,
+                            0.0,
+                            1.0,
+                        );
+                        let engine_after =
+                            engine_speed - torque * dt / powertrain.config.engine.inertia;
+                        let shaft_after = shaft_speed + torque * dt * inverse;
+                        let remaining_slip = engine_after - shaft_after;
+                        assert!(remaining_slip * slip >= 0.0 && remaining_slip.abs() < slip.abs());
+                        let energy_before = powertrain.config.engine.inertia * engine_speed.powi(2)
+                            + shaft_speed.powi(2) / inverse;
+                        let energy_after = powertrain.config.engine.inertia * engine_after.powi(2)
+                            + shaft_after.powi(2) / inverse;
+                        assert!(energy_after <= energy_before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clutch_feedforward_balances_engine_and_external_wheel_acceleration() {
+        let mut powertrain = VehiclePowertrain::new(VehicleControllerConfig::default());
+        powertrain.state.engine_rpm = 3000.0;
+        for inverse in [0.0, 1.0, 50.0] {
+            for source in [-100.0, 0.0, 100.0] {
+                let load_acceleration = 40.0;
+                let torque = powertrain.clutch_torque(
+                    1.0 / 60.0,
+                    3000.0,
+                    1.0,
+                    source,
+                    inverse,
+                    load_acceleration,
+                    1.0,
+                );
+                let engine_acceleration = (source - torque) / powertrain.config.engine.inertia;
+                let shaft_acceleration = torque * inverse - load_acceleration;
+                assert!((engine_acceleration - shaft_acceleration).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
     fn rev_limiter_smoothly_reduces_positive_torque_and_reaches_zero() {
         fn output_at_rpm(rpm_fraction: Real) -> (PowertrainOutput, Real) {
             let mut config = VehicleControllerConfig::default();
@@ -1666,8 +1784,9 @@ mod tests {
         assert_eq!(limit_amount, 1.0);
         assert!(below_taper.drive_torque > inside_taper.drive_torque);
         assert!(inside_taper.drive_torque > 0.0);
-        assert_eq!(at_limit.drive_torque, 0.0);
-        assert_eq!(at_limit.wheel_coupling_torque, 0.0);
+        // RPM-to-angular-speed roundoff can leave a tiny synchronization torque.
+        assert!(at_limit.drive_torque.abs() < 1.0e-8);
+        assert!(at_limit.wheel_coupling_torque.abs() < 1.0e-8);
     }
 
     #[test]
