@@ -25,6 +25,8 @@ const WHEEL_EFFECTIVE_INERTIA: Real = 1.5;
 const WHEEL_STOP_EPSILON: Real = 1.0e-4;
 // Numerical allowance for a rolling constraint, in meters per second.
 const ASSIST_SURFACE_SPEED_TOLERANCE: Real = 0.01;
+// Maximum powered wheel-surface overspeed in m/s; TC strength reduces this gap.
+const TRACTION_CONTROL_MAX_SPEED_GAP: Real = 10.0;
 const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
 
 fn drift_assist_speed_activation(forward_speed: Real) -> Real {
@@ -601,6 +603,20 @@ fn assist_torque_fraction(strength: Real, slip_at_fraction: impl Fn(Real) -> Rea
     // No previous actuator value feeds this solve: weak assistance cannot accumulate
     // into full intervention, even when the wheel remains spinning or locked.
     1.0 - strength * (1.0 - controlled_fraction)
+}
+
+fn traction_control_torque_fraction(
+    strength: Real,
+    slip_at_fraction: impl Fn(Real) -> Real,
+) -> Real {
+    let strength = strength.clamp(0.0, 1.0);
+    if strength == 0.0 {
+        return 1.0;
+    }
+    let allowed_gap = TRACTION_CONTROL_MAX_SPEED_GAP * (1.0 - strength);
+    // Reuse the full correction solve, shifting its target to the allowed gap.
+    // ABS keeps its existing proportional correction and near-zero target.
+    assist_torque_fraction(1.0, |fraction| slip_at_fraction(fraction) - allowed_gap)
 }
 
 impl DynamicRayCastVehicleController {
@@ -1853,7 +1869,7 @@ impl DynamicRayCastVehicleController {
             };
             let drive_cut_for_brake = |brake_impulse: Real| {
                 if powered_acceleration && tc_requested {
-                    1.0 - assist_torque_fraction(wheel.traction_control, |fraction| {
+                    1.0 - traction_control_torque_fraction(wheel.traction_control, |fraction| {
                         let (wheel_speed, road_speed) = predict(fraction, brake_impulse);
                         (wheel_speed - road_speed) * drive_direction
                     })
@@ -2567,7 +2583,7 @@ mod tests {
                         let underspeed = speed - wheel.angular_velocity * wheel.radius;
                         assert!(underspeed.is_finite());
                         assert!(wheel.abs_release <= strength + 0.000001);
-                        assert!(wheel.traction_control_cut <= strength + 0.000001);
+                        assert!(wheel.traction_control_cut <= 1.0);
                         // Only full assistance guarantees recovery under excessive demand.
                         // Allow for later wheels/lateral impulses changing road speed.
                         if strength == 1.0 {
@@ -2630,7 +2646,7 @@ mod tests {
                                     * if braking { -1.0 } else { 1.0 };
                                 assert!(slip.is_finite());
                                 assert!(wheel.abs_release <= strength + 0.000001);
-                                assert!(wheel.traction_control_cut <= strength + 0.000001);
+                                assert!(wheel.traction_control_cut <= 1.0);
                                 locked_steps += usize::from(wheel.lock);
                                 if strength == 0.0 {
                                     assert_eq!(wheel.abs_release, 0.0);
@@ -2659,8 +2675,11 @@ mod tests {
                             "{hz} Hz direction {direction} braking {braking}: {means:?}"
                         );
                     }
-                    assert!(means[2] > means[4] + 0.1);
-                    if !braking {
+                    if braking {
+                        assert!(means[2] > means[4] + 0.1);
+                    } else {
+                        // TC now holds a fixed gap: 0.8 allows one quarter of 0.2's gap.
+                        assert!((means[4] - means[2] * 0.25).abs() < 0.003);
                         assert!(means[4] < means[0] * 0.5);
                     }
                     if braking {
@@ -2670,6 +2689,70 @@ mod tests {
                             lock_counts.windows(2).all(|pair| pair[0] >= pair[1]),
                             "{lock_counts:?}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tc_gap_preview_uses_full_correction_only_above_the_allowance() {
+        assert_eq!(
+            traction_control_torque_fraction(0.0, |_| panic!("TC off")),
+            1.0
+        );
+        for strength in [0.0001, 0.2, 0.4, 0.6, 0.8, 1.0] {
+            let gap = TRACTION_CONTROL_MAX_SPEED_GAP * (1.0 - strength);
+            assert_eq!(traction_control_torque_fraction(strength, |_| gap), 1.0);
+            assert_eq!(traction_control_torque_fraction(strength, |_| -10.0), 1.0);
+            let uncontrolled_gap = TRACTION_CONTROL_MAX_SPEED_GAP * 2.0;
+            let fraction = traction_control_torque_fraction(strength, |f| uncontrolled_gap * f);
+            assert!(
+                (fraction - (gap + ASSIST_SURFACE_SPEED_TOLERANCE) / uncontrolled_gap).abs()
+                    < 0.000001
+            );
+            assert_eq!(
+                traction_control_torque_fraction(strength, |_| gap + 1.0),
+                0.0
+            );
+        }
+    }
+
+    #[test]
+    fn tc_gap_is_independent_of_road_speed_and_excess_torque() {
+        for hz in [30, 60, 120] {
+            for direction in [-1.0, 1.0] {
+                for speed in [0.0, 40.0] {
+                    for torque in [10.0, 1_000.0, 3_000.0] {
+                        for strength in [0.2, 0.4, 0.6, 0.8, 1.0] {
+                            let (mut controller, mut bodies, colliders) =
+                                four_wheel_test_vehicle(speed * direction, strength);
+                            set_test_drive(&mut controller, torque * direction);
+                            let dt = 1.0 / hz as Real;
+                            let allowance = TRACTION_CONTROL_MAX_SPEED_GAP * (1.0 - strength);
+                            for _ in 0..hz * 2 {
+                                controller.current_vehicle_speed =
+                                    bodies[controller.chassis].linvel().z;
+                                controller.update_friction(&mut bodies, &colliders, dt);
+                                let slip = driven_overspeed(&controller, &bodies, direction);
+                                assert!(
+                                    slip < allowance + 0.1,
+                                    "{hz} Hz speed {speed} torque {torque} TC {strength}: {slip}"
+                                );
+                                if torque == 10.0 {
+                                    assert!(controller
+                                        .wheels
+                                        .iter()
+                                        .all(|w| w.traction_control_cut == 0.0));
+                                    assert!(slip < 0.1, "TC must not manufacture wheelspin");
+                                }
+                            }
+                            let final_slip = driven_overspeed(&controller, &bodies, direction);
+                            if torque >= 1_000.0 {
+                                assert!((final_slip - allowance).abs() < 0.1,
+                                    "{hz} Hz torque {torque} TC {strength}: failed to hold gap {final_slip}/{allowance}");
+                            }
+                        }
                     }
                 }
             }
@@ -2834,7 +2917,7 @@ mod tests {
                         early_samples += 1;
                     }
                     for wheel in controller.wheels.iter().filter(|w| w.role.driven) {
-                        assert!(wheel.traction_control_cut <= strength + 0.000001);
+                        assert!(wheel.traction_control_cut <= 1.0);
                     }
                 }
                 let road_speed = bodies[controller.chassis].linvel().z;
@@ -2857,8 +2940,12 @@ mod tests {
                         "{hz} Hz TC {strength}: spin delayed until {spin_onset_rpm:?} RPM"
                     );
                 }
-                if strength == 1.0 {
-                    assert!(max_slip < 0.1);
+                if strength > 0.0 {
+                    let allowed_gap = TRACTION_CONTROL_MAX_SPEED_GAP * (1.0 - strength);
+                    assert!(
+                        max_slip < allowed_gap + 0.1,
+                        "{hz} Hz TC {strength}: maximum slip {max_slip}, allowance {allowed_gap}"
+                    );
                 }
                 launch_slip.push(early_slip / early_samples as Real);
             }
@@ -2867,10 +2954,7 @@ mod tests {
                 launch_slip[2] > 1.0,
                 "weak TC must not eliminate launch spin"
             );
-            assert!(
-                (launch_slip[0] - launch_slip[1]).abs() < 0.01,
-                "near-zero TC must behave continuously with off"
-            );
+            assert!(launch_slip[1] < TRACTION_CONTROL_MAX_SPEED_GAP + 0.1);
             for pair in launch_slip.windows(2) {
                 assert!(pair[0] > pair[1], "{hz} Hz launch slip: {launch_slip:?}");
             }
@@ -2975,13 +3059,13 @@ mod tests {
                         for wheel in controller.wheels.iter().filter(|w| w.role.driven) {
                             active |= wheel.traction_control_cut > 0.0;
                             assert!(wheel.angular_velocity.is_finite());
-                            if strength == 1.0 {
+                            if strength > 0.0 {
                                 let road = bodies[controller.chassis]
                                     .velocity_at_point(&wheel.raycast_info.contact_point_ws)
                                     .z;
                                 assert!(
                                     (wheel.angular_velocity * wheel.radius - road) * ratio.signum()
-                                        < 0.1
+                                        < TRACTION_CONTROL_MAX_SPEED_GAP * (1.0 - strength) + 0.1
                                 );
                             }
                         }
