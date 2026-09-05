@@ -27,6 +27,11 @@ const WHEEL_STOP_EPSILON: Real = 1.0e-4;
 const ASSIST_SURFACE_SPEED_TOLERANCE: Real = 0.01;
 // Maximum powered wheel-surface overspeed in m/s; TC strength reduces this gap.
 const TRACTION_CONTROL_MAX_SPEED_GAP: Real = 10.0;
+// Handling approximation: soften lateral demand only during powered wheelspin.
+// These are independent of the TC speed-gap target.
+const WHEELSPIN_LATERAL_START_GAP: Real = 0.1;
+const WHEELSPIN_LATERAL_FULL_GAP: Real = 10.0;
+const WHEELSPIN_LATERAL_MIN_MULTIPLIER: Real = 0.1;
 const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
 
 fn drift_assist_speed_activation(forward_speed: Real) -> Real {
@@ -489,6 +494,31 @@ fn steering_positive_side(
 fn wheel_angular_inertia(radius: Real) -> Real {
     let radius_scale = radius.max(0.01) / WHEEL_REFERENCE_RADIUS;
     (WHEEL_EFFECTIVE_INERTIA * radius_scale * radius_scale).max(Real::EPSILON)
+}
+
+fn powered_wheelspin_lateral_multiplier(wheel: &Wheel, road_speed: Real, brake: Real) -> Real {
+    let direction = wheel.target_rotation.signum();
+    let surface_speed = wheel.angular_velocity * wheel.radius;
+    if !wheel.role.driven
+        || !wheel.raycast_info.is_in_contact
+        || !wheel.drivetrain_connected
+        || wheel.drive_throttle <= 0.0
+        || brake > 0.0
+        || wheel.target_rotation == 0.0
+        || surface_speed * direction <= 0.0
+    {
+        return 1.0;
+    }
+    // Use held throttle and existing spin, not instantaneous torque: a limiter
+    // cut must not restore lateral grip for one tick. No persistent blend state.
+    let excess = (surface_speed - road_speed) * direction;
+    let normalized = ((excess - WHEELSPIN_LATERAL_START_GAP)
+        / (WHEELSPIN_LATERAL_FULL_GAP - WHEELSPIN_LATERAL_START_GAP))
+        .clamp(0.0, 1.0);
+    let smoothstep = normalized * normalized * (3.0 - 2.0 * normalized);
+    // Delay strong lateral reduction until heavier spin, retaining smooth endpoints.
+    let blend = smoothstep * smoothstep;
+    WHEELSPIN_LATERAL_MIN_MULTIPLIER + (1.0 - WHEELSPIN_LATERAL_MIN_MULTIPLIER) * (1.0 - blend)
 }
 
 // Solve rolling contact and the bounded brake torque together. A brake that
@@ -1886,6 +1916,10 @@ impl DynamicRayCastVehicleController {
                 continue;
             }
 
+            // Freeze this step's spin-dependent demand for both assist previews
+            // and the final friction-circle solve. Keep configured stiffness intact.
+            wheel.side_impulse *=
+                powered_wheelspin_lateral_multiplier(wheel, contact.forward_speed, brake);
             let side_total = wheel.side_impulse * wheel.side_factor;
             let forward_friction_limit = contact.friction_limit;
             let side_utilization_squared = if contact.friction_limit > Real::EPSILON {
@@ -3543,6 +3577,119 @@ mod tests {
 
         assert_eq!(reference, WHEEL_EFFECTIVE_INERTIA);
         assert!((doubled - reference * 4.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn wheelspin_lateral_multiplier_uses_local_road_speed_and_drive_direction() {
+        for direction in [-1.0, 1.0] {
+            for road_speed in [0.0, 10.0, 50.0] {
+                let mut wheel = test_wheel();
+                wheel.target_rotation *= direction;
+                let mut previous = 1.0;
+                for gap in [0.0, 0.05, 0.1, 1.0, 5.0, 10.0, 20.0] {
+                    wheel.angular_velocity = (road_speed + gap) * direction / wheel.radius;
+                    let multiplier =
+                        powered_wheelspin_lateral_multiplier(&wheel, road_speed * direction, 0.0);
+                    assert!(multiplier <= previous + 1.0e-5);
+                    assert!(multiplier >= WHEELSPIN_LATERAL_MIN_MULTIPLIER - 1.0e-5);
+                    if gap <= WHEELSPIN_LATERAL_START_GAP {
+                        assert!((multiplier - 1.0).abs() < 1.0e-5);
+                    } else if gap >= WHEELSPIN_LATERAL_FULL_GAP {
+                        assert!((multiplier - WHEELSPIN_LATERAL_MIN_MULTIPLIER).abs() < 1.0e-5);
+                    }
+                    previous = multiplier;
+                }
+                wheel.angular_velocity = (road_speed + 0.05) * direction / wheel.radius;
+                assert!(
+                    (powered_wheelspin_lateral_multiplier(&wheel, road_speed * direction, 0.0)
+                        - 1.0)
+                        .abs()
+                        < 1.0e-5,
+                    "regrip must have no timer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wheelspin_lateral_multiplier_delays_reduction_with_squared_smoothstep() {
+        let mut wheel = test_wheel();
+        // Samples at one quarter, half, and three quarters of the active gap range.
+        for (progress, expected) in [(0.25, 0.97802734375), (0.5, 0.775), (0.75, 0.35927734375)] {
+            let gap = WHEELSPIN_LATERAL_START_GAP
+                + progress * (WHEELSPIN_LATERAL_FULL_GAP - WHEELSPIN_LATERAL_START_GAP);
+            wheel.angular_velocity = (10.0 + gap) / wheel.radius;
+            let multiplier = powered_wheelspin_lateral_multiplier(&wheel, 10.0, 0.0);
+            assert!((multiplier - expected).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn wheelspin_lateral_multiplier_bypasses_braking_coasting_and_non_driven_wheels() {
+        for case in 0..8 {
+            let mut wheel = test_wheel();
+            wheel.angular_velocity = 20.0 / wheel.radius;
+            let mut brake = 0.0;
+            match case {
+                0 => wheel.role.driven = false,
+                1 => wheel.raycast_info.is_in_contact = false,
+                2 => wheel.drivetrain_connected = false,
+                3 => wheel.drive_throttle = 0.0,
+                4 => brake = 0.1,
+                5 => wheel.target_rotation = 0.0,
+                6 => wheel.angular_velocity = 0.0,
+                _ => wheel.angular_velocity = 5.0 / wheel.radius,
+            }
+            assert_eq!(
+                powered_wheelspin_lateral_multiplier(&wheel, 10.0, brake),
+                1.0,
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn wheelspin_lateral_multiplier_survives_limiter_torque_cuts() {
+        let mut wheel = test_wheel();
+        wheel.angular_velocity = 20.0 / wheel.radius;
+        for torque in [500.0, 0.0, -100.0] {
+            wheel.wheel_coupling_torque = torque;
+            assert!(
+                (powered_wheelspin_lateral_multiplier(&wheel, 10.0, 0.0)
+                    - WHEELSPIN_LATERAL_MIN_MULTIPLIER)
+                    .abs()
+                    < 1.0e-5
+            );
+        }
+    }
+
+    #[test]
+    fn powered_wheelspin_softens_contact_lateral_demand_without_retuning_the_wheel() {
+        for hz in [30, 60, 120] {
+            let mut impulses = Vec::new();
+            for spinning in [false, true] {
+                let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(10.0, 0.0);
+                bodies[controller.chassis].set_linvel(Vector::new(1.0, 0.0, 10.0), true);
+                set_test_drive(&mut controller, 100.0);
+                for wheel in &mut controller.wheels {
+                    wheel.wheel_suspension_force = 1.0e8;
+                    if spinning && wheel.role.driven {
+                        wheel.angular_velocity += 20.0 / wheel.radius;
+                    }
+                }
+                controller.update_friction(&mut bodies, &colliders, 1.0 / hz as Real);
+                assert_eq!(controller.wheels[2].side_friction_stiffness, 1.0);
+                assert_eq!(controller.wheels[2].contact_damping, 0.15);
+                impulses.push((
+                    controller.wheels[0].side_impulse,
+                    controller.wheels[2].side_impulse,
+                ));
+            }
+            assert!((impulses[1].0 - impulses[0].0).abs() < 0.001);
+            assert!(
+                (impulses[1].1 - impulses[0].1 * WHEELSPIN_LATERAL_MIN_MULTIPLIER).abs() < 0.001
+            );
+        }
     }
 
     #[test]
