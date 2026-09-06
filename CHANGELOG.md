@@ -259,7 +259,6 @@ without affecting performance of the other parts of the simulation.
   the joint’s anchor and reference orientation.
 - Add `EffectiveCharacterMovement::is_sliding_down_slope` to indicate if the character controlled by the kinematic
   character controller is sliding on a slope that is too steep.
-- Add `Wheel::side_friction_stiffness` to customize the side friction applied to the vehicle controller’s wheel.
 - Add `Wheel::raycast_info` to access more wheel information relative to the ground.
 - Add `DebugRenderStyle::disabled_color_multiplier` to make the debug-renderer color disabled object differently.
 - Fix incorrect update of angular degrees-of-freedoms on spherical multibody joints.

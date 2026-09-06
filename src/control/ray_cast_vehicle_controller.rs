@@ -92,8 +92,6 @@ pub struct WheelTuning {
     pub suspension_damping: Real,
     /// The maximum distance the suspension can travel before and after its resting length.
     pub max_suspension_travel: Real,
-    /// The multiplier of friction between a tire and the collider it's on top of.
-    pub side_friction_stiffness: Real,
     /// Parameter controlling how much traction the tire has.
     ///
     /// The larger the value, the more instantaneous braking will happen (with the risk of
@@ -112,7 +110,6 @@ impl Default for WheelTuning {
             suspension_compression: 0.83,
             suspension_damping: 0.88,
             max_suspension_travel: 5.0,
-            side_friction_stiffness: 1.0,
             friction_slip: 10.5,
             max_suspension_force: 6000.0,
             tire_type: "default".to_string(),
@@ -154,8 +151,6 @@ struct WheelDesc {
     pub friction_slip: Real,
     /// The maximum force applied by the suspension.
     pub max_suspension_force: Real,
-    /// The multiplier of friction between a tire and the collider it's on top of.
-    pub side_friction_stiffness: Real,
     /// The type of tire for friction calculations
     pub tire_type: String,
     /// The wheel's role in the vehicle drivetrain.
@@ -200,8 +195,6 @@ pub struct Wheel {
     /// The larger the value, the more instantaneous braking will happen (with the risk of
     /// causing the vehicle to flip if it’s too strong).
     pub friction_slip: Real,
-    /// The multiplier of friction between a tire and the collider it's on top of.
-    pub side_friction_stiffness: Real,
     /// The wheel’s current rotation on its axle.
     pub rotation: Real,
     /// The change in rotation since the last update.
@@ -249,8 +242,6 @@ pub struct Wheel {
     pub side_factor: Real,
     /// The forward factor for the wheel, used to calculate the forward impulse.
     pub fwd_factor: Real,
-    /// The brake factor for the wheel, used to calculate the brake impulse.
-    pub brake_factor: Real,
     /// The damping applied to the contact point of the wheel.
     pub contact_damping: Real,
     lock: bool,
@@ -325,7 +316,6 @@ impl Wheel {
             side_impulse: 0.0,
             brake_impulse: 0.0,
             forward_impulse: 0.0,
-            side_friction_stiffness: info.side_friction_stiffness,
             lock: false,
             tire_type: info.tire_type,
             suspension_compression_rate: 0.0,
@@ -333,7 +323,6 @@ impl Wheel {
             ground_type: String::new(),
             side_factor: 1.0,
             fwd_factor: 1.0,
-            brake_factor: 1.0,
             contact_damping: 0.2,
             role: info.role,
         }
@@ -661,8 +650,25 @@ fn traction_control_torque_fraction(
     }
     let allowed_gap = TRACTION_CONTROL_MAX_SPEED_GAP * (1.0 - strength);
     // Reuse the full correction solve, shifting its target to the allowed gap.
-    // ABS keeps its existing proportional correction and near-zero target.
     assist_torque_fraction(1.0, |fraction| slip_at_fraction(fraction) - allowed_gap)
+}
+
+fn anti_lock_brake_torque_fraction(
+    strength: Real,
+    direction: Real,
+    speeds_at_fraction: impl Fn(Real) -> (Real, Real),
+) -> Real {
+    let strength = strength.clamp(0.0, 1.0);
+    if strength == 0.0 {
+        return 1.0;
+    }
+    // Strength sets permitted wheel underspeed relative to road speed, not a
+    // brake-release cap. Every enabled level can fully release an existing lock.
+    let allowed_slip_ratio = 1.0 - strength;
+    assist_torque_fraction(1.0, |fraction| {
+        let (wheel_speed, road_speed) = speeds_at_fraction(fraction);
+        (road_speed - wheel_speed) * direction - road_speed.abs() * allowed_slip_ratio
+    })
 }
 
 impl DynamicRayCastVehicleController {
@@ -946,7 +952,6 @@ impl DynamicRayCastVehicleController {
             friction_slip: tuning.friction_slip,
             max_suspension_travel: tuning.max_suspension_travel,
             max_suspension_force: tuning.max_suspension_force,
-            side_friction_stiffness: tuning.side_friction_stiffness,
             tire_type: tuning.tire_type.clone(),
             role,
         };
@@ -1849,7 +1854,7 @@ impl DynamicRayCastVehicleController {
                 &wheel.raycast_info.contact_point_ws,
                 &side_dir,
                 wheel.contact_damping,
-            ) * wheel.side_friction_stiffness;
+            );
         }
 
         let mut drive_torques: Vec<_> = self
@@ -1979,7 +1984,7 @@ impl DynamicRayCastVehicleController {
             let predict = |drive_fraction: Real, brake_impulse: Real| {
                 let (drive_velocity, forward, braking) = solve(drive_fraction, brake_impulse);
                 // Predict the same weighted friction-circle scaling applied below.
-                let demand = forward * wheel.fwd_factor + braking * wheel.brake_factor;
+                let demand = forward * wheel.fwd_factor + braking;
                 let forward_utilization = if forward_friction_limit > Real::EPSILON {
                     (demand / forward_friction_limit).powi(2)
                 } else if demand.abs() > Real::EPSILON {
@@ -2014,12 +2019,15 @@ impl DynamicRayCastVehicleController {
                 && self.current_vehicle_speed.abs() > 1.0
                 && contact.forward_speed.abs() > 1.0
             {
-                assist_torque_fraction(wheel.anti_lock_brake, |fraction| {
-                    let brake_impulse = requested_brake_impulse * fraction;
-                    let cut = drive_cut_for_brake(brake_impulse);
-                    let (wheel_speed, road_speed) = predict(1.0 - cut, brake_impulse);
-                    (road_speed - wheel_speed) * contact.forward_speed.signum()
-                })
+                anti_lock_brake_torque_fraction(
+                    wheel.anti_lock_brake,
+                    contact.forward_speed.signum(),
+                    |fraction| {
+                        let brake_impulse = requested_brake_impulse * fraction;
+                        let cut = drive_cut_for_brake(brake_impulse);
+                        predict(1.0 - cut, brake_impulse)
+                    },
+                )
             } else {
                 1.0
             };
@@ -2042,8 +2050,7 @@ impl DynamicRayCastVehicleController {
             wheel.brake_impulse = braking;
             wheel.engine_force_feedback = forward + braking;
 
-            let forward_total =
-                wheel.forward_impulse * wheel.fwd_factor + wheel.brake_impulse * wheel.brake_factor;
+            let forward_total = wheel.forward_impulse * wheel.fwd_factor + wheel.brake_impulse;
             let forward_utilization_squared = if forward_friction_limit > Real::EPSILON {
                 (forward_total / forward_friction_limit).powi(2)
             } else if forward_total.abs() > Real::EPSILON {
@@ -2565,6 +2572,146 @@ mod tests {
     }
 
     #[test]
+    fn abs_slip_target_scales_with_speed_without_limiting_brake_release() {
+        assert_eq!(
+            anti_lock_brake_torque_fraction(0.0, 1.0, |_| panic!("ABS off")),
+            1.0
+        );
+        for strength in [0.05, 0.2, 0.5, 0.8, 1.0] {
+            for speed in [2.0, 20.0, 80.0] {
+                for direction in [-1.0, 1.0] {
+                    let allowance = speed * (1.0 - strength);
+                    let fraction = anti_lock_brake_torque_fraction(strength, direction, |f| {
+                        (speed * (1.0 - 2.0 * f) * direction, speed * direction)
+                    });
+                    assert!(
+                        (fraction - (allowance + ASSIST_SURFACE_SPEED_TOLERANCE) / (2.0 * speed))
+                            .abs()
+                            < 0.000001
+                    );
+                    // Below the target, ABS must not manufacture braking slip.
+                    assert_eq!(
+                        anti_lock_brake_torque_fraction(strength, direction, |_| {
+                            (speed * direction, speed * direction)
+                        }),
+                        1.0
+                    );
+                    // A locked wheel can require full release at any enabled strength.
+                    assert_eq!(
+                        anti_lock_brake_torque_fraction(strength, direction, |_| {
+                            (0.0, speed * direction)
+                        }),
+                        0.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_abs_controls_slip_on_low_grip_and_surface_changes() {
+        for hz in [30, 60, 120] {
+            for direction in [-1.0, 1.0] {
+                for speed in [20.0, 60.0] {
+                    for strength in [0.0, 0.05, 0.2, 0.5, 0.8, 1.0] {
+                        for initial_grip in [0.05, 0.2, 1.0] {
+                            let dt = 1.0 / hz as Real;
+                            let (mut controller, mut bodies, colliders) =
+                                four_wheel_test_vehicle(speed * direction, 0.0);
+                            for wheel in &mut controller.wheels {
+                                wheel.anti_lock_brake = strength;
+                                wheel.brake = 1.0;
+                                wheel.max_brake_force = 3_000.0 * 60.0 * dt;
+                                wheel.friction_slip = 1.0;
+                            }
+                            let mut locked = false;
+                            let mut maximum_release: Real = 0.0;
+                            for step in 0..hz {
+                                let grip = if step < hz / 2 { initial_grip } else { 0.05 };
+                                controller
+                                    .tire_types
+                                    .get_mut("default")
+                                    .unwrap()
+                                    .default_friction = grip;
+                                controller.current_vehicle_speed =
+                                    bodies[controller.chassis].linvel().z;
+                                controller.update_friction(&mut bodies, &colliders, dt);
+                                for wheel in &controller.wheels {
+                                    locked |= wheel.lock;
+                                    maximum_release = maximum_release.max(wheel.abs_release);
+                                    if strength > 0.0 {
+                                        let road = bodies[controller.chassis]
+                                            .velocity_at_point(&wheel.raycast_info.contact_point_ws)
+                                            .z;
+                                        let slip = (road - wheel.angular_velocity * wheel.radius)
+                                            * direction;
+                                        assert!(!wheel.lock && slip <= road.abs() * (1.0 - strength) + 0.1,
+                                            "{hz} Hz speed {speed} direction {direction} grip {grip} ABS {strength}: slip {slip}, road {road}");
+                                    }
+                                }
+                            }
+                            assert_eq!(locked, strength == 0.0);
+                            if strength > 0.0 && strength < 1.0 {
+                                assert!(maximum_release > strength,
+                                    "ABS {strength} must release beyond the old strength cap: {maximum_release}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_abs_releases_existing_lock_on_low_grip() {
+        for hz in [30, 60, 120] {
+            for direction in [-1.0, 1.0] {
+                for strength in [0.05, 0.2, 0.5, 0.8] {
+                    let dt = 1.0 / hz as Real;
+                    let (mut controller, mut bodies, colliders) =
+                        four_wheel_test_vehicle(40.0 * direction, 0.0);
+                    controller
+                        .tire_types
+                        .get_mut("default")
+                        .unwrap()
+                        .default_friction = 0.05;
+                    controller.current_vehicle_speed = 40.0 * direction;
+                    for wheel in &mut controller.wheels {
+                        wheel.anti_lock_brake = strength;
+                        wheel.angular_velocity = 0.0;
+                        wheel.brake = 1.0;
+                        wheel.max_brake_force = 3_000.0 * 60.0 * dt;
+                        wheel.friction_slip = 1.0;
+                    }
+                    controller.update_friction(&mut bodies, &colliders, dt);
+                    for wheel in &controller.wheels {
+                        assert_eq!(wheel.abs_release, 1.0);
+                        assert!(!wheel.lock && wheel.angular_velocity * direction > 0.0);
+                        assert!(
+                            wheel.angular_velocity.abs() * wheel.radius < 2.0,
+                            "recovery must integrate tire torque, not snap to road speed"
+                        );
+                    }
+                    // Very low grip needs several seconds to spin an already locked
+                    // wheel back up through its physical inertia.
+                    for _ in 0..hz * 8 {
+                        controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
+                        controller.update_friction(&mut bodies, &colliders, dt);
+                    }
+                    for wheel in &controller.wheels {
+                        let road = bodies[controller.chassis]
+                            .velocity_at_point(&wheel.raycast_info.contact_point_ws)
+                            .z;
+                        let slip = (road - wheel.angular_velocity * wheel.radius) * direction;
+                        assert!(!wheel.lock && slip <= road.abs() * (1.0 - strength) + 0.1,
+                            "{hz} Hz direction {direction} ABS {strength}: recovery slip {slip}, road {road}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn full_abs_prevents_braking_lock_with_useful_deceleration() {
         for hz in [30, 60, 120] {
             for direction in [-1.0, 1.0] {
@@ -2719,10 +2866,13 @@ mod tests {
                         );
                         let underspeed = speed - wheel.angular_velocity * wheel.radius;
                         assert!(underspeed.is_finite());
-                        assert!(wheel.abs_release <= strength + 0.000001);
+                        assert!((0.0..=1.0).contains(&wheel.abs_release));
                         assert!(wheel.traction_control_cut <= 1.0);
-                        // Only full assistance guarantees recovery under excessive demand.
                         // Allow for later wheels/lateral impulses changing road speed.
+                        assert!(
+                            !wheel.lock && underspeed < speed.abs() * (1.0 - strength + 0.03),
+                            "{hz} Hz strength {strength} cornering: underspeed {underspeed}"
+                        );
                         if strength == 1.0 {
                             assert!(
                                 !wheel.lock && underspeed < speed.abs() * 0.03,
@@ -2782,7 +2932,7 @@ mod tests {
                                     * direction
                                     * if braking { -1.0 } else { 1.0 };
                                 assert!(slip.is_finite());
-                                assert!(wheel.abs_release <= strength + 0.000001);
+                                assert!((0.0..=1.0).contains(&wheel.abs_release));
                                 assert!(wheel.traction_control_cut <= 1.0);
                                 locked_steps += usize::from(wheel.lock);
                                 if strength == 0.0 {
@@ -2820,12 +2970,8 @@ mod tests {
                         assert!(means[4] < means[0] * 0.5);
                     }
                     if braking {
-                        assert!(lock_counts[2] > 0, "weak ABS must still permit lock");
-                        assert_eq!(lock_counts[6], 0);
-                        assert!(
-                            lock_counts.windows(2).all(|pair| pair[0] >= pair[1]),
-                            "{lock_counts:?}"
-                        );
+                        assert!(lock_counts[0] > 0, "ABS off must still permit lock");
+                        assert!(lock_counts[1..].iter().all(|count| *count == 0));
                     }
                 }
             }
@@ -3294,7 +3440,6 @@ mod tests {
                     wheel.brake = 0.2;
                     wheel.anti_lock_brake = abs;
                     wheel.last_skid_info = 0.1;
-                    wheel.brake_factor = 1.1;
                     wheel.angular_velocity = bodies[controller.chassis]
                         .velocity_at_point(&wheel.raycast_info.contact_point_ws)
                         .z
@@ -3525,7 +3670,7 @@ mod tests {
                     let wheel = &controller.wheels[0];
                     let weighted_forward = (wheel.forward_impulse - wheel.brake_impulse)
                         * wheel.fwd_factor
-                        + wheel.brake_impulse * wheel.brake_factor;
+                        + wheel.brake_impulse;
                     let weighted_side = wheel.side_impulse * wheel.side_factor;
                     let expected = wheel.wheel_suspension_force
                         * dt
@@ -3640,7 +3785,6 @@ mod tests {
             damping_relaxation: 0.88,
             friction_slip: 10.5,
             max_suspension_force: 6000.0,
-            side_friction_stiffness: 1.0,
             tire_type: "default".to_string(),
             role: WheelRole::new(WheelAxle::Rear, true, false),
         });
@@ -3761,7 +3905,6 @@ mod tests {
                     }
                 }
                 controller.update_friction(&mut bodies, &colliders, 1.0 / hz as Real);
-                assert_eq!(controller.wheels[2].side_friction_stiffness, 1.0);
                 assert_eq!(controller.wheels[2].contact_damping, 0.15);
                 impulses.push((
                     controller.wheels[0].side_impulse,

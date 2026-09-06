@@ -86,7 +86,6 @@ pub fn init_world(testbed: &mut Testbed) {
         suspension_compression: 2.0,
         suspension_damping: 2.599_999_904_632_568_4,
         max_suspension_travel: 0.25,
-        side_friction_stiffness: 1.1,
         friction_slip: 1.2,
         max_suspension_force: 20_000.0,
         tire_type: "road".to_string(),
