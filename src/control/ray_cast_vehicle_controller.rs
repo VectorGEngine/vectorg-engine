@@ -229,7 +229,7 @@ pub struct Wheel {
     pub engine_force: Real,
     /// The maximum brakking multiplier applied to this wheel.
     pub brake: Real,
-    /// The maximum amount of braking impulse applied to slow down the vehicle.
+    /// The maximum braking force applied by this wheel, in newtons.
     pub max_brake_force: Real,
     /// The anti-lock braking system strength applied to this wheel.
     pub anti_lock_brake: Real,
@@ -1931,9 +1931,9 @@ impl DynamicRayCastVehicleController {
             } else {
                 0.0
             };
-            // Make the brake response quadratic to make it less sensitive at low values and more sensitive at high values.
-            let brake = (wheel.brake.powi(2) + esc_brake).clamp(0.0, 1.0);
-            let requested_brake_impulse = wheel.max_brake_force * brake;
+
+            let brake = (wheel.brake + esc_brake).clamp(0.0, 1.0);
+            let requested_brake_impulse = wheel.max_brake_force * brake * dt;
 
             if !contact.is_grounded {
                 wheel.sliding_grip = 1.0;
@@ -3084,7 +3084,7 @@ mod tests {
                     four_wheel_test_vehicle(10.0 * direction, 1.0);
                 for wheel in &mut controller.wheels {
                     wheel.brake = 1.0;
-                    wheel.max_brake_force = 3_000.0 * 60.0 * dt;
+                    wheel.max_brake_force = 180_000.0;
                     wheel.anti_lock_brake = 0.0;
                     wheel.friction_slip = 1.0;
                 }
@@ -3130,7 +3130,7 @@ mod tests {
                             wheel.angular_velocity = 0.0;
                             wheel.anti_lock_brake = 0.0;
                             wheel.brake = 1.0;
-                            wheel.max_brake_force = 3_000.0 * 60.0 * dt;
+                            wheel.max_brake_force = 180_000.0;
                             wheel.friction_slip = 1.0;
                             if wheel.role.steered {
                                 wheel.steering = steering;
@@ -3306,7 +3306,7 @@ mod tests {
                     * dt
                     * wheel.friction_slip
                     * 0.85,
-                brake_budget: wheel.max_brake_force * brake * wheel.radius,
+                brake_budget: wheel.max_brake_force * brake * dt * wheel.radius,
             };
             let expected = contact.solve();
             controller.update_friction(&mut bodies, &colliders, dt);
@@ -3333,7 +3333,7 @@ mod tests {
                                 wheel.max_suspension_force = cap;
                                 wheel.brake = brake;
                                 wheel.anti_lock_brake = assist;
-                                wheel.max_brake_force = 3000.0 * 60.0 / hz as Real;
+                                wheel.max_brake_force = 180_000.0;
                             }
                             controller.update_friction(&mut bodies, &colliders, 1.0 / hz as Real);
                             let result: Vec<_> = controller
@@ -3418,7 +3418,7 @@ mod tests {
                     four_wheel_test_vehicle(20.0 * direction, 0.0);
                 for wheel in &mut controller.wheels {
                     wheel.brake = 1.0;
-                    wheel.max_brake_force = 5.0 * 60.0 * dt;
+                    wheel.max_brake_force = 300.0;
                     wheel.anti_lock_brake = 0.0;
                     wheel.friction_slip = 1.0;
                 }
@@ -3444,7 +3444,7 @@ mod tests {
                 let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(speed, 0.0);
                 for wheel in &mut controller.wheels {
                     wheel.brake = 1.0;
-                    wheel.max_brake_force = 3_000.0 * 60.0 * dt;
+                    wheel.max_brake_force = 180_000.0;
                     wheel.anti_lock_brake = 0.0;
                     wheel.friction_slip = 1.0;
                 }
@@ -3551,7 +3551,7 @@ mod tests {
                             for wheel in &mut controller.wheels {
                                 wheel.anti_lock_brake = strength;
                                 wheel.brake = 1.0;
-                                wheel.max_brake_force = 3_000.0 * 60.0 * dt;
+                                wheel.max_brake_force = 180_000.0;
                                 wheel.friction_slip = 1.0;
                             }
                             let mut locked = false;
@@ -3610,7 +3610,7 @@ mod tests {
                         wheel.anti_lock_brake = strength;
                         wheel.angular_velocity = 0.0;
                         wheel.brake = 1.0;
-                        wheel.max_brake_force = 3_000.0 * 60.0 * dt;
+                        wheel.max_brake_force = 180_000.0;
                         wheel.friction_slip = 1.0;
                     }
                     controller.update_friction(&mut bodies, &colliders, dt);
@@ -3656,7 +3656,7 @@ mod tests {
                     });
                     for wheel in &mut controller.wheels {
                         wheel.brake = 1.0;
-                        wheel.max_brake_force = 3_000.0 * 60.0 * dt;
+                        wheel.max_brake_force = 180_000.0;
                         wheel.anti_lock_brake = abs;
                         wheel.friction_slip = 1.0;
                         // Start from rolling contact, not a pre-seeded ABS signal.
@@ -3711,7 +3711,7 @@ mod tests {
                         wheel.last_skid_info = 1.0;
                         wheel.friction_slip = 1.0;
                         wheel.anti_lock_brake = 1.0;
-                        wheel.max_brake_force = 3_000.0 * 60.0 * dt;
+                        wheel.max_brake_force = 180_000.0;
                     }
                 }
                 for wheel in &mut controller.wheels {
@@ -3765,7 +3765,7 @@ mod tests {
                 for wheel in &mut controller.wheels {
                     wheel.anti_lock_brake = strength;
                     wheel.brake = 1.0;
-                    wheel.max_brake_force = 1_000.0 * 60.0 * dt;
+                    wheel.max_brake_force = 60_000.0;
                     wheel.friction_slip = 0.6;
                     wheel.last_skid_info = 1.0;
                     if wheel.role.steered {
@@ -3840,7 +3840,7 @@ mod tests {
                             wheel.anti_lock_brake = strength;
                             if braking {
                                 wheel.brake = 1.0;
-                                wheel.max_brake_force = 100.0 * 60.0 * dt;
+                                wheel.max_brake_force = 6_000.0;
                             }
                         }
                         let mut sum = 0.0;
@@ -4011,7 +4011,7 @@ mod tests {
                         wheel.angular_velocity = if braking { 0.0 } else { 120.0 / wheel.radius };
                         wheel.anti_lock_brake = strength;
                         wheel.brake = if braking { 1.0 } else { 0.0 };
-                        wheel.max_brake_force = 1_000.0 * 60.0 * dt;
+                        wheel.max_brake_force = 60_000.0;
                     }
                     for step in 0..hz * 12 {
                         let friction = if step < hz * 2 || step >= hz * 4 {
@@ -4376,6 +4376,9 @@ mod tests {
             .all(|wheel| wheel.anti_lock_brake == 1.0));
         controller.wheels[0].anti_lock_brake = 0.0;
         controller.wheels[1].anti_lock_brake = 0.5;
+        for wheel in &mut controller.wheels {
+            wheel.max_brake_force = 60_000.0;
+        }
         controller.set_input(VehicleInput {
             handbrake: 1.0,
             ..VehicleInput::default()
@@ -4415,7 +4418,7 @@ mod tests {
             let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(0.5, 0.0);
             for wheel in &mut controller.wheels {
                 wheel.brake = 1.0;
-                wheel.max_brake_force = 3_000.0 * 60.0 * dt;
+                wheel.max_brake_force = 180_000.0;
                 wheel.friction_slip = 1.0;
             }
             for _ in 0..hz {
@@ -4445,6 +4448,7 @@ mod tests {
                 set_test_drive(&mut controller, 1_000.0);
                 for wheel in &mut controller.wheels {
                     wheel.brake = 0.2;
+                    wheel.max_brake_force = 60_000.0;
                     wheel.anti_lock_brake = abs;
                     wheel.last_skid_info = 0.1;
                     wheel.angular_velocity = bodies[controller.chassis]
@@ -5007,7 +5011,7 @@ mod tests {
         controller.wheels[0].angular_velocity = forward_speed / controller.wheels[0].radius;
         controller.wheels[0].brake = 1.0;
         controller.wheels[0].anti_lock_brake = 0.0;
-        controller.wheels[0].max_brake_force = 2_000.0;
+        controller.wheels[0].max_brake_force = 120_000.0;
 
         controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
 

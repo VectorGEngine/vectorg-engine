@@ -73,7 +73,7 @@ impl Scene {
                 },
                 WheelRole::new(axle, axle == WheelAxle::Rear, false),
             );
-            wheel.max_brake_force = 3000.0;
+            wheel.max_brake_force = 180_000.0;
             wheel.anti_lock_brake = 0.0;
         }
         let mut queries = QueryPipeline::new();
