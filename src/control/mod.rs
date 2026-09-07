@@ -7,7 +7,9 @@ pub use self::character_controller::{
 pub use self::pid_controller::{PdController, PdErrors, PidController};
 
 #[cfg(feature = "dim3")]
-pub use self::ray_cast_vehicle_controller::{DynamicRayCastVehicleController, Wheel, WheelTuning};
+pub use self::ray_cast_vehicle_controller::{
+    DynamicRayCastVehicleController, TireFriction, Wheel, WheelTuning,
+};
 #[cfg(feature = "dim3")]
 pub use self::vehicle_powertrain::{
     EngineConfig, SteeringConfig, TransmissionConfig, TurboConfig, VehicleControllerConfig,

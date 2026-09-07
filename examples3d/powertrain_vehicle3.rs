@@ -78,8 +78,8 @@ pub fn init_world(testbed: &mut Testbed) {
     let mut vehicle = DynamicRayCastVehicleController::new(chassis_handle, config);
     vehicle.index_forward_axis = 2;
     vehicle.index_up_axis = 1;
-    vehicle.add_tire_type("road", 1.0);
-    vehicle.add_surface_to_tire_type("road", "tarmac", 1.15);
+    vehicle.add_tire_type("road", 1.0, 0.85);
+    vehicle.add_surface_to_tire_type("road", "tarmac", 1.15, 0.9775);
 
     let tuning = WheelTuning {
         suspension_stiffness: 80.0,
@@ -112,8 +112,6 @@ pub fn init_world(testbed: &mut Testbed) {
         );
         wheel.max_brake_force = 5000.0;
         wheel.anti_roll = 0.400_000_005_960_464_5;
-        wheel.fwd_factor = 1.600_000_023_841_858;
-        wheel.contact_damping = 0.150_000_005_960_464_48;
     }
 
     testbed.set_world(bodies, colliders, impulse_joints, multibody_joints);
