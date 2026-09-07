@@ -72,6 +72,10 @@ pub struct DynamicRayCastVehicleController {
     drift_assist_direction: Real,
 
     timer: Real,
+    // Gravity is integrated with the vehicle impulses, then restored after the
+    // world step. Keeping ownership here avoids changing the general solver.
+    pending_gravity_scale: Option<Real>,
+    pending_gravity_impulse: Vector<Real>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -655,6 +659,8 @@ impl DynamicRayCastVehicleController {
             drift_assist_offset: 0.0,
             drift_assist_direction: 0.0,
             timer: 0.0,
+            pending_gravity_scale: None,
+            pending_gravity_impulse: Vector::zeros(),
         }
     }
 
@@ -1458,16 +1464,23 @@ impl DynamicRayCastVehicleController {
         state.steering_friction = steering_friction;
     }
 
-    /// Updates the vehicle’s velocity based on its suspension, engine force, and brake.
+    /// Integrates gravity together with suspension and tire impulses for this tick.
+    /// Step the world next, then call `finish_vehicle_update` to restore automatic
+    /// chassis gravity. Other bodies continue using the world's normal integration.
     #[profiling::function]
     pub fn update_vehicle(
         &mut self,
         dt: Real,
+        gravity: &Vector<Real>,
         bodies: &mut RigidBodySet,
         colliders: &ColliderSet,
         queries: &QueryPipeline,
         filter: QueryFilter,
     ) {
+        self.finish_vehicle_update(bodies);
+        if dt <= 0.0 {
+            return;
+        }
         self.timer += dt;
         let num_wheels = self.wheels.len();
         let chassis = &bodies[self.chassis];
@@ -1500,6 +1513,12 @@ impl DynamicRayCastVehicleController {
             .get_mut_internal_with_modification_tracking(self.chassis)
             .unwrap();
 
+        let gravity_scale = chassis.gravity_scale();
+        self.pending_gravity_scale = Some(gravity_scale);
+        self.pending_gravity_impulse = gravity * (chassis.mass() * gravity_scale * dt);
+        chassis.set_gravity_scale(0.0, false);
+        chassis.apply_impulse(self.pending_gravity_impulse, false);
+
         for wheel in &mut self.wheels {
             if wheel.engine_force.abs() > 0.0 {
                 chassis.wake_up(true);
@@ -1515,6 +1534,28 @@ impl DynamicRayCastVehicleController {
             chassis.apply_impulse_at_point(impulse, wheel.raycast_info.contact_point_ws, false);
         }
 
+        for wheel in &self.wheels {
+            if let Some(ground) = wheel
+                .raycast_info
+                .ground_object
+                .and_then(|handle| colliders[handle].parent())
+                .filter(|handle| *handle != self.chassis && bodies[*handle].is_dynamic())
+            {
+                let force = wheel
+                    .wheel_suspension_force
+                    .min(wheel.max_suspension_force)
+                    .max(0.0);
+                bodies
+                    .get_mut_internal_with_modification_tracking(ground)
+                    .unwrap()
+                    .apply_impulse_at_point(
+                        -wheel.raycast_info.contact_normal_ws * force * dt,
+                        wheel.raycast_info.contact_point_ws,
+                        true,
+                    );
+            }
+        }
+
         self.update_friction(bodies, colliders, dt);
 
         for wheel in &mut self.wheels {
@@ -1522,6 +1563,32 @@ impl DynamicRayCastVehicleController {
         }
         let chassis = &bodies[self.chassis];
         self.update_output_state(chassis);
+    }
+
+    /// Completes the vehicle tick after stepping the world.
+    pub fn finish_vehicle_update(&mut self, bodies: &mut RigidBodySet) {
+        let Some(scale) = self.pending_gravity_scale.take() else {
+            return;
+        };
+        if let Some(chassis) = bodies.get_mut(self.chassis) {
+            chassis.set_gravity_scale(scale, false);
+            self.current_vehicle_speed = (chassis.position()
+                * Vector::ith(self.index_forward_axis, 1.0))
+            .dot(chassis.linvel());
+            self.update_output_state(chassis);
+        }
+    }
+
+    /// Cancels gravity ownership before the world step when resetting or removing
+    /// the controller. Retract the pre-applied gravity impulse so the world can
+    /// integrate it normally, without adding it a second time.
+    pub fn cancel_vehicle_update(&mut self, bodies: &mut RigidBodySet) {
+        if let Some(scale) = self.pending_gravity_scale.take() {
+            if let Some(chassis) = bodies.get_mut(self.chassis) {
+                chassis.apply_impulse(-self.pending_gravity_impulse, false);
+                chassis.set_gravity_scale(scale, false);
+            }
+        }
     }
 
     /// Reference to all the wheels attached to this vehicle.
@@ -1907,7 +1974,7 @@ impl DynamicRayCastVehicleController {
             let ground_body = contact
                 .ground_object
                 .and_then(|handle| colliders[handle].parent())
-                .filter(|handle| bodies[*handle].is_dynamic() && *handle != self.chassis);
+                .filter(|handle| *handle != self.chassis);
             let ground_velocity = ground_body
                 .map(|handle| bodies[handle].velocity_at_point(&point))
                 .unwrap_or_else(Vector::zeros);
@@ -2031,7 +2098,7 @@ impl DynamicRayCastVehicleController {
                 angular_axes[0] * result.tangent[0] + angular_axes[1] * result.tangent[1],
                 false,
             );
-            if let Some(handle) = ground_body {
+            if let Some(handle) = ground_body.filter(|handle| bodies[*handle].is_dynamic()) {
                 bodies
                     .get_mut_internal_with_modification_tracking(handle)
                     .unwrap()
@@ -5545,7 +5612,6 @@ fn relative_velocity_at_contact(
     let ground_velocity = ground_object
         .and_then(|h| colliders[h].parent())
         .map(|h| &bodies[h])
-        .filter(|b| b.is_dynamic())
         .map(|b| b.velocity_at_point(point))
         .unwrap_or_else(Vector::zeros);
 

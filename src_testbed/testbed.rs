@@ -815,14 +815,6 @@ impl Testbed<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_> {
                     state.traction_control_activity,
                 );
             }
-
-            vehicle.update_vehicle(
-                self.harness.physics.integration_parameters.dt,
-                &mut self.harness.physics.bodies,
-                &self.harness.physics.colliders,
-                &self.harness.physics.query_pipeline,
-                QueryFilter::exclude_dynamic().exclude_rigid_body(vehicle.chassis),
-            );
         }
     }
 
@@ -1443,7 +1435,23 @@ fn update_testbed(
                     keys: &keys,
                     mouse: &mouse,
                 };
+                #[cfg(feature = "dim3")]
+                if let Some(vehicle) = &mut state.vehicle_controller {
+                    let physics = &mut harness.physics;
+                    vehicle.update_vehicle(
+                        physics.integration_parameters.dt,
+                        &physics.gravity,
+                        &mut physics.bodies,
+                        &physics.colliders,
+                        &physics.query_pipeline,
+                        QueryFilter::exclude_dynamic().exclude_rigid_body(vehicle.chassis),
+                    );
+                }
                 harness.step_with_graphics(Some(&mut testbed_graphics));
+                #[cfg(feature = "dim3")]
+                if let Some(vehicle) = &mut state.vehicle_controller {
+                    vehicle.finish_vehicle_update(&mut harness.physics.bodies);
+                }
 
                 for plugin in &mut plugins.0 {
                     plugin.step(&mut harness.physics)
