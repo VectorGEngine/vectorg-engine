@@ -233,11 +233,11 @@ pub struct SteeringConfig {
     pub minimum_speed_factor: Real,
     /// Whether speed-sensitive range reduction and counter-steering are enabled.
     pub assist: bool,
-    /// Drift-correction strength in the range `0.0` through `1.0`.
+    /// Counter-steer assistance strength in the range `0.0` through `1.0`.
     ///
     /// A value of `0.0` disables correction while `1.0` applies the full
     /// calculated correction whenever steering assistance is active.
-    pub drift_correction: Real,
+    pub counter_steer_assist: Real,
 }
 
 impl Default for SteeringConfig {
@@ -248,7 +248,7 @@ impl Default for SteeringConfig {
             speed_sensitivity: 35.0,
             minimum_speed_factor: 0.25,
             assist: false,
-            drift_correction: 1.0,
+            counter_steer_assist: 1.0,
         }
     }
 }
@@ -1545,7 +1545,7 @@ fn sanitize_config(config: &mut VehicleControllerConfig) {
     config.steering.max_angle = config.steering.max_angle.abs();
     config.steering.road_wheel_curve = config.steering.road_wheel_curve.clamp(0.0, 1.0);
     config.steering.minimum_speed_factor = config.steering.minimum_speed_factor.clamp(0.0, 1.0);
-    config.steering.drift_correction = config.steering.drift_correction.clamp(0.0, 1.0);
+    config.steering.counter_steer_assist = config.steering.counter_steer_assist.clamp(0.0, 1.0);
 }
 
 fn non_negative_finite(value: Real) -> Real {

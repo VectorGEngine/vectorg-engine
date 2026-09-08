@@ -10,16 +10,16 @@ use super::vehicle_powertrain::{
     VehicleShiftOutcome, VehicleState, WheelAxle, WheelRole,
 };
 
-const DRIFT_ASSIST_MIN_SPEED: Real = 5.0;
-const DRIFT_ASSIST_FULL_SPEED: Real = 10.0;
-const DRIFT_ASSIST_MIN_CONTACTS: usize = 2;
-const DRIFT_ASSIST_ENTER_ANGLE: Real = 0.104_719_76; // 6 degrees.
-const DRIFT_ASSIST_EXIT_ANGLE: Real = 0.052_359_88; // 3 degrees.
-const DRIFT_ASSIST_FULL_ANGLE: Real = 0.349_065_84; // 20 degrees.
-const DRIFT_ASSIST_RESPONSE: Real = 8.0;
-const DRIFT_ASSIST_RELEASE_RESPONSE: Real = 15.0;
-const DRIFT_ASSIST_YAW_DAMPING: Real = 0.08;
-const DRIFT_ASSIST_INPUT_DEADZONE: Real = 0.01;
+const COUNTER_STEER_ASSIST_MIN_SPEED: Real = 5.0;
+const COUNTER_STEER_ASSIST_FULL_SPEED: Real = 10.0;
+const COUNTER_STEER_ASSIST_MIN_CONTACTS: usize = 2;
+const COUNTER_STEER_ASSIST_ENTER_ANGLE: Real = 0.104_719_76; // 6 degrees.
+const COUNTER_STEER_ASSIST_EXIT_ANGLE: Real = 0.052_359_88; // 3 degrees.
+const COUNTER_STEER_ASSIST_FULL_ANGLE: Real = 0.349_065_84; // 20 degrees.
+const COUNTER_STEER_ASSIST_RESPONSE: Real = 8.0;
+const COUNTER_STEER_ASSIST_RELEASE_RESPONSE: Real = 15.0;
+const COUNTER_STEER_ASSIST_YAW_DAMPING: Real = 0.08;
+const COUNTER_STEER_ASSIST_INPUT_DEADZONE: Real = 0.01;
 const WHEEL_REFERENCE_RADIUS: Real = 0.35;
 const WHEEL_EFFECTIVE_INERTIA: Real = 1.5;
 const WHEEL_STOP_EPSILON: Real = 1.0e-4;
@@ -35,9 +35,9 @@ const RECOVERY_THRESHOLD: Real = 0.94;
 const RECOVERY_BASE_RATE: Real = 0.15;
 const RECOVERY_RATE: Real = 0.3;
 
-fn drift_assist_speed_activation(forward_speed: Real) -> Real {
-    let normalized = ((forward_speed - DRIFT_ASSIST_MIN_SPEED)
-        / (DRIFT_ASSIST_FULL_SPEED - DRIFT_ASSIST_MIN_SPEED))
+fn counter_steer_assist_speed_activation(forward_speed: Real) -> Real {
+    let normalized = ((forward_speed - COUNTER_STEER_ASSIST_MIN_SPEED)
+        / (COUNTER_STEER_ASSIST_FULL_SPEED - COUNTER_STEER_ASSIST_MIN_SPEED))
         .clamp(0.0, 1.0);
     normalized * normalized * (3.0 - 2.0 * normalized)
 }
@@ -67,9 +67,9 @@ pub struct DynamicRayCastVehicleController {
     pub tire_types: HashMap<String, TireType>,
     powertrain: VehiclePowertrain,
     last_steering_compression: Real,
-    drift_assist_active: bool,
-    drift_assist_offset: Real,
-    drift_assist_direction: Real,
+    counter_steer_assist_active: bool,
+    counter_steer_assist_offset: Real,
+    counter_steer_assist_direction: Real,
 
     timer: Real,
     // Gravity is integrated with the vehicle impulses, then restored after the
@@ -655,9 +655,9 @@ impl DynamicRayCastVehicleController {
             tire_types,
             powertrain: VehiclePowertrain::new(config),
             last_steering_compression: 0.0,
-            drift_assist_active: false,
-            drift_assist_offset: 0.0,
-            drift_assist_direction: 0.0,
+            counter_steer_assist_active: false,
+            counter_steer_assist_offset: 0.0,
+            counter_steer_assist_direction: 0.0,
             timer: 0.0,
             pending_gravity_scale: None,
             pending_gravity_impulse: Vector::zeros(),
@@ -691,9 +691,9 @@ impl DynamicRayCastVehicleController {
         self.forward_ws.clear();
         self.axle.clear();
         self.last_steering_compression = 0.0;
-        self.drift_assist_active = false;
-        self.drift_assist_offset = 0.0;
-        self.drift_assist_direction = 0.0;
+        self.counter_steer_assist_active = false;
+        self.counter_steer_assist_offset = 0.0;
+        self.counter_steer_assist_direction = 0.0;
         self.timer = 0.0;
         for wheel in &mut self.wheels {
             wheel.reset();
@@ -721,20 +721,27 @@ impl DynamicRayCastVehicleController {
         self.powertrain.config.steering.assist = enabled;
 
         if !enabled {
-            self.drift_assist_active = false;
-            self.drift_assist_offset = 0.0;
-            self.drift_assist_direction = 0.0;
+            self.counter_steer_assist_active = false;
+            self.counter_steer_assist_offset = 0.0;
+            self.counter_steer_assist_direction = 0.0;
         }
     }
 
-    /// Sets drift-correction strength (`0.0` = none, `1.0` = full correction).
-    pub fn set_drift_correction(&mut self, correction: Real) {
-        self.powertrain.config.steering.drift_correction = correction.clamp(0.0, 1.0);
+    /// Sets the minimum steering range factor at high speed (`0.0` to `1.0`).
+    pub fn set_minimum_speed_factor(&mut self, factor: Real) {
+        if factor.is_finite() {
+            self.powertrain.config.steering.minimum_speed_factor = factor.clamp(0.0, 1.0);
+        }
+    }
 
-        if self.powertrain.config.steering.drift_correction <= Real::EPSILON {
-            self.drift_assist_active = false;
-            self.drift_assist_offset = 0.0;
-            self.drift_assist_direction = 0.0;
+    /// Sets counter-steer assistance strength (`0.0` = none, `1.0` = full assistance).
+    pub fn set_counter_steer_assist(&mut self, strength: Real) {
+        self.powertrain.config.steering.counter_steer_assist = strength.clamp(0.0, 1.0);
+
+        if self.powertrain.config.steering.counter_steer_assist <= Real::EPSILON {
+            self.counter_steer_assist_active = false;
+            self.counter_steer_assist_offset = 0.0;
+            self.counter_steer_assist_direction = 0.0;
         }
     }
 
@@ -1132,13 +1139,15 @@ impl DynamicRayCastVehicleController {
         let curved_input =
             curved_steering_input(normalized_input, steering_config.road_wheel_curve);
         let player_angle = curved_input * max_angle * speed_factor;
-        let correction_strength = steering_config.drift_correction.clamp(0.0, 1.0);
-        let assist_speed_activation = drift_assist_speed_activation(self.current_vehicle_speed);
+        let counter_steer_strength = steering_config.counter_steer_assist.clamp(0.0, 1.0);
+        let assist_speed_activation =
+            counter_steer_assist_speed_activation(self.current_vehicle_speed);
         let mut target_assist_offset = None;
         let mut cancel_immediately = false;
-        let grounded = self.powertrain.state().wheels_in_contact >= DRIFT_ASSIST_MIN_CONTACTS;
+        let grounded =
+            self.powertrain.state().wheels_in_contact >= COUNTER_STEER_ASSIST_MIN_CONTACTS;
         let can_assist = assist_enabled
-            && correction_strength > Real::EPSILON
+            && counter_steer_strength > Real::EPSILON
             && assist_speed_activation > 0.0
             && grounded;
 
@@ -1159,65 +1168,67 @@ impl DynamicRayCastVehicleController {
 
         if let Some(angle) = drift_angle {
             let absolute_angle = angle.abs();
-            self.drift_assist_active = if self.drift_assist_active {
-                absolute_angle > DRIFT_ASSIST_EXIT_ANGLE
+            self.counter_steer_assist_active = if self.counter_steer_assist_active {
+                absolute_angle > COUNTER_STEER_ASSIST_EXIT_ANGLE
             } else {
-                absolute_angle > DRIFT_ASSIST_ENTER_ANGLE
+                absolute_angle > COUNTER_STEER_ASSIST_ENTER_ANGLE
             };
 
-            if self.drift_assist_active {
+            if self.counter_steer_assist_active {
                 let yaw_rate = self.chassis_yaw_rate(chassis);
-                let correction_angle =
-                    (-angle - yaw_rate * DRIFT_ASSIST_YAW_DAMPING).clamp(-max_angle, max_angle);
-                self.drift_assist_direction = correction_angle.signum();
-                let matching_input = input.steering.abs() > DRIFT_ASSIST_INPUT_DEADZONE
+                let correction_angle = (-angle - yaw_rate * COUNTER_STEER_ASSIST_YAW_DAMPING)
+                    .clamp(-max_angle, max_angle);
+                self.counter_steer_assist_direction = correction_angle.signum();
+                let matching_input = input.steering.abs() > COUNTER_STEER_ASSIST_INPUT_DEADZONE
                     && input.steering * correction_angle > 0.0;
 
                 if matching_input {
-                    let normalized_angle = ((absolute_angle - DRIFT_ASSIST_ENTER_ANGLE)
-                        / (DRIFT_ASSIST_FULL_ANGLE - DRIFT_ASSIST_ENTER_ANGLE))
+                    let normalized_angle = ((absolute_angle - COUNTER_STEER_ASSIST_ENTER_ANGLE)
+                        / (COUNTER_STEER_ASSIST_FULL_ANGLE - COUNTER_STEER_ASSIST_ENTER_ANGLE))
                         .clamp(0.0, 1.0);
                     let activation = normalized_angle
                         * normalized_angle
                         * (3.0 - 2.0 * normalized_angle)
                         * assist_speed_activation;
-                    target_assist_offset =
-                        Some((correction_angle - player_angle) * correction_strength * activation);
-                } else if input.steering.abs() > DRIFT_ASSIST_INPUT_DEADZONE {
+                    target_assist_offset = Some(
+                        (correction_angle - player_angle) * counter_steer_strength * activation,
+                    );
+                } else if input.steering.abs() > COUNTER_STEER_ASSIST_INPUT_DEADZONE {
                     cancel_immediately = true;
                 }
             }
         } else {
-            self.drift_assist_active = false;
+            self.counter_steer_assist_active = false;
         }
 
-        if input.steering.abs() > DRIFT_ASSIST_INPUT_DEADZONE
-            && self.drift_assist_direction != 0.0
-            && input.steering * self.drift_assist_direction < 0.0
+        if input.steering.abs() > COUNTER_STEER_ASSIST_INPUT_DEADZONE
+            && self.counter_steer_assist_direction != 0.0
+            && input.steering * self.counter_steer_assist_direction < 0.0
         {
             cancel_immediately = true;
         }
 
         if cancel_immediately {
-            self.drift_assist_offset = 0.0;
-            self.drift_assist_direction = 0.0;
+            self.counter_steer_assist_offset = 0.0;
+            self.counter_steer_assist_direction = 0.0;
         } else {
             let target_offset = target_assist_offset.unwrap_or(0.0);
-            let response_rate = if target_offset.abs() < self.drift_assist_offset.abs() {
-                DRIFT_ASSIST_RELEASE_RESPONSE
+            let response_rate = if target_offset.abs() < self.counter_steer_assist_offset.abs() {
+                COUNTER_STEER_ASSIST_RELEASE_RESPONSE
             } else {
-                DRIFT_ASSIST_RESPONSE
+                COUNTER_STEER_ASSIST_RESPONSE
             };
             let response = 1.0 - (-response_rate * dt.max(0.0)).exp();
-            self.drift_assist_offset += (target_offset - self.drift_assist_offset) * response;
+            self.counter_steer_assist_offset +=
+                (target_offset - self.counter_steer_assist_offset) * response;
 
-            if target_assist_offset.is_none() && self.drift_assist_offset.abs() <= 1.0e-4 {
-                self.drift_assist_offset = 0.0;
-                self.drift_assist_direction = 0.0;
+            if target_assist_offset.is_none() && self.counter_steer_assist_offset.abs() <= 1.0e-4 {
+                self.counter_steer_assist_offset = 0.0;
+                self.counter_steer_assist_direction = 0.0;
             }
         }
 
-        let mut center_angle = player_angle + self.drift_assist_offset;
+        let mut center_angle = player_angle + self.counter_steer_assist_offset;
 
         center_angle = center_angle.clamp(-max_angle, max_angle);
         let state = self.powertrain.state_mut();
@@ -5138,18 +5149,65 @@ mod tests {
         controller.update_steering(&chassis, 1.0 / 60.0);
         assert!((controller.state().steering_angle - max_angle * 0.25).abs() < 1.0e-5);
 
+        controller.set_minimum_speed_factor(0.7);
+        controller.update_steering(&chassis, 1.0 / 60.0);
+        assert!((controller.state().steering_angle - max_angle * 0.7).abs() < 1.0e-5);
+
+        controller.set_minimum_speed_factor(2.0);
+        assert_eq!(
+            controller.powertrain.config.steering.minimum_speed_factor,
+            1.0
+        );
+        controller.set_minimum_speed_factor(-1.0);
+        assert_eq!(
+            controller.powertrain.config.steering.minimum_speed_factor,
+            0.0
+        );
+        controller.set_minimum_speed_factor(Real::NAN);
+        assert_eq!(
+            controller.powertrain.config.steering.minimum_speed_factor,
+            0.0
+        );
+
         controller.set_steering_assist(false);
         controller.update_steering(&chassis, 1.0 / 60.0);
         assert!((controller.state().steering_angle - max_angle).abs() < 1.0e-5);
     }
 
     #[test]
-    fn steering_assist_speed_activation_blends_from_five_to_ten_meters_per_second() {
-        assert_eq!(drift_assist_speed_activation(-10.0), 0.0);
-        assert_eq!(drift_assist_speed_activation(5.0), 0.0);
-        assert!((drift_assist_speed_activation(7.5) - 0.5).abs() < 1.0e-5);
-        assert_eq!(drift_assist_speed_activation(10.0), 1.0);
-        assert_eq!(drift_assist_speed_activation(20.0), 1.0);
+    fn counter_steer_assist_speed_activation_blends_from_five_to_ten_meters_per_second() {
+        assert_eq!(counter_steer_assist_speed_activation(-10.0), 0.0);
+        assert_eq!(counter_steer_assist_speed_activation(5.0), 0.0);
+        assert!((counter_steer_assist_speed_activation(7.5) - 0.5).abs() < 1.0e-5);
+        assert_eq!(counter_steer_assist_speed_activation(10.0), 1.0);
+        assert_eq!(counter_steer_assist_speed_activation(20.0), 1.0);
+    }
+
+    #[test]
+    fn counter_steer_assist_requires_steering_assist() {
+        let mut config = VehicleControllerConfig::default();
+        config.steering.assist = false;
+        config.steering.counter_steer_assist = 1.0;
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
+        controller.index_forward_axis = 2;
+        controller.index_up_axis = 1;
+        controller.current_vehicle_speed = 10.0;
+        controller.powertrain.state_mut().wheels_in_contact = 4;
+        controller.set_input(VehicleInput {
+            steering: 0.2,
+            ..VehicleInput::default()
+        });
+
+        let chassis = RigidBodyBuilder::dynamic()
+            .linvel(Vector::z() * 10.0 + Vector::x() * 4.0)
+            .build();
+        controller.update_steering(&chassis, 1.0 / 60.0);
+
+        let expected = 0.2 * controller.powertrain.config.steering.max_angle;
+        assert!((controller.state().steering_angle - expected).abs() < 1.0e-5);
+        assert!(!controller.counter_steer_assist_active);
+        assert_eq!(controller.counter_steer_assist_offset, 0.0);
     }
 
     #[test]
@@ -5171,7 +5229,7 @@ mod tests {
             .build();
         controller.current_vehicle_speed = 5.0;
         controller.update_steering(&minimum_speed_chassis, 1.0 / 60.0);
-        assert_eq!(controller.drift_assist_offset, 0.0);
+        assert_eq!(controller.counter_steer_assist_offset, 0.0);
 
         let just_above_minimum_chassis = RigidBodyBuilder::dynamic()
             .linvel(Vector::z() * 5.001 + Vector::x() * 5.0)
@@ -5179,8 +5237,8 @@ mod tests {
         controller.current_vehicle_speed = 5.001;
         controller.update_steering(&just_above_minimum_chassis, 1.0 / 60.0);
 
-        assert!(controller.drift_assist_offset.abs() > 0.0);
-        assert!(controller.drift_assist_offset.abs() < 1.0e-6);
+        assert!(controller.counter_steer_assist_offset.abs() > 0.0);
+        assert!(controller.counter_steer_assist_offset.abs() < 1.0e-6);
     }
 
     #[test]
@@ -5210,8 +5268,8 @@ mod tests {
             + (1.0 - normalized).powi(2) * (1.0 - steering.minimum_speed_factor);
         let expected = 0.2 * steering.max_angle * speed_factor;
         assert!((controller.state().steering_angle - expected).abs() < 1.0e-5);
-        assert!(!controller.drift_assist_active);
-        assert_eq!(controller.drift_assist_offset, 0.0);
+        assert!(!controller.counter_steer_assist_active);
+        assert_eq!(controller.counter_steer_assist_offset, 0.0);
     }
 
     #[test]
@@ -5247,16 +5305,16 @@ mod tests {
 
         assert!(controller.state().steering_angle > player_angle);
         assert!(controller.state().steering_angle < correction_angle);
-        assert!(controller.drift_assist_offset > 0.0);
-        assert!(controller.drift_assist_offset < correction_angle - player_angle);
+        assert!(controller.counter_steer_assist_offset > 0.0);
+        assert!(controller.counter_steer_assist_offset < correction_angle - player_angle);
     }
 
     #[test]
-    fn drift_correction_strength_blends_between_player_and_full_correction() {
+    fn counter_steer_assist_strength_blends_between_player_and_full_assistance() {
         fn controller(strength: Real) -> DynamicRayCastVehicleController {
             let mut config = VehicleControllerConfig::default();
             config.steering.assist = true;
-            config.steering.drift_correction = strength;
+            config.steering.counter_steer_assist = strength;
             config.steering.road_wheel_curve = 0.25;
             let mut controller =
                 DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
@@ -5334,11 +5392,11 @@ mod tests {
             + (1.0 - normalized).powi(2) * (1.0 - steering.minimum_speed_factor);
         let expected = -steering.max_angle * speed_factor;
         assert!((controller.state().steering_angle - expected).abs() < 1.0e-5);
-        assert_eq!(controller.drift_assist_offset, 0.0);
+        assert_eq!(controller.counter_steer_assist_offset, 0.0);
     }
 
     #[test]
-    fn opposite_input_releases_drift_correction_immediately() {
+    fn opposite_input_releases_counter_steer_assist_immediately() {
         let mut config = VehicleControllerConfig::default();
         config.steering.assist = true;
         let mut controller =
@@ -5358,7 +5416,7 @@ mod tests {
         for _ in 0..60 {
             controller.update_steering(&chassis, 1.0 / 60.0);
         }
-        assert!(controller.drift_assist_offset > 0.1);
+        assert!(controller.counter_steer_assist_offset > 0.1);
 
         controller.set_input(VehicleInput {
             steering: -0.4,
@@ -5372,7 +5430,7 @@ mod tests {
             + (1.0 - normalized).powi(2) * (1.0 - steering.minimum_speed_factor);
         let expected = -0.4 * steering.max_angle * speed_factor;
         assert!((controller.state().steering_angle - expected).abs() < 1.0e-5);
-        assert_eq!(controller.drift_assist_offset, 0.0);
+        assert_eq!(controller.counter_steer_assist_offset, 0.0);
     }
 
     #[test]
@@ -5452,16 +5510,22 @@ mod tests {
     }
 
     #[test]
-    fn drift_correction_setter_clamps_to_normalized_range() {
+    fn counter_steer_assist_setter_clamps_to_normalized_range() {
         let mut controller = DynamicRayCastVehicleController::new(
             RigidBodyHandle::invalid(),
             VehicleControllerConfig::default(),
         );
 
-        controller.set_drift_correction(2.0);
-        assert_eq!(controller.powertrain.config.steering.drift_correction, 1.0);
-        controller.set_drift_correction(-1.0);
-        assert_eq!(controller.powertrain.config.steering.drift_correction, 0.0);
+        controller.set_counter_steer_assist(2.0);
+        assert_eq!(
+            controller.powertrain.config.steering.counter_steer_assist,
+            1.0
+        );
+        controller.set_counter_steer_assist(-1.0);
+        assert_eq!(
+            controller.powertrain.config.steering.counter_steer_assist,
+            0.0
+        );
     }
 
     #[test]
@@ -5488,9 +5552,9 @@ mod tests {
         controller.powertrain.state_mut().current_gear = 3;
         controller.current_vehicle_speed = 25.0;
         controller.last_steering_compression = 1.0;
-        controller.drift_assist_active = true;
-        controller.drift_assist_offset = 0.3;
-        controller.drift_assist_direction = 1.0;
+        controller.counter_steer_assist_active = true;
+        controller.counter_steer_assist_offset = 0.3;
+        controller.counter_steer_assist_direction = 1.0;
         controller.timer = 5.0;
         let wheel = &mut controller.wheels[0];
         wheel.rotation = 10.0;
@@ -5519,8 +5583,8 @@ mod tests {
         assert!(controller.state().engine_running);
         assert_eq!(controller.state().current_gear, 0);
         assert_eq!(controller.current_vehicle_speed, 0.0);
-        assert!(!controller.drift_assist_active);
-        assert_eq!(controller.drift_assist_offset, 0.0);
+        assert!(!controller.counter_steer_assist_active);
+        assert_eq!(controller.counter_steer_assist_offset, 0.0);
         assert_eq!(controller.timer, 0.0);
         let wheel = &controller.wheels[0];
         assert_eq!(wheel.rotation, 0.0);
