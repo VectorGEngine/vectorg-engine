@@ -438,6 +438,7 @@ pub(crate) struct VehiclePowertrain {
     turbo_load: Real,
     previous_throttle: Real,
     restart_armed: bool,
+    engine_start_requested: bool,
     engine_start_elapsed: Real,
     automatic_clutch_engagement: Real,
     automatic_clutch_phase: AutomaticClutchPhase,
@@ -471,6 +472,7 @@ impl VehiclePowertrain {
             turbo_load: 0.0,
             previous_throttle: 0.0,
             restart_armed: true,
+            engine_start_requested: false,
             engine_start_elapsed: 0.0,
             automatic_clutch_engagement: 0.0,
             automatic_clutch_phase: AutomaticClutchPhase::Open,
@@ -508,6 +510,7 @@ impl VehiclePowertrain {
         self.turbo_load = 0.0;
         self.previous_throttle = 0.0;
         self.restart_armed = true;
+        self.engine_start_requested = false;
         self.engine_start_elapsed = 0.0;
         self.automatic_clutch_engagement = 0.0;
         self.automatic_clutch_phase = AutomaticClutchPhase::Open;
@@ -515,6 +518,12 @@ impl VehiclePowertrain {
 
     pub fn input(&self) -> VehicleInput {
         self.input
+    }
+
+    pub fn start_engine(&mut self) {
+        if !self.state.engine_running && !self.state.engine_starting {
+            self.engine_start_requested = true;
+        }
     }
 
     pub fn state(&self) -> VehicleState {
@@ -1143,6 +1152,7 @@ impl VehiclePowertrain {
     }
 
     fn update_engine_start_state(&mut self, dt: Real, drive_throttle: Real) {
+        let requested = core::mem::take(&mut self.engine_start_requested);
         if self.state.engine_running {
             self.state.engine_starting = false;
             self.state.engine_start_progress = 0.0;
@@ -1168,7 +1178,8 @@ impl VehiclePowertrain {
 
         if drive_throttle <= TRANSMISSION_PEDAL_RELEASE {
             self.restart_armed = true;
-        } else if self.restart_armed && drive_throttle > TRANSMISSION_PEDAL_ENGAGE {
+        }
+        if requested || (self.restart_armed && drive_throttle > TRANSMISSION_PEDAL_ENGAGE) {
             self.state.engine_starting = true;
             self.state.engine_start_progress = 0.0;
             self.state.engine_rpm = 0.0;
@@ -3123,6 +3134,44 @@ mod tests {
         assert_eq!(powertrain.state().engine_state_sequence, 3);
         assert!(powertrain.state().engine_rpm >= powertrain.config.engine.idle_rpm);
         assert_eq!(output.drive_throttle, 1.0);
+    }
+
+    #[test]
+    fn explicit_engine_start_uses_the_starter_without_throttle_and_ignores_repeated_requests() {
+        let mut powertrain = manual_powertrain();
+        powertrain.state.engine_running = false;
+        powertrain.state.engine_rpm = 0.0;
+        powertrain.restart_armed = false;
+        powertrain.start_engine();
+        powertrain.start_engine();
+        assert_eq!(powertrain.engine_state(), VehicleEngineState::Stopped);
+        let output = powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        assert_eq!(powertrain.engine_state(), VehicleEngineState::Starting);
+        assert_eq!(powertrain.state.engine_state_sequence, 1);
+        assert_eq!(output.drive_torque, 0.0);
+        assert_eq!(powertrain.input.throttle, 0.0);
+        for _ in 0..90 {
+            powertrain.start_engine();
+            powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        }
+        assert_eq!(powertrain.engine_state(), VehicleEngineState::Running);
+        assert_eq!(powertrain.state.engine_state_sequence, 2);
+        assert!(!powertrain.engine_start_requested);
+    }
+
+    #[test]
+    fn engine_start_request_does_not_survive_running_or_reset() {
+        let mut powertrain = manual_powertrain();
+        powertrain.start_engine();
+        assert!(!powertrain.engine_start_requested);
+        powertrain.state.engine_running = false;
+        powertrain.start_engine();
+        assert!(powertrain.engine_start_requested);
+        powertrain.reset();
+        assert!(!powertrain.engine_start_requested);
+        powertrain.state.engine_running = false;
+        powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        assert_eq!(powertrain.engine_state(), VehicleEngineState::Stopped);
     }
 
     #[test]

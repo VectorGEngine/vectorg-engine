@@ -669,6 +669,11 @@ impl DynamicRayCastVehicleController {
         self.powertrain.set_input(input);
     }
 
+    /// Requests the existing starter sequence on the next update if the engine is stopped.
+    pub fn start_engine(&mut self) {
+        self.powertrain.start_engine();
+    }
+
     /// The normalized driver inputs currently held by the controller.
     pub fn input(&self) -> VehicleInput {
         self.powertrain.input()
