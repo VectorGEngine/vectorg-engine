@@ -24,6 +24,31 @@ impulse per vehicle tick; other external forces and collision responses continue
 to use the world's normal substeps. Complete the update/step/finish sequence before
 changing the chassis gravity scale or taking a physics snapshot.
 
+Tire contacts share a scratch contact-space impulse response for the chassis and
+any common ground bodies. Relaxed synchronous block iterations replace each
+wheel's accumulated tangent/brake impulses, so no wheel gets priority from its
+insertion order. Effective inverse mass/inertia and the force application
+Jacobians match the real bodies, including locked axes and wheel roll influence.
+Only the final summed impulses are applied to each real body.
+The iteration uses a diagonal body-response majorizer and an energy line search:
+pure rolling demand does not seed canceling lateral forces that waste tire grip,
+and weakly coupled wheel-inertia corrections can take a full step.
+
+Drive torque and grip/assist history are immutable during a tick's previews.
+ABS/TC and grip-recovery predictions are rechecked against the other contacts'
+latest impulses; a bounded outer solve updates their limits. A contact velocity
+residual controls convergence (including the wheel's angular response), not raw
+impulse differences. If an iteration cap is reached, the solver retains its
+feasible accumulated result for the accepted limits and records the remaining
+residual in its scratch diagnostics. Wheel state and feedback commit once;
+solver iterations never integrate torque or recovery time repeatedly.
+Assist torque searches alternate bracketed interpolation with bisection,
+preserving the original torque-fraction resolution and slip targets. Scalar
+isotropic friction projections use their exact radial solution; wheels whose
+angular momentum exceeds both available impulse budgets skip the impossible
+held-wheel preview. These reduce preview cost without removing the coupled
+contact or assist convergence checks.
+
 Wheel geometry keeps the fixed suspension mount separate from the tire center.
 In chassis coordinates, the steering pivot is `mount + direction * length`,
 and the tire center is `pivot + steering_rotation * center_offset`. The single
