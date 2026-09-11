@@ -24,3 +24,5 @@ mod pid_controller;
 mod ray_cast_vehicle_controller;
 #[cfg(feature = "dim3")]
 mod vehicle_powertrain;
+#[cfg(feature = "dim3")]
+mod wheel_contact;

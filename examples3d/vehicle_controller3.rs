@@ -62,6 +62,7 @@ pub fn init_world(testbed: &mut Testbed) {
             Vector::z(),
             hh,
             hh / 4.0,
+            0.2,
             &tuning,
             WheelRole::new(axle, front, front),
         );

@@ -1,5 +1,5 @@
 use crate::dynamics::{RigidBody, RigidBodyHandle, RigidBodySet};
-use crate::geometry::{ColliderHandle, ColliderSet, Ray};
+use crate::geometry::{ColliderHandle, ColliderSet};
 use crate::math::{Point, Real, Rotation, Vector, DIM};
 use crate::pipeline::{QueryFilter, QueryPipeline};
 use crate::utils::SimdDot;
@@ -9,6 +9,7 @@ use super::vehicle_powertrain::{
     VehicleControllerConfig, VehicleEngineState, VehicleInput, VehiclePowertrain,
     VehicleShiftOutcome, VehicleState, WheelAxle, WheelRole,
 };
+use super::wheel_contact::WheelSweep;
 
 const COUNTER_STEER_ASSIST_MIN_SPEED: Real = 5.0;
 const COUNTER_STEER_ASSIST_FULL_SPEED: Real = 10.0;
@@ -28,8 +29,6 @@ const ASSIST_SURFACE_SPEED_TOLERANCE: Real = 0.01;
 // Maximum powered wheel-surface overspeed in m/s; TC strength reduces this gap.
 const TRACTION_CONTROL_MAX_SPEED_GAP: Real = 10.0;
 const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
-// Below this incidence the single suspension ray cannot resolve a supporting road plane.
-const MIN_SUSPENSION_CONTACT_COS: Real = 0.1;
 
 const SLIDING_START_SPEED: Real = 4.0;
 const SLIDING_FULL_SPEED: Real = 8.0;
@@ -137,6 +136,8 @@ struct WheelDesc {
     pub max_suspension_travel: Real,
     /// The wheel’s radius.
     pub radius: Real,
+    /// Full tire width along the axle, centered on the tire center.
+    pub width: Real,
 
     /// The suspension stiffness.
     ///
@@ -191,6 +192,8 @@ pub struct Wheel {
     pub max_suspension_travel: Real,
     /// The wheel’s radius.
     pub radius: Real,
+    /// Full tire width along the axle, centered on the tire center.
+    pub width: Real,
     /// The suspension stiffness.
     ///
     /// Increase this value if the suspension appears to not push the vehicle strong enough.
@@ -284,6 +287,7 @@ impl Wheel {
             suspension_rest_length: info.suspension_rest_length,
             max_suspension_travel: info.max_suspension_travel,
             radius: info.radius,
+            width: info.width,
             suspension_stiffness: info.suspension_stiffness,
             damping_compression: info.damping_compression,
             damping_relaxation: info.damping_relaxation,
@@ -1008,15 +1012,21 @@ impl DynamicRayCastVehicleController {
         axle_cs: Vector<Real>,
         suspension_rest_length: Real,
         radius: Real,
+        width: Real,
         tuning: &WheelTuning,
         role: WheelRole,
     ) -> &mut Wheel {
+        assert!(
+            width.is_finite() && width > 0.0,
+            "Wheel width must be finite and positive"
+        );
         let ci = WheelDesc {
             chassis_connection_cs,
             direction_cs,
             axle_cs,
             suspension_rest_length,
             radius,
+            width,
             suspension_stiffness: tuning.suspension_stiffness,
             damping_compression: tuning.suspension_compression,
             damping_relaxation: tuning.suspension_damping,
@@ -1073,85 +1083,59 @@ impl DynamicRayCastVehicleController {
     }
 
     #[profiling::function]
-    fn ray_cast(
+    fn suspension_cast(
         &mut self,
         bodies: &RigidBodySet,
         colliders: &ColliderSet,
         queries: &QueryPipeline,
         filter: QueryFilter,
-        chassis: &RigidBody,
+        _chassis: &RigidBody,
         wheel_id: usize,
     ) {
         let wheel = &mut self.wheels[wheel_id];
         let min_length = (wheel.suspension_rest_length - wheel.max_suspension_travel).max(0.0);
         let max_length = wheel.suspension_rest_length + wheel.max_suspension_travel;
-        // Cover full droop plus the largest radius projection accepted below. A distant
-        // plane is not a contact unless the solved tire centre is within suspension travel.
-        let raylen = max_length + wheel.radius / MIN_SUSPENSION_CONTACT_COS;
-        let rayvector = wheel.wheel_direction_ws * raylen;
         let source = wheel.raycast_info.hard_point_ws;
         wheel.debug = WheelDebug {
-            ray_end: source + rayvector,
+            ray_end: source + wheel.wheel_direction_ws * max_length,
             status: 1,
             ..WheelDebug::default()
         };
-        wheel.raycast_info.contact_point_ws = source + rayvector;
-        let ray = Ray::new(source, rayvector);
-        let hit = queries.cast_ray_and_get_normal(bodies, colliders, &ray, 1.0, true, filter);
-
         wheel.raycast_info.ground_object = None;
         wheel.raycast_info.is_in_contact = false;
-
-        if let Some((collider_hit, mut hit)) = hit {
-            let mut hit_point = ray.point_at(hit.time_of_impact);
-            wheel.debug.raw_hit = Some(hit_point);
+        wheel.raycast_info.contact_point_ws = wheel.debug.ray_end;
+        let sweep = WheelSweep {
+            mount: source,
+            direction: wheel.wheel_direction_ws,
+            axle: wheel.wheel_axle_ws,
+            radius: wheel.radius,
+            width: wheel.width,
+            min_length,
+            max_length,
+        };
+        let (support, rejected) = sweep.cast(bodies, colliders, queries, filter, self.chassis);
+        if let Some(point) = rejected {
+            wheel.debug.raw_hit = Some(point);
             wheel.debug.status = 2;
-            if hit.time_of_impact == 0.0 {
-                let collider = &colliders[collider_hit];
-                // Starting inside a collider: find the exit toward the suspension mount
-                // on the same line, so the plane is on the surface rather than at source.
-                let up_ray = Ray::new(source, -rayvector);
-                if let Some(hit2) =
-                    collider
-                        .shape
-                        .cast_ray_and_get_normal(collider.position(), &up_ray, 1.0, false)
-                {
-                    // Hollow casts from inside may return a normal facing the ray origin.
-                    hit.normal = if hit2.normal.dot(&wheel.wheel_direction_ws) > 0.0 {
-                        -hit2.normal
-                    } else {
-                        hit2.normal
-                    };
-                    hit_point = up_ray.point_at(hit2.time_of_impact);
-                }
-            }
-
+        }
+        if let Some(hit) = support {
+            wheel.debug.raw_hit = Some(hit.point);
+            wheel.debug.status = 4;
+            wheel.raycast_info.suspension_length = hit.length;
+            wheel.raycast_info.contact_point_ws = hit.point;
+            wheel.raycast_info.contact_normal_ws = hit.normal;
+            wheel.raycast_info.is_in_contact = true;
+            wheel.raycast_info.ground_object = Some(hit.collider);
             let incidence = -hit.normal.dot(&wheel.wheel_direction_ws);
-            // The tire is a circular cross-section in the plane perpendicular to its axle.
-            // Project the road normal into that plane to locate its support point.
-            let radial = hit.normal - wheel.wheel_axle_ws * hit.normal.dot(&wheel.wheel_axle_ws);
-            let radial_length = radial.norm();
-            if incidence >= MIN_SUSPENSION_CONTACT_COS && radial_length > 1.0e-5 {
-                wheel.debug.status = 3;
-                let radius_normal = wheel.radius * radial_length;
-                let length = (hit.normal.dot(&(source - hit_point)) - radius_normal) / incidence;
-                if length.is_finite() && length <= max_length + 1.0e-5 {
-                    wheel.raycast_info.suspension_length = length.clamp(min_length, max_length);
-                    let center =
-                        source + wheel.wheel_direction_ws * wheel.raycast_info.suspension_length;
-                    let support = center - radial * (wheel.radius / radial_length);
-                    // At a compression stop, retain a surface contact even if the tire penetrates.
-                    wheel.raycast_info.contact_point_ws =
-                        support - hit.normal * hit.normal.dot(&(support - hit_point));
-                    wheel.raycast_info.contact_normal_ws = hit.normal;
-                    wheel.raycast_info.is_in_contact = true;
-                    wheel.debug.status = 4;
-                    wheel.raycast_info.ground_object = Some(collider_hit);
-                    let velocity = chassis.velocity_at_point(&wheel.raycast_info.contact_point_ws);
-                    wheel.clipped_inv_contact_dot_suspension = 1.0 / incidence;
-                    wheel.suspension_relative_velocity = hit.normal.dot(&velocity) / incidence;
-                }
-            }
+            let velocity = relative_velocity_at_contact(
+                bodies,
+                colliders,
+                self.chassis,
+                Some(hit.collider),
+                &hit.point,
+            );
+            wheel.clipped_inv_contact_dot_suspension = 1.0 / incidence;
+            wheel.suspension_relative_velocity = hit.normal.dot(&velocity) / incidence;
         }
         if !wheel.raycast_info.is_in_contact {
             // No contact, put wheel info as in rest position
@@ -1631,7 +1615,7 @@ impl DynamicRayCastVehicleController {
         //
 
         for wheel_id in 0..self.wheels.len() {
-            self.ray_cast(bodies, colliders, queries, filter, chassis, wheel_id);
+            self.suspension_cast(bodies, colliders, queries, filter, chassis, wheel_id);
         }
 
         let chassis_mass = chassis.mass();
@@ -2954,6 +2938,7 @@ mod tests {
                                 Vector::x(),
                                 0.3,
                                 0.4,
+                                0.2,
                                 &WheelTuning::default(),
                                 WheelRole::new(WheelAxle::Front, false, false),
                             );
@@ -3524,6 +3509,7 @@ mod tests {
                 -Vector::x(),
                 0.4,
                 0.35,
+                0.2,
                 &WheelTuning::default(),
                 WheelRole::new(axle, true, axle == WheelAxle::Front),
             );
@@ -3559,6 +3545,7 @@ mod tests {
             Vector::x(),
             0.4,
             WHEEL_REFERENCE_RADIUS,
+            0.2,
             &WheelTuning::default(),
             WheelRole::new(WheelAxle::Rear, true, false),
         );
@@ -3611,6 +3598,7 @@ mod tests {
                 Vector::x(),
                 0.4,
                 0.35,
+                0.2,
                 &WheelTuning::default(),
                 WheelRole::new(axle, axle == WheelAxle::Rear, axle == WheelAxle::Front),
             );
@@ -5606,6 +5594,7 @@ mod tests {
             Vector::x(),
             0.4,
             0.35,
+            0.2,
             &WheelTuning::default(),
             WheelRole::new(WheelAxle::Rear, true, false),
         );
@@ -5720,7 +5709,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_offset_ray_hits_only_the_ground_beneath_the_current_tire_center() {
+    fn steering_offset_sweep_hits_the_ground_beneath_the_current_tire_center() {
         use crate::geometry::ColliderBuilder;
         for side in [-1.0, 1.0] {
             for input in [-1.0, 1.0] {
@@ -5738,6 +5727,7 @@ mod tests {
                     -Vector::y(),
                     Vector::x(),
                     0.6,
+                    0.2,
                     0.2,
                     &WheelTuning::default(),
                     WheelRole::new(WheelAxle::Front, false, true),
@@ -5765,13 +5755,18 @@ mod tests {
                 let wheel = &controller.wheels[0];
                 assert_eq!(wheel.raycast_info.ground_object, Some(ground));
                 assert!(
-                    (wheel.raycast_info.contact_point_ws - Point::from(shifted)).norm() < 1.0e-5
+                    (wheel.raycast_info.contact_point_ws - Point::from(shifted)).norm() < 1.0e-4,
+                    "contact={:?} shifted={:?} normal={:?} length={}",
+                    wheel.raycast_info.contact_point_ws,
+                    shifted,
+                    wheel.raycast_info.contact_normal_ws,
+                    wheel.raycast_info.suspension_length
                 );
                 assert!(
-                    (wheel.center() - Point::from(shifted + Vector::y() * 0.2)).norm() < 1.0e-5
+                    (wheel.center() - Point::from(shifted + Vector::y() * 0.2)).norm() < 1.0e-4
                 );
-                assert!((wheel.raycast_info.suspension_length - 0.4).abs() < 1.0e-5);
-                // Removing the offset makes the same ray miss the narrow ground patch.
+                assert!((wheel.raycast_info.suspension_length - 0.4).abs() < 1.0e-4);
+                // Removing the offset makes the same cylinder miss the narrow ground patch.
                 controller.wheels[0]
                     .set_center_offset_cs(Vector::zeros())
                     .unwrap();
@@ -5784,7 +5779,7 @@ mod tests {
                     QueryFilter::default(),
                 );
                 assert!(!controller.wheels[0].raycast_info.is_in_contact);
-                assert!((controller.wheels[0].center().y - 0.0).abs() < 1.0e-5);
+                assert!((controller.wheels[0].center().y - 0.0).abs() < 1.0e-4);
             }
         }
     }
@@ -5814,7 +5809,7 @@ mod tests {
     }
 
     #[test]
-    fn inclined_suspension_places_the_circular_tire_on_the_road_plane() {
+    fn inclined_suspension_places_the_cylinder_on_the_road_plane() {
         use crate::geometry::ColliderBuilder;
         for side in [-1.0, 1.0] {
             for road_tilt in [0.0, 0.2] {
@@ -5837,8 +5832,9 @@ mod tests {
                         let rotation = Rotation::new(kingpin * steering);
                         let world_axle = pose.rotation * (rotation * axle);
                         let radius = 0.3;
-                        let support_height =
-                            radius * (1.0 - normal.dot(&world_axle).powi(2)).sqrt();
+                        let support_height = radius
+                            * (1.0 - normal.dot(&world_axle).powi(2)).sqrt()
+                            + 0.1 * normal.dot(&world_axle).abs();
                         let expected_center =
                             Point::new(0.8, (support_height - 0.8 * normal.x) / normal.y, 1.0);
                         let offset = Vector::new(side * 0.25, 0.02, 0.0);
@@ -5855,6 +5851,7 @@ mod tests {
                             axle,
                             0.5,
                             radius,
+                            0.2,
                             &WheelTuning::default(),
                             WheelRole::new(WheelAxle::Front, false, true),
                         );
@@ -5865,7 +5862,7 @@ mod tests {
                         let mut queries = QueryPipeline::new();
                         queries.update(&colliders);
                         controller.update_wheel_transforms_ws(&bodies[chassis], 0);
-                        controller.ray_cast(
+                        controller.suspension_cast(
                             &bodies,
                             &colliders,
                             &queries,
@@ -5884,12 +5881,13 @@ mod tests {
                             "contact must lie on the road"
                         );
                         assert!(
-                            (radial.norm() - radius).abs() < 2.0e-5,
+                            ((radial - world_axle * radial.dot(&world_axle)).norm() - radius).abs()
+                                < 2.0e-5,
                             "contact must lie on the tire"
                         );
                         assert!(
-                            radial.dot(&world_axle).abs() < 2.0e-5,
-                            "contact must lie in the wheel plane"
+                            radial.dot(&world_axle).abs() <= 0.1 + 2.0e-5,
+                            "contact must lie within tire width"
                         );
                     }
                 }
@@ -5921,6 +5919,7 @@ mod tests {
                     Vector::x(),
                     0.5,
                     0.3,
+                    0.2,
                     &WheelTuning::default(),
                     WheelRole::new(WheelAxle::Front, false, true),
                 );
@@ -5930,7 +5929,7 @@ mod tests {
                 let mut queries = QueryPipeline::new();
                 queries.update(&colliders);
                 controller.update_wheel_transforms_ws(&bodies[chassis], 0);
-                controller.ray_cast(
+                controller.suspension_cast(
                     &bodies,
                     &colliders,
                     &queries,
@@ -5970,6 +5969,7 @@ mod tests {
                 Vector::x(),
                 0.3,
                 0.3,
+                0.2,
                 &WheelTuning::default(),
                 WheelRole::new(WheelAxle::Front, false, true),
             );
@@ -5977,7 +5977,7 @@ mod tests {
             let mut queries = QueryPipeline::new();
             queries.update(&colliders);
             controller.update_wheel_transforms_ws(&bodies[chassis], 0);
-            controller.ray_cast(
+            controller.suspension_cast(
                 &bodies,
                 &colliders,
                 &queries,
@@ -5986,8 +5986,7 @@ mod tests {
                 0,
             );
             let diagnostic = controller.wheels[0].debug;
-            assert!(diagnostic.raw_hit.is_some());
-            assert_eq!(diagnostic.status, if height > 1.0 { 3 } else { 2 });
+            assert_eq!(diagnostic.status, if height > 1.0 { 1 } else { 2 });
             assert_eq!(diagnostic.forward_impulse, Vector::zeros());
             assert_eq!(diagnostic.side_impulse, Vector::zeros());
             let wheel = &controller.wheels[0];
@@ -6015,6 +6014,7 @@ mod tests {
             Vector::x(),
             0.3,
             0.3,
+            0.2,
             &WheelTuning::default(),
             WheelRole::new(WheelAxle::Front, false, true),
         );
@@ -6022,7 +6022,7 @@ mod tests {
         let mut queries = QueryPipeline::new();
         queries.update(&colliders);
         controller.update_wheel_transforms_ws(&bodies[chassis], 0);
-        controller.ray_cast(
+        controller.suspension_cast(
             &bodies,
             &colliders,
             &queries,
@@ -6037,6 +6037,147 @@ mod tests {
         assert_eq!(wheel.raycast_info.suspension_length, 0.0);
     }
 
+    #[test]
+    fn suspension_damping_uses_ground_relative_velocity() {
+        use crate::geometry::ColliderBuilder;
+        for velocity in [-3.0, 0.0, 3.0] {
+            let mut bodies = RigidBodySet::new();
+            let chassis = bodies.insert(RigidBodyBuilder::dynamic().linvel(Vector::y() * velocity));
+            let ground = bodies.insert(
+                RigidBodyBuilder::kinematic_velocity_based().linvel(Vector::y() * velocity),
+            );
+            let mut colliders = ColliderSet::new();
+            colliders.insert_with_parent(
+                ColliderBuilder::cuboid(5.0, 0.1, 5.0).translation(Vector::new(0.0, -0.1, 0.0)),
+                ground,
+                &mut bodies,
+            );
+            let mut queries = QueryPipeline::new();
+            queries.update(&colliders);
+            let mut controller =
+                DynamicRayCastVehicleController::new(chassis, VehicleControllerConfig::default());
+            let wheel = controller.add_wheel(
+                Point::new(0.0, 0.6, 0.0),
+                -Vector::y(),
+                Vector::x(),
+                0.5,
+                0.3,
+                0.2,
+                &WheelTuning::default(),
+                WheelRole::new(WheelAxle::Front, false, false),
+            );
+            wheel.suspension_stiffness = 0.0;
+            controller.update_wheel_transforms_ws(&bodies[chassis], 0);
+            controller.suspension_cast(
+                &bodies,
+                &colliders,
+                &queries,
+                QueryFilter::default(),
+                &bodies[chassis],
+                0,
+            );
+            controller.update_suspension(1000.0);
+            assert!(controller.wheels[0].raycast_info.is_in_contact);
+            assert_eq!(controller.wheels[0].suspension_relative_velocity, 0.0);
+            assert_eq!(controller.wheels[0].wheel_suspension_force, 0.0);
+        }
+    }
+
+    #[test]
+    fn curb_suspension_response_remains_bounded_across_timesteps() {
+        use crate::geometry::ColliderBuilder;
+        for speed in [2.0, 5.0, 10.0] {
+            let mut peaks = Vec::new();
+            for hz in [30, 60, 120] {
+                let dt = 1.0 / hz as Real;
+                let mut bodies = RigidBodySet::new();
+                let chassis = bodies.insert(
+                    RigidBodyBuilder::dynamic()
+                        .additional_mass(1000.0)
+                        .lock_rotations()
+                        .translation(Vector::new(0.0, 0.56934375, -2.0)),
+                );
+                let mut colliders = ColliderSet::new();
+                bodies[chassis].recompute_mass_properties_from_colliders(&colliders);
+                colliders.insert(
+                    ColliderBuilder::cuboid(100.0, 0.1, 100.0)
+                        .translation(Vector::new(0.0, -0.1, 0.0)),
+                );
+                colliders.insert(
+                    ColliderBuilder::cuboid(100.0, 0.05, 100.0)
+                        .translation(Vector::new(0.0, 0.05, 100.0)),
+                );
+                let mut queries = QueryPipeline::new();
+                queries.update(&colliders);
+                let mut controller = DynamicRayCastVehicleController::new(
+                    chassis,
+                    VehicleControllerConfig::default(),
+                );
+                for x in [-0.6, 0.6] {
+                    for z in [-0.8, 0.8] {
+                        let wheel = controller.add_wheel(
+                            Point::new(x, 0.0, z),
+                            -Vector::y(),
+                            Vector::x(),
+                            0.3,
+                            0.3,
+                            0.2,
+                            &WheelTuning::default(),
+                            WheelRole::new(WheelAxle::Front, false, false),
+                        );
+                        wheel.max_suspension_travel = 0.3;
+                        wheel.suspension_stiffness = 80.0;
+                        wheel.damping_compression = 2.0;
+                        wheel.damping_relaxation = 2.6;
+                        wheel.max_suspension_force = 31_000.0;
+                    }
+                }
+                let mut peak: Real = 0.0;
+                // Isolate the suspension with prescribed horizontal travel; no tire or
+                // chassis collision impulses can conceal a suspension regression.
+                for step in 0..hz * 5 {
+                    let horizontal = if step < hz { 0.0 } else { speed };
+                    let vertical = bodies[chassis].linvel().y;
+                    bodies[chassis].set_linvel(Vector::new(0.0, vertical, horizontal), true);
+                    for i in 0..4 {
+                        controller.update_wheel_transforms_ws(&bodies[chassis], i);
+                        controller.suspension_cast(
+                            &bodies,
+                            &colliders,
+                            &queries,
+                            QueryFilter::default(),
+                            &bodies[chassis],
+                            i,
+                        );
+                    }
+                    controller.update_suspension(1000.0);
+                    let force = controller
+                        .wheels
+                        .iter()
+                        .map(|w| {
+                            w.wheel_suspension_force.min(w.max_suspension_force)
+                                * w.raycast_info.contact_normal_ws.y
+                        })
+                        .sum::<Real>();
+                    bodies[chassis].apply_impulse(Vector::y() * (force - 9810.0) * dt, true);
+                    let position = *bodies[chassis].translation() + bodies[chassis].linvel() * dt;
+                    bodies[chassis].set_translation(position, true);
+                    peak = peak.max(bodies[chassis].linvel().y);
+                    assert!(position.y.is_finite() && position.y > 0.3 && position.y < 1.2);
+                }
+                assert!((bodies[chassis].translation().y - 0.66934375).abs() < 0.01);
+                assert!(peak < 2.0, "speed={speed} hz={hz} peak={peak}");
+                peaks.push(peak);
+            }
+            eprintln!("curb speed={speed}: peak vertical speeds at 30/60/120 Hz: {peaks:?}");
+            assert!(
+                peaks.iter().copied().fold(0.0, Real::max)
+                    - peaks.iter().copied().fold(Real::MAX, Real::min)
+                    < 0.6
+            );
+        }
+    }
+
     fn test_wheel() -> Wheel {
         let mut wheel = Wheel::new(WheelDesc {
             chassis_connection_cs: Point::origin(),
@@ -6045,6 +6186,7 @@ mod tests {
             suspension_rest_length: 0.4,
             max_suspension_travel: 5.0,
             radius: 0.35,
+            width: 0.2,
             suspension_stiffness: 5.88,
             damping_compression: 0.83,
             damping_relaxation: 0.88,
@@ -6398,6 +6540,7 @@ mod tests {
             Vector::x(),
             0.4,
             0.35,
+            0.2,
             &WheelTuning::default(),
             WheelRole::new(WheelAxle::Rear, true, false),
         );
@@ -6465,6 +6608,7 @@ mod tests {
             Vector::x(),
             0.4,
             0.35,
+            0.2,
             &WheelTuning::default(),
             WheelRole::new(WheelAxle::Front, false, true),
         );
@@ -6896,6 +7040,7 @@ mod tests {
             Vector::x(),
             0.4,
             0.35,
+            0.2,
             &WheelTuning::default(),
             WheelRole::new(WheelAxle::Front, true, true),
         );

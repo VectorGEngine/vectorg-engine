@@ -51,11 +51,11 @@ contact or assist convergence checks.
 
 Wheel geometry keeps the fixed suspension mount separate from the tire center.
 In chassis coordinates, the steering pivot is `mount + direction * length`,
-and the tire center is `pivot + steering_rotation * center_offset`. The single
-suspension ray starts at `mount + steering_rotation * center_offset` and follows
+and the tire center is `pivot + steering_rotation * center_offset`. The cylinder
+suspension sweep is centered on `mount + steering_rotation * center_offset` and follows
 the suspension direction. Steering rotates the neutral offset and axle around
 `steering_axis`; it does not rotate the suspension direction or include wheel
-roll. With a zero offset, the ray stays on the original suspension line.
+roll. With a zero offset, the tire stays on the original suspension line.
 
 The game derives suspension direction and rest length from the authored Mount-to-Joint
 displacement. The existing wheel Up Axis (`spin.upLocalAxis`) transformed by
@@ -65,17 +65,27 @@ the wheel center; toe rotates the neutral offset and axle around the kingpin;
 camber adjusts the axle at the tire center. Driving, replay, force feedback,
 and capability calculations share these frames.
 
-The ray supplies a local road plane. Tire contact is solved using a circular
-wheel cross-section perpendicular to the steered axle. Its support radius along
-the plane normal and the suspension/normal angle determine spring length.
-The resulting tire support point supplies tire and suspension contact forces;
-the ray hit itself is not generally that contact point for tilted travel.
-Spring compression and damper velocity are measured along suspension travel;
-their combined force is projected into the supporting road-normal reaction.
-Ray reach covers full droop and the radius projection for supported incidence
-angles (normal opposite travel, cosine at least 0.1). Hits beyond reachable
-travel or at near-parallel incidence do not create wheel contact. This remains
-a single-ray approximation; it does not resolve tire width or suspension-arm arcs.
+The suspension query sweeps a cylinder (authored radius and full axle width)
+from maximum compression to full droop. It visits only shapes/triangles whose
+bounds overlap that travel volume, then selects the earliest supporting hit.
+Mesh and compound parts are considered separately so a rejected steep contact
+cannot hide supporting ground in the same collider. Contact normals must oppose
+travel with cosine at least 0.1; initial overlaps request penetration geometry.
+Contacts inside planar faces use exact cylinder support distances and face normals;
+edge/corner contacts use the engine's convex shape cast. This avoids noisy GJK
+normals on large flat road faces and preserves the circular approach to curbs.
+The sweep witness and cylinder support determine the contact, including camber.
+A flat contact patch uses its central support when that point lies on the surface.
+There is one suspension/tire load per wheel, regardless of candidate count.
+
+Spring compression and ground-relative damper velocity are measured along
+suspension travel; their combined force is projected into the road-normal reaction.
+The game supplies a finite force envelope from full-stroke spring force plus
+damping at the speed with equivalent spring energy. Its floor can support the
+whole chassis weight and configured maximum downforce on one contact. Applied
+suspension, anti-roll transfer, and tire grip all respect this same force limit.
+The scene query covers suspension travel, not forward motion between ticks;
+narrow obstacles can still be skipped at sufficiently high speed.
 
 Downforce uses one shared configuration with a positive curve exponent, a maximum
 center-of-mass force, and optional chassis-local points with their own maximum

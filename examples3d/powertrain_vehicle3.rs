@@ -108,6 +108,7 @@ pub fn init_world(testbed: &mut Testbed) {
             -Vector::x(),
             suspension_rest_length,
             wheel_radius,
+            0.2,
             &tuning,
             WheelRole::new(axle, true, front),
         );

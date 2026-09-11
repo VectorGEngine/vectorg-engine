@@ -64,6 +64,7 @@ impl Scene {
                 Vector::x(),
                 0.4,
                 0.35,
+                0.2,
                 &WheelTuning {
                     suspension_stiffness: 30.0,
                     suspension_compression: 3.0,
@@ -198,6 +199,67 @@ fn airborne_vehicle_receives_gravity_once() {
     let velocity = scene.bodies[scene.vehicle.chassis].linvel().y;
     assert!((velocity + 9.81).abs() < 0.15, "velocity={velocity}");
     assert!(scene.position().y < 96.0 && scene.position().y > 94.0);
+}
+
+#[test]
+fn curb_crossing_and_landing_settle_through_the_physics_pipeline() {
+    for hz in [30, 60, 120] {
+        for one_side in [false, true] {
+            let mut scene = Scene::new(hz, 4, 0.0, 0.0);
+            scene.colliders.insert(
+                ColliderBuilder::cuboid(if one_side { 1.0 } else { 10.0 }, 0.05, 10.0)
+                    .translation(Vector::new(if one_side { 1.0 } else { 0.0 }, 0.05, 12.0)),
+            );
+            scene.queries.update(&scene.colliders);
+            for wheel in scene.vehicle.wheels_mut() {
+                wheel.max_suspension_travel = 0.4;
+                wheel.max_suspension_force = 20_000.0;
+            }
+            for _ in 0..hz * 2 {
+                scene.tick();
+            }
+            scene.vehicle.set_input(VehicleInput {
+                clutch: 1.0,
+                ..Default::default()
+            });
+            let chassis = scene.vehicle.chassis;
+            scene.bodies[chassis].set_linvel(Vector::new(0.0, 0.0, 5.0), true);
+            let mut peak: f32 = 0.0;
+            for _ in 0..hz * 2 {
+                scene.tick();
+                peak = peak.max(scene.bodies[chassis].linvel().y);
+                assert!(scene.position().y < 1.2 && scene.position().y > 0.3);
+            }
+            assert!(scene.position().z > 4.0, "car must cross the curb");
+            assert!(peak < 2.0, "hz={hz} one_side={one_side} peak={peak}");
+            scene.vehicle.set_input(VehicleInput {
+                brake: 1.0,
+                clutch: 1.0,
+                ..Default::default()
+            });
+            for _ in 0..hz * 4 {
+                scene.tick();
+            }
+            assert!(scene.bodies[chassis].linvel().y.abs() < 0.03);
+            // A true airborne landing still receives support and settles.
+            let mut position = scene.position();
+            position.y += 0.8;
+            scene.bodies[chassis].set_translation(position, true);
+            for _ in 0..hz * 4 {
+                scene.tick();
+            }
+            assert!(scene.bodies[chassis].linvel().norm() < 0.05);
+            assert!(
+                scene
+                    .vehicle
+                    .wheels()
+                    .iter()
+                    .filter(|w| w.raycast_info().is_in_contact)
+                    .count()
+                    >= 3
+            );
+        }
+    }
 }
 
 #[test]
