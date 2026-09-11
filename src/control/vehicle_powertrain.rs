@@ -3,6 +3,7 @@ use crate::math::{Real, Vector};
 const TAU: Real = 6.283_185_307_179_586 as Real;
 const TRANSMISSION_PEDAL_ENGAGE: Real = 0.1;
 const TRANSMISSION_PEDAL_RELEASE: Real = 0.05;
+const AUTO_DIRECTION_STOP_DURATION: Real = 0.15;
 const TRANSMISSION_MANUAL_OVERRIDE: Real = 1.5;
 const MANUAL_SHIFT_CLUTCH_DISENGAGEMENT: Real = 0.8;
 const STALL_RPM_RATIO: Real = 0.55;
@@ -168,6 +169,8 @@ pub struct VehicleDownforceConfig {
     pub max_force: Real,
     /// Positive curve exponent: 1 is linear, 2 is quadratic.
     pub exponent: Real,
+    /// Additional longitudinal drag per newton of generated downforce.
+    pub drag_per_downforce: Real,
     /// Per-point maximum forces; the shared curve applies to every point.
     pub points: Vec<VehicleDownforcePoint>,
 }
@@ -177,6 +180,7 @@ impl Default for VehicleDownforceConfig {
         Self {
             max_force: 0.0,
             exponent: 2.0,
+            drag_per_downforce: 0.2,
             points: Vec::new(),
         }
     }
@@ -363,8 +367,12 @@ pub struct VehicleState {
     pub gear_shift_rejected_sequence: u32,
     /// Current gear, where -1 is reverse and 0 is neutral.
     pub current_gear: i32,
-    /// Whether reverse gear is currently selected.
+    /// Whether the automatic controls retain reverse driving intent, including in neutral.
     pub reverse_direction: bool,
+    /// Driver throttle after automatic direction resolution, before engine overrides.
+    pub resolved_throttle: Real,
+    /// Service-brake input after automatic direction resolution, before wheel brake bias.
+    pub resolved_brake: Real,
     /// Signed chassis speed along the configured forward axis.
     pub vehicle_speed: Real,
     /// Fastest driven-wheel surface speed.
@@ -477,6 +485,29 @@ enum AutomaticClutchPhase {
     Locked,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectionPedal {
+    NeedsRelease,
+    Released,
+    Pending,
+    Braking,
+    Driving,
+}
+
+impl DirectionPedal {
+    fn update(&mut self, value: Real, eligible: bool) {
+        if value <= TRANSMISSION_PEDAL_RELEASE {
+            *self = Self::Released;
+        } else {
+            *self = match *self {
+                Self::Released | Self::Pending if eligible => Self::Pending,
+                Self::Released | Self::Pending => Self::Braking,
+                other => other,
+            };
+        }
+    }
+}
+
 pub(crate) struct VehiclePowertrain {
     pub config: VehicleControllerConfig,
     input: VehicleInput,
@@ -491,7 +522,10 @@ pub(crate) struct VehiclePowertrain {
     shift_phase_timer: Real,
     shift_to: i32,
     shift_overshoot_rpm: Real,
-    reverse_brake_armed: bool,
+    brake_intent: DirectionPedal,
+    throttle_intent: DirectionPedal,
+    stopped_time: Real,
+    movement_speed: Real,
     turbo_load: Real,
     previous_throttle: Real,
     restart_armed: bool,
@@ -525,7 +559,10 @@ impl VehiclePowertrain {
             shift_phase_timer: 0.0,
             shift_to: 0,
             shift_overshoot_rpm: 0.0,
-            reverse_brake_armed: false,
+            brake_intent: DirectionPedal::NeedsRelease,
+            throttle_intent: DirectionPedal::NeedsRelease,
+            stopped_time: 0.0,
+            movement_speed: 0.0,
             turbo_load: 0.0,
             previous_throttle: 0.0,
             restart_armed: true,
@@ -563,7 +600,10 @@ impl VehiclePowertrain {
         self.shift_phase_timer = 0.0;
         self.shift_to = 0;
         self.shift_overshoot_rpm = 0.0;
-        self.reverse_brake_armed = false;
+        self.brake_intent = DirectionPedal::NeedsRelease;
+        self.throttle_intent = DirectionPedal::NeedsRelease;
+        self.stopped_time = 0.0;
+        self.movement_speed = 0.0;
         self.turbo_load = 0.0;
         self.previous_throttle = 0.0;
         self.restart_armed = true;
@@ -676,7 +716,8 @@ impl VehiclePowertrain {
 
     fn set_manual_shift_target(&mut self, gear: i32, allows_blip: bool) {
         self.state.reverse_direction = false;
-        self.reverse_brake_armed = false;
+        self.brake_intent = DirectionPedal::NeedsRelease;
+        self.throttle_intent = DirectionPedal::NeedsRelease;
         self.shift_target = gear;
         self.shift_target_allows_blip = allows_blip;
         self.manual_override = TRANSMISSION_MANUAL_OVERRIDE;
@@ -694,6 +735,7 @@ impl VehiclePowertrain {
         self.update_with_wheel_dynamics(
             dt,
             vehicle_speed,
+            vehicle_speed.abs(),
             driven_wheel_speed,
             driven_wheel_radius,
             0.0,
@@ -706,6 +748,7 @@ impl VehiclePowertrain {
         &mut self,
         dt: Real,
         vehicle_speed: Real,
+        movement_speed: Real,
         driven_wheel_speed: Real,
         driven_wheel_radius: Real,
         wheel_inverse_inertia: Real,
@@ -717,8 +760,11 @@ impl VehiclePowertrain {
         self.state.vehicle_speed = vehicle_speed;
         self.state.driven_wheel_speed = driven_wheel_speed.abs();
         self.update_shift_sequence(dt, driven_wheel_speed.abs(), driven_wheel_radius);
+        self.update_direction_inputs(dt, movement_speed);
 
         let (requested_drive_throttle, service_brake) = self.effective_pedals();
+        self.state.resolved_throttle = requested_drive_throttle;
+        self.state.resolved_brake = service_brake;
         self.update_engine_start_state(dt, requested_drive_throttle);
         let mut drive_throttle = if self.state.engine_starting {
             0.0
@@ -909,12 +955,7 @@ impl VehiclePowertrain {
         };
         self.state.turbo_load = self.turbo_load;
 
-        self.update_transmission(
-            dt,
-            vehicle_speed,
-            driven_wheel_speed.abs(),
-            driven_wheel_radius,
-        );
+        self.update_transmission(vehicle_speed, driven_wheel_speed.abs(), driven_wheel_radius);
         if self.engine_state() != previous_engine_state {
             self.state.engine_state_sequence = self.state.engine_state_sequence.wrapping_add(1);
         }
@@ -932,7 +973,11 @@ impl VehiclePowertrain {
 
     fn effective_pedals(&self) -> (Real, Real) {
         if self.state.reverse_direction {
-            (self.input.brake, self.input.throttle)
+            if self.brake_intent == DirectionPedal::Driving {
+                (self.input.brake, self.input.throttle)
+            } else {
+                (0.0, self.input.brake.max(self.input.throttle))
+            }
         } else {
             (self.input.throttle, self.input.brake)
         }
@@ -1271,15 +1316,10 @@ impl VehiclePowertrain {
 
     fn update_transmission(
         &mut self,
-        dt: Real,
         vehicle_speed: Real,
         driven_wheel_speed: Real,
         wheel_radius: Real,
     ) {
-        self.shift_cooldown = (self.shift_cooldown - dt).max(0.0);
-        self.reverse_cooldown = (self.reverse_cooldown - dt).max(0.0);
-        self.manual_override = (self.manual_override - dt).max(0.0);
-
         if self.shift_phase != ShiftPhase::Idle {
             return;
         }
@@ -1297,7 +1337,7 @@ impl VehiclePowertrain {
         }
 
         self.state.current_gear = self.shift_target;
-        if self.state.current_gear >= 0 {
+        if self.state.current_gear > 0 {
             self.state.reverse_direction = false;
         }
         self.shift_cooldown = self.config.transmission.shift_cooldown;
@@ -1402,57 +1442,80 @@ impl VehiclePowertrain {
         Some(wheel_rpm * ratio * self.config.transmission.final_drive_ratio)
     }
 
-    fn update_automatic_transmission(&mut self, speed: Real, wheel_radius: Real) {
-        if self.reverse_cooldown > Real::EPSILON {
-            return;
-        }
-
-        let stopped = speed.abs() < self.config.transmission.stopped_speed;
-        let throttle_pressed = self.input.throttle > TRANSMISSION_PEDAL_ENGAGE;
-        let brake_pressed = self.input.brake > TRANSMISSION_PEDAL_ENGAGE;
-        let brake_released = self.input.brake <= TRANSMISSION_PEDAL_RELEASE;
-
-        if self.state.reverse_direction {
-            self.reverse_brake_armed = false;
-        } else if self.shift_target != 0 {
-            self.reverse_brake_armed = false;
-        } else if brake_released {
-            self.reverse_brake_armed = true;
-        }
-
-        if self.shift_cooldown > Real::EPSILON {
-            return;
-        }
-
-        if self.config.transmission.auto_reverse {
-            if self.state.reverse_direction && stopped && throttle_pressed {
-                self.state.reverse_direction = false;
-                self.shift_target = 1;
-                self.shift_target_allows_blip = false;
-                self.reverse_cooldown = self.config.transmission.shift_cooldown;
-                self.reverse_brake_armed = false;
-                return;
-            }
-
-            if !self.state.reverse_direction
-                && self.shift_target == 0
-                && self.reverse_brake_armed
-                && brake_pressed
-            {
-                self.state.reverse_direction = true;
-                self.shift_target = -1;
-                self.shift_target_allows_blip = false;
-                self.reverse_cooldown = self.config.transmission.shift_cooldown;
-                self.reverse_brake_armed = false;
-                return;
-            }
-        }
-
-        let drive_pedal = if self.state.reverse_direction {
-            self.input.brake
+    fn update_direction_inputs(&mut self, dt: Real, movement_speed: Real) {
+        self.shift_cooldown = (self.shift_cooldown - dt).max(0.0);
+        self.reverse_cooldown = (self.reverse_cooldown - dt).max(0.0);
+        self.manual_override = (self.manual_override - dt).max(0.0);
+        self.movement_speed = movement_speed;
+        self.stopped_time = if movement_speed < self.config.transmission.stopped_speed {
+            (self.stopped_time + dt).min(AUTO_DIRECTION_STOP_DURATION)
         } else {
-            self.input.throttle
+            0.0
         };
+
+        let automatic = self.config.transmission.automatic
+            && self.config.transmission.auto_reverse
+            && self.manual_override <= Real::EPSILON;
+        let eligible = automatic
+            && self.stopped_time >= AUTO_DIRECTION_STOP_DURATION
+            && self.shift_phase == ShiftPhase::Idle
+            && self.shift_cooldown <= Real::EPSILON
+            && self.reverse_cooldown <= Real::EPSILON;
+
+        // Track every sample, including cooldown/manual-override ticks. A rejected
+        // press is consumed as braking and cannot become a queued direction change.
+        self.brake_intent.update(
+            self.input.brake,
+            eligible && self.input.throttle <= TRANSMISSION_PEDAL_RELEASE,
+        );
+        self.throttle_intent.update(
+            self.input.throttle,
+            eligible && self.input.brake <= TRANSMISSION_PEDAL_RELEASE,
+        );
+        if !automatic {
+            return;
+        }
+
+        // The opposing pedal cancels this reverse launch for the rest of the
+        // press. Releasing the opposing pedal must not restore acceleration.
+        if self.brake_intent == DirectionPedal::Driving
+            && self.input.throttle > TRANSMISSION_PEDAL_RELEASE
+        {
+            self.brake_intent = DirectionPedal::Braking;
+        }
+
+        let gear = if self.brake_intent == DirectionPedal::Pending
+            && self.input.brake > TRANSMISSION_PEDAL_ENGAGE
+        {
+            self.brake_intent = DirectionPedal::Driving;
+            -1
+        } else if self.state.reverse_direction
+            && self.throttle_intent == DirectionPedal::Pending
+            && self.input.throttle > TRANSMISSION_PEDAL_ENGAGE
+        {
+            self.throttle_intent = DirectionPedal::Driving;
+            1
+        } else {
+            return;
+        };
+
+        // Commit only a presently eligible request, before resolving pedals and
+        // torque. Ordinary forward shifting remains in update_transmission.
+        self.state.reverse_direction = gear < 0;
+        self.state.current_gear = gear;
+        self.shift_target = gear;
+        self.shift_target_allows_blip = false;
+        self.reverse_cooldown = self.config.transmission.shift_cooldown;
+        self.shift_cooldown = self.config.transmission.shift_cooldown;
+    }
+
+    fn update_automatic_transmission(&mut self, speed: Real, wheel_radius: Real) {
+        if self.reverse_cooldown > Real::EPSILON || self.shift_cooldown > Real::EPSILON {
+            return;
+        }
+
+        let stopped = self.movement_speed < self.config.transmission.stopped_speed;
+        let (drive_pedal, _) = self.effective_pedals();
 
         if self.shift_target != 0 && stopped && drive_pedal <= TRANSMISSION_PEDAL_RELEASE {
             self.shift_target = 0;
@@ -1909,6 +1972,174 @@ mod tests {
         VehiclePowertrain::new(config)
     }
 
+    fn settle_for_direction(powertrain: &mut VehiclePowertrain) {
+        powertrain.set_input(VehicleInput::default());
+        for _ in 0..20 {
+            powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        }
+    }
+
+    fn direction_tick(
+        powertrain: &mut VehiclePowertrain,
+        speed: Real,
+        movement_speed: Real,
+        throttle: Real,
+        brake: Real,
+    ) -> PowertrainOutput {
+        powertrain.set_input(VehicleInput {
+            throttle,
+            brake,
+            ..VehicleInput::default()
+        });
+        powertrain.update_with_wheel_dynamics(
+            1.0 / 60.0,
+            speed,
+            movement_speed,
+            speed,
+            0.35,
+            0.0,
+            0.0,
+            1.0,
+        )
+    }
+
+    #[test]
+    fn rolling_brake_press_remains_braking_through_stop_and_neutral() {
+        for speed in [-5.0, 5.0] {
+            for initial_brake in [0.08, 1.0] {
+                for gear in [0, 1] {
+                    let mut powertrain = automatic_powertrain();
+                    settle_for_direction(&mut powertrain);
+                    powertrain.state.current_gear = gear;
+                    powertrain.shift_target = gear;
+                    let output =
+                        direction_tick(&mut powertrain, speed, speed.abs(), 0.0, initial_brake);
+                    assert_eq!(output.service_brake, initial_brake);
+                    assert_eq!(output.drive_throttle, 0.0);
+                    for _ in 0..30 {
+                        let output = direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
+                        assert_eq!(output.service_brake, 1.0);
+                        assert_eq!(output.drive_throttle, 0.0);
+                        assert!(!powertrain.state.reverse_direction);
+                    }
+                    direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 0.0);
+                    let output = direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
+                    assert_eq!(powertrain.state.current_gear, -1);
+                    assert_eq!(output.drive_throttle, 1.0);
+                    assert_eq!(output.service_brake, 0.0);
+                    assert_eq!(powertrain.state.resolved_throttle, 1.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direction_requests_blocked_by_motion_overlap_or_cooldown_are_not_queued() {
+        for blocker in 0..5 {
+            let mut powertrain = automatic_powertrain();
+            settle_for_direction(&mut powertrain);
+            let (movement, throttle) = match blocker {
+                0 => (5.0, 0.0), // Sideways movement with zero forward speed.
+                1 => (0.0, 1.0),
+                2 => {
+                    powertrain.shift_cooldown = 0.1;
+                    (0.0, 0.0)
+                }
+                3 => {
+                    powertrain.manual_override = 0.1;
+                    (0.0, 0.0)
+                }
+                _ => {
+                    powertrain.stopped_time = 0.0;
+                    (0.0, 0.0)
+                }
+            };
+            direction_tick(&mut powertrain, 0.0, movement, throttle, 0.08);
+            for _ in 0..60 {
+                let output = direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
+                assert_eq!(output.service_brake, 1.0);
+                assert_eq!(output.drive_throttle, 0.0);
+                assert!(!powertrain.state.reverse_direction);
+            }
+            direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 0.0);
+            direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
+            assert_eq!(powertrain.state.current_gear, -1);
+        }
+    }
+
+    #[test]
+    fn reverse_braking_requires_a_new_stationary_launch_press() {
+        for use_throttle in [false, true] {
+            let mut powertrain = automatic_powertrain();
+            settle_for_direction(&mut powertrain);
+            direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
+            let output = direction_tick(&mut powertrain, -5.0, 5.0, 0.0, 1.0);
+            assert_eq!(output.drive_throttle, 1.0);
+            direction_tick(&mut powertrain, -5.0, 5.0, 0.0, 0.0);
+            let (throttle, brake) = if use_throttle { (1.0, 0.0) } else { (0.0, 1.0) };
+            let output = direction_tick(&mut powertrain, -5.0, 5.0, throttle, brake);
+            assert_eq!(output.service_brake, 1.0);
+            assert_eq!(output.drive_throttle, 0.0);
+            for _ in 0..30 {
+                let output = direction_tick(&mut powertrain, 0.0, 0.0, throttle, brake);
+                assert_eq!(output.service_brake, 1.0);
+                assert_eq!(output.drive_throttle, 0.0);
+                assert!(powertrain.state.reverse_direction);
+            }
+            assert_eq!(powertrain.state.current_gear, 0);
+            direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 0.0);
+            let output = direction_tick(&mut powertrain, 0.0, 0.0, throttle, brake);
+            assert_eq!(output.drive_throttle, 1.0);
+            assert_eq!(output.service_brake, 0.0);
+            assert_eq!(
+                powertrain.state.current_gear,
+                if use_throttle { 1 } else { -1 }
+            );
+        }
+    }
+
+    #[test]
+    fn opposing_pedal_cancels_reverse_drive_until_release() {
+        let mut powertrain = automatic_powertrain();
+        settle_for_direction(&mut powertrain);
+        direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
+        let output = direction_tick(&mut powertrain, -4.0, 4.0, 0.4, 1.0);
+        assert_eq!(output.drive_throttle, 0.0);
+        assert_eq!(output.service_brake, 1.0);
+        for speed in [-4.0, 0.0] {
+            for _ in 0..30 {
+                let output = direction_tick(&mut powertrain, speed, speed.abs(), 0.0, 1.0);
+                assert_eq!(output.drive_throttle, 0.0);
+                assert_eq!(output.service_brake, 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn stopped_timer_resets_on_motion_and_uses_simulation_time() {
+        for hz in [30, 60, 120] {
+            let mut powertrain = automatic_powertrain();
+            let dt = 1.0 / hz as Real;
+            for _ in 0..hz / 10 {
+                powertrain.update(dt, 0.0, 0.0, 0.35);
+            }
+            assert!(powertrain.stopped_time < AUTO_DIRECTION_STOP_DURATION);
+            direction_tick(&mut powertrain, 0.0, 1.0, 0.0, 0.0);
+            assert_eq!(powertrain.stopped_time, 0.0);
+            for _ in 0..hz / 5 {
+                powertrain.update(dt, 0.0, 0.0, 0.35);
+            }
+            assert_eq!(powertrain.stopped_time, AUTO_DIRECTION_STOP_DURATION);
+            powertrain.set_input(VehicleInput {
+                brake: 1.0,
+                ..VehicleInput::default()
+            });
+            let output = powertrain.update(dt, 0.0, 0.0, 0.35);
+            assert_eq!(powertrain.state.current_gear, -1);
+            assert_eq!(output.drive_throttle, 1.0);
+        }
+    }
+
     #[test]
     fn automatic_transmission_starts_in_neutral_and_engages_from_the_drive_pedal() {
         let mut powertrain = automatic_powertrain();
@@ -1936,8 +2167,7 @@ mod tests {
         powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
         assert_eq!(powertrain.state().current_gear, 0);
 
-        powertrain.set_input(VehicleInput::default());
-        powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        settle_for_direction(&mut powertrain);
 
         powertrain.set_input(VehicleInput {
             brake: 1.0,
@@ -1952,8 +2182,7 @@ mod tests {
     #[test]
     fn throttle_returns_automatic_reverse_to_first_gear_when_stopped() {
         let mut powertrain = automatic_powertrain();
-        powertrain.set_input(VehicleInput::default());
-        powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        settle_for_direction(&mut powertrain);
         powertrain.set_input(VehicleInput {
             brake: 1.0,
             ..VehicleInput::default()
@@ -1973,8 +2202,7 @@ mod tests {
     #[test]
     fn zero_shift_cooldown_does_not_oscillate_between_forward_and_reverse() {
         let mut powertrain = automatic_powertrain();
-        powertrain.set_input(VehicleInput::default());
-        powertrain.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        settle_for_direction(&mut powertrain);
 
         powertrain.set_input(VehicleInput {
             brake: 1.0,
@@ -2113,6 +2341,8 @@ mod tests {
             gear_shift_rejected_sequence: 9,
             current_gear: 3,
             reverse_direction: true,
+            resolved_throttle: 0.7,
+            resolved_brake: 0.2,
             vehicle_speed: 30.0,
             driven_wheel_speed: 35.0,
             steering_angle: 0.4,
@@ -2137,7 +2367,10 @@ mod tests {
         powertrain.shift_phase_timer = 0.2;
         powertrain.shift_to = 3;
         powertrain.shift_overshoot_rpm = 600.0;
-        powertrain.reverse_brake_armed = true;
+        powertrain.brake_intent = DirectionPedal::Driving;
+        powertrain.throttle_intent = DirectionPedal::Braking;
+        powertrain.stopped_time = AUTO_DIRECTION_STOP_DURATION;
+        powertrain.movement_speed = 30.0;
         powertrain.turbo_load = 0.9;
         powertrain.previous_throttle = 1.0;
         powertrain.restart_armed = false;
@@ -2171,7 +2404,10 @@ mod tests {
         assert_eq!(powertrain.state().gear_shift_rejected_sequence, 0);
         assert_eq!(powertrain.state().gear_shift_sequence, 0);
         assert_eq!(powertrain.state().engine_state_sequence, 0);
-        assert!(!powertrain.reverse_brake_armed);
+        assert_eq!(powertrain.brake_intent, DirectionPedal::NeedsRelease);
+        assert_eq!(powertrain.throttle_intent, DirectionPedal::NeedsRelease);
+        assert_eq!(powertrain.stopped_time, 0.0);
+        assert_eq!(powertrain.movement_speed, 0.0);
         assert_eq!(powertrain.turbo_load, 0.0);
         assert_eq!(powertrain.previous_throttle, 0.0);
         assert!(powertrain.restart_armed);
@@ -2488,6 +2724,7 @@ mod tests {
             }
         } else {
             powertrain.state.reverse_direction = true;
+            powertrain.brake_intent = DirectionPedal::Driving;
             powertrain.shift_target = -1;
             VehicleInput {
                 brake: throttle,

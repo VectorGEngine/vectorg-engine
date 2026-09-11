@@ -1189,7 +1189,11 @@ impl DynamicRayCastVehicleController {
         (driven_speed, average_radius)
     }
 
-    fn update_powertrain(&mut self, dt: Real) -> super::vehicle_powertrain::PowertrainOutput {
+    fn update_powertrain(
+        &mut self,
+        dt: Real,
+        movement_speed: Real,
+    ) -> super::vehicle_powertrain::PowertrainOutput {
         let (speed, radius) = self.driven_wheel_speed_and_radius();
         let driven_count = self.wheels.iter().filter(|w| w.role.driven).count();
         // Match the wheel used for the existing fastest-driven-wheel RPM signal.
@@ -1220,6 +1224,7 @@ impl DynamicRayCastVehicleController {
         self.powertrain.update_with_wheel_dynamics(
             dt,
             self.current_vehicle_speed,
+            movement_speed,
             speed,
             radius,
             inverse_inertia,
@@ -1473,18 +1478,22 @@ impl DynamicRayCastVehicleController {
             self.powertrain.config.gearing_top_speed(wheel.radius)
         });
         let downforce_scale = downforce.scale_at_speed(speed_abs, top_speed) * dt;
+        let mut total_downforce_impulse = 0.0;
         if downforce.points.is_empty() {
-            chassis.apply_impulse(-up * downforce.max_force * downforce_scale, false);
+            total_downforce_impulse = downforce.max_force * downforce_scale;
+            chassis.apply_impulse(-up * total_downforce_impulse, false);
         } else {
             for point in &downforce.points {
                 let world_point = transform * Point::from(point.position);
-                chassis.apply_impulse_at_point(
-                    -up * point.max_force * downforce_scale,
-                    world_point,
-                    false,
-                );
+                let impulse = point.max_force * downforce_scale;
+                total_downforce_impulse += impulse;
+                chassis.apply_impulse_at_point(-up * impulse, world_point, false);
             }
         }
+        chassis.apply_impulse(
+            -forward * (total_downforce_impulse * downforce.drag_per_downforce * speed.signum()),
+            false,
+        );
         chassis.set_linear_damping(
             dynamics.base_linear_damping + dynamics.linear_damping_per_speed * speed_abs,
         );
@@ -1607,7 +1616,7 @@ impl DynamicRayCastVehicleController {
 
         let forward_w = chassis.position() * Vector::ith(self.index_forward_axis, 1.0);
         self.current_vehicle_speed = forward_w.dot(chassis.linvel());
-        let output = self.update_powertrain(dt);
+        let output = self.update_powertrain(dt, chassis.linvel().norm());
         self.update_steering(chassis, dt);
         self.apply_powertrain_output(output);
         self.apply_chassis_dynamics(dt, bodies);
@@ -2901,6 +2910,70 @@ mod tests {
     use super::*;
     use crate::dynamics::RigidBodyBuilder;
 
+    #[test]
+    fn downforce_drag_uses_active_load_and_opposes_motion() {
+        use crate::control::vehicle_powertrain::VehicleDownforcePoint;
+
+        for points in [false, true] {
+            for force in [0.0, 1000.0, 2000.0] {
+                for drag_ratio in [0.0, 0.1, 0.2] {
+                    for speed_ratio in [0.0, 0.5, 1.0, 2.0, -0.5] {
+                        for dt in [1.0 / 60.0, 1.0 / 120.0] {
+                            let mut config = VehicleControllerConfig::default();
+                            config.dynamics.drag_coefficient = 0.35;
+                            config.dynamics.frontal_area = 2.0;
+                            config.dynamics.rolling_resistance = 0.0;
+                            config.dynamics.downforce.max_force =
+                                if points { 9000.0 } else { force };
+                            config.dynamics.downforce.drag_per_downforce = drag_ratio;
+                            if points {
+                                config.dynamics.downforce.points = [-1.0, 1.0]
+                                    .map(|z| VehicleDownforcePoint {
+                                        position: Vector::new(0.0, 0.0, z),
+                                        max_force: force / 2.0,
+                                    })
+                                    .to_vec();
+                            }
+                            let top_speed = config.gearing_top_speed(0.4);
+                            let speed = top_speed * speed_ratio;
+                            let mut bodies = RigidBodySet::new();
+                            let chassis = bodies.insert(
+                                RigidBodyBuilder::dynamic()
+                                    .additional_mass(100.0)
+                                    .linvel(Vector::z() * speed),
+                            );
+                            bodies[chassis]
+                                .recompute_mass_properties_from_colliders(&ColliderSet::new());
+                            let mut controller =
+                                DynamicRayCastVehicleController::new(chassis, config);
+                            controller.index_forward_axis = 2;
+                            controller.current_vehicle_speed = speed;
+                            controller.add_wheel(
+                                Point::origin(),
+                                -Vector::y(),
+                                Vector::x(),
+                                0.3,
+                                0.4,
+                                &WheelTuning::default(),
+                                WheelRole::new(WheelAxle::Front, false, false),
+                            );
+                            controller.apply_chassis_dynamics(dt, &mut bodies);
+                            let load = force * speed_ratio.abs().min(1.0).powi(2);
+                            let body_drag = 0.5 * 1.225 * 0.35 * 2.0 * speed * speed.abs();
+                            let expected_speed = speed
+                                - (body_drag + load * drag_ratio * speed.signum()) * dt / 100.0;
+                            let velocity = bodies[chassis].linvel();
+                            assert!((velocity.y + load * dt / 100.0).abs() < 1e-5);
+                            assert!((velocity.z - expected_speed).abs() < 3e-5,
+                                "points={points}, force={force}, drag={drag_ratio}, speed={speed}, dt={dt}: {} vs {expected_speed}", velocity.z);
+                            assert_eq!(velocity.x, 0.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn example_contact() -> CoupledContact {
         CoupledContact {
             speed: [40.0, 4.0],
@@ -3816,7 +3889,8 @@ mod tests {
                 let mut max_overspeed: Real = 0.0;
                 for _ in 0..hz * 2 {
                     controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
-                    let output = controller.update_powertrain(dt);
+                    let output =
+                        controller.update_powertrain(dt, controller.current_vehicle_speed.abs());
                     controller.apply_powertrain_output(output);
                     controller.update_friction(&mut bodies, &colliders, dt);
                     max_overspeed =
@@ -3964,6 +4038,59 @@ mod tests {
                     controller.update_friction(&mut bodies, &colliders, dt);
                 }
                 assert!(bodies[controller.chassis].linvel().norm() < speed + 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_brake_stops_forward_and_backward_motion_without_relaunching() {
+        for hz in [30, 60, 120] {
+            for direction in [-1.0, 1.0] {
+                for reverse in [false, true] {
+                    let dt = 1.0 / hz as Real;
+                    let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(0.0, 0.0);
+                    controller.powertrain.config.transmission.automatic = true;
+                    controller.powertrain.config.transmission.auto_reverse = true;
+                    for _ in 0..hz {
+                        controller.update_powertrain(dt, 0.0);
+                    }
+                    if reverse {
+                        controller.set_input(VehicleInput {
+                            brake: 1.0,
+                            ..VehicleInput::default()
+                        });
+                        controller.update_powertrain(dt, 0.0);
+                        assert_eq!(controller.state().current_gear, -1);
+                    }
+                    bodies[controller.chassis].set_linvel(Vector::z() * (10.0 * direction), true);
+                    controller.current_vehicle_speed = 10.0 * direction;
+                    controller.set_input(VehicleInput::default());
+                    controller.update_powertrain(dt, 10.0);
+                    for wheel in &mut controller.wheels {
+                        wheel.angular_velocity = 10.0 * direction / wheel.radius;
+                        wheel.max_brake_force = 180_000.0;
+                        wheel.anti_lock_brake = 0.0;
+                        wheel.friction_slip = 1.0;
+                    }
+                    controller.set_input(VehicleInput {
+                        brake: 1.0,
+                        ..VehicleInput::default()
+                    });
+                    for _ in 0..hz * 5 {
+                        let velocity = *bodies[controller.chassis].linvel();
+                        controller.current_vehicle_speed = velocity.z;
+                        let output = controller.update_powertrain(dt, velocity.norm());
+                        assert_eq!(output.drive_throttle, 0.0);
+                        assert_eq!(output.service_brake, 1.0);
+                        controller.apply_powertrain_output(output);
+                        controller.update_friction(&mut bodies, &colliders, dt);
+                    }
+                    assert!(
+                        bodies[controller.chassis].linvel().norm() < 0.01,
+                        "{hz} Hz direction {direction}, reverse mode {reverse}"
+                    );
+                    assert_eq!(controller.state().current_gear, 0);
+                }
             }
         }
     }
@@ -4534,7 +4661,8 @@ mod tests {
                     let mut active = false;
                     for _ in 0..hz * 2 {
                         controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
-                        let output = controller.update_powertrain(dt);
+                        let output = controller
+                            .update_powertrain(dt, controller.current_vehicle_speed.abs());
                         controller.apply_powertrain_output(output);
                         controller.update_friction(&mut bodies, &colliders, dt);
                         for wheel in &controller.wheels {
@@ -4985,7 +5113,8 @@ mod tests {
                 let mut spin_onset_rpm = None;
                 for step in 0..hz * 24 {
                     controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
-                    let output = controller.update_powertrain(dt);
+                    let output =
+                        controller.update_powertrain(dt, controller.current_vehicle_speed.abs());
                     controller.apply_powertrain_output(output);
                     controller.update_friction(&mut bodies, &colliders, dt);
                     let slip = driven_overspeed(&controller, &bodies, 1.0);
@@ -5058,7 +5187,8 @@ mod tests {
                 let mut negative_power_steps = 0;
                 for _ in 0..hz * 40 {
                     controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
-                    let output = controller.update_powertrain(dt);
+                    let output =
+                        controller.update_powertrain(dt, controller.current_vehicle_speed.abs());
                     if output.wheel_coupling_torque < 0.0 {
                         negative_power_steps += 1;
                     }
@@ -5134,7 +5264,8 @@ mod tests {
                 let mut max_gap: Real = 0.0;
                 for _ in 0..hz * 80 {
                     controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
-                    let output = controller.update_powertrain(dt);
+                    let output =
+                        controller.update_powertrain(dt, controller.current_vehicle_speed.abs());
                     controller.apply_powertrain_output(output);
                     controller.update_friction(&mut bodies, &colliders, dt);
                     let state = controller.state();
@@ -5211,7 +5342,8 @@ mod tests {
                     let mut active = false;
                     for _ in 0..hz * 3 {
                         controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
-                        let output = controller.update_powertrain(dt);
+                        let output = controller
+                            .update_powertrain(dt, controller.current_vehicle_speed.abs());
                         controller.apply_powertrain_output(output);
                         controller.update_friction(&mut bodies, &colliders, dt);
                         for wheel in controller.wheels.iter().filter(|w| w.role.driven) {
@@ -6143,7 +6275,10 @@ mod tests {
                             base_torque + signed_transfer * direction;
                     }
                     for _ in 0..hz * 60 {
-                        controller.update_powertrain(1.0 / hz as Real);
+                        controller.update_powertrain(
+                            1.0 / hz as Real,
+                            controller.current_vehicle_speed.abs(),
+                        );
                     }
                     assert!(
                         (controller.state().engine_rpm - 5_000.0).abs() < 1.0,

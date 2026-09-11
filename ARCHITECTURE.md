@@ -85,3 +85,8 @@ The shared scale is `min(abs(speed) / top_speed, 1)^exponent`; missing wheels or
 invalid top-speed inputs produce no downforce. Point forces replace the
 center-of-mass force when points are present. An exponent of one is linear and
 two is quadratic; both reach and cap at maximum force at theoretical top speed.
+The summed active downforce also generates longitudinal drag at the center of
+mass, multiplied by the car's nonnegative `drag_per_downforce` ratio (default
+0.2). This drag opposes forward or reverse motion, uses the same curve and cap,
+and is additional to body drag and rolling resistance. Points replace the
+center-of-mass fallback in both the load and drag calculation.
