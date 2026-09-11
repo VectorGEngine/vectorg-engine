@@ -152,13 +152,49 @@ impl Default for TurboConfig {
     }
 }
 
-/// Braking, stability, aerodynamics, and chassis-damping parameters.
+/// A chassis-local downforce application point.
 #[derive(Clone, Debug)]
 pub struct VehicleDownforcePoint {
     /// Application point in chassis-local coordinates.
     pub position: Vector<Real>,
-    /// Downforce in newtons per squared meter-per-second.
-    pub coefficient: Real,
+    /// Maximum downforce in newtons, reached at the gearing-derived top speed.
+    pub max_force: Real,
+}
+
+/// Shared downforce curve and its application points.
+#[derive(Clone, Debug)]
+pub struct VehicleDownforceConfig {
+    /// Maximum center-of-mass downforce in newtons, used only when points is empty.
+    pub max_force: Real,
+    /// Positive curve exponent: 1 is linear, 2 is quadratic.
+    pub exponent: Real,
+    /// Per-point maximum forces; the shared curve applies to every point.
+    pub points: Vec<VehicleDownforcePoint>,
+}
+
+impl Default for VehicleDownforceConfig {
+    fn default() -> Self {
+        Self {
+            max_force: 0.0,
+            exponent: 2.0,
+            points: Vec::new(),
+        }
+    }
+}
+
+impl VehicleDownforceConfig {
+    /// Fraction of maximum force, capped at one. Invalid curves produce no force.
+    pub fn scale_at_speed(&self, speed: Real, top_speed: Real) -> Real {
+        if !speed.is_finite()
+            || !top_speed.is_finite()
+            || top_speed <= 0.0
+            || !self.exponent.is_finite()
+            || self.exponent <= 0.0
+        {
+            return 0.0;
+        }
+        (speed.abs() / top_speed).min(1.0).powf(self.exponent)
+    }
 }
 
 /// Braking, stability, aerodynamics, and chassis-damping parameters.
@@ -182,10 +218,8 @@ pub struct VehicleDynamicsConfig {
     pub frontal_area: Real,
     /// Rolling-resistance coefficient.
     pub rolling_resistance: Real,
-    /// Downforce in newtons per squared meter-per-second.
-    pub downforce_coefficient: Real,
-    /// Optional chassis-local application points. An empty list preserves center-of-mass downforce.
-    pub downforce_points: Vec<VehicleDownforcePoint>,
+    /// Downforce strength, shared curve, and optional application points.
+    pub downforce: VehicleDownforceConfig,
     /// Chassis linear damping at rest.
     pub base_linear_damping: Real,
     /// Additional linear damping per meter-per-second.
@@ -208,8 +242,7 @@ impl Default for VehicleDynamicsConfig {
             drag_coefficient: 0.35,
             frontal_area: 2.0,
             rolling_resistance: 0.015,
-            downforce_coefficient: 0.0,
-            downforce_points: Vec::new(),
+            downforce: VehicleDownforceConfig::default(),
             base_linear_damping: 0.02,
             linear_damping_per_speed: 0.002,
             base_angular_damping: 0.02,
@@ -266,6 +299,30 @@ pub struct VehicleControllerConfig {
     pub dynamics: VehicleDynamicsConfig,
     /// Steering configuration.
     pub steering: SteeringConfig,
+}
+
+impl VehicleControllerConfig {
+    /// Theoretical top speed in meters per second at max RPM in the highest gear.
+    /// The controller supplies its first wheel's radius, matching the game convention.
+    pub fn gearing_top_speed(&self, wheel_radius: Real) -> Real {
+        let Some(&highest_ratio) = self.transmission.forward_ratios.last() else {
+            return 0.0;
+        };
+        let final_drive = self.transmission.final_drive_ratio;
+        let rpm = self.engine.max_rpm;
+        if !wheel_radius.is_finite()
+            || wheel_radius <= 0.0
+            || !rpm.is_finite()
+            || rpm <= 0.0
+            || !highest_ratio.is_finite()
+            || highest_ratio <= 0.0
+            || !final_drive.is_finite()
+            || final_drive <= 0.0
+        {
+            return 0.0;
+        }
+        rpm * TAU * wheel_radius / (60.0 * highest_ratio * final_drive)
+    }
 }
 
 /// Normalized driver input for one vehicle update.
@@ -3281,5 +3338,65 @@ mod tests {
         update_until_started(&mut clutch_disengaged, starting_wheel_speed, wheel_radius);
         assert!(!clutch_disengaged.state().engine_running);
         assert_eq!(clutch_disengaged.state().engine_rpm, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod downforce_curve_tests {
+    use super::*;
+
+    #[test]
+    fn shared_curves_reach_and_cap_at_maximum() {
+        for (exponent, midpoint) in [
+            (0.5, 0.5_f64.sqrt() as Real),
+            (1.0, 0.5),
+            (2.0, 0.25),
+            (3.0, 0.125),
+        ] {
+            let curve = VehicleDownforceConfig {
+                exponent,
+                ..Default::default()
+            };
+            assert_eq!(curve.scale_at_speed(0.0, 100.0), 0.0);
+            assert_eq!(curve.scale_at_speed(100.0, 100.0), 1.0);
+            assert_eq!(curve.scale_at_speed(200.0, 100.0), 1.0);
+            assert!((curve.scale_at_speed(50.0, 100.0) - midpoint).abs() < 0.00001);
+            assert_eq!(
+                curve.scale_at_speed(-50.0, 100.0),
+                curve.scale_at_speed(50.0, 100.0)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_curves_and_top_speeds_produce_no_force() {
+        let mut curve = VehicleDownforceConfig::default();
+        for invalid in [0.0, -1.0, Real::NAN, Real::INFINITY] {
+            curve.exponent = invalid;
+            assert_eq!(curve.scale_at_speed(50.0, 100.0), 0.0);
+            curve.exponent = 2.0;
+            assert_eq!(curve.scale_at_speed(50.0, invalid), 0.0);
+        }
+        assert_eq!(curve.scale_at_speed(Real::NAN, 100.0), 0.0);
+    }
+
+    #[test]
+    fn top_speed_uses_max_rpm_highest_gear_final_drive_and_radius() {
+        let mut config = VehicleControllerConfig::default();
+        config.engine.max_rpm = 6000.0;
+        config.transmission.forward_ratios = vec![3.0, 2.0, 1.0];
+        config.transmission.final_drive_ratio = 4.0;
+        let expected = 6000.0 * TAU * 0.3 / (60.0 * 4.0);
+        assert!((config.gearing_top_speed(0.3) - expected).abs() < 0.00001);
+        assert!((config.gearing_top_speed(0.6) - 2.0 * expected).abs() < 0.00001);
+        config.engine.max_rpm *= 2.0;
+        config.transmission.final_drive_ratio *= 2.0;
+        assert!((config.gearing_top_speed(0.3) - expected).abs() < 0.00001);
+        config.transmission.forward_ratios.clear();
+        assert_eq!(config.gearing_top_speed(0.3), 0.0);
+        config.transmission.forward_ratios.push(0.0);
+        assert_eq!(config.gearing_top_speed(0.3), 0.0);
+        config.transmission.forward_ratios.push(1.0);
+        assert_eq!(config.gearing_top_speed(0.0), 0.0);
     }
 }

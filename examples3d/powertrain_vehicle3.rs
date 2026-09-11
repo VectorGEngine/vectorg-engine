@@ -70,7 +70,8 @@ pub fn init_world(testbed: &mut Testbed) {
     config.dynamics.drag_coefficient = 0.5;
     config.dynamics.frontal_area = 2.1;
     config.dynamics.rolling_resistance = 0.014;
-    config.dynamics.downforce_coefficient = 0.8;
+    let top_speed = config.gearing_top_speed(0.300_000_011_920_928_96);
+    config.dynamics.downforce.max_force = 0.8 * top_speed * top_speed;
     config.steering.max_angle = 50.0f32.to_radians();
     config.steering.speed_sensitivity = 32.0;
     config.steering.minimum_speed_factor = 0.3;
