@@ -846,6 +846,18 @@ impl DynamicRayCastVehicleController {
         }
     }
 
+    /// Returns the fraction of service braking assigned to the front axle.
+    pub fn brake_bias(&self) -> Real {
+        self.powertrain.config.dynamics.brake_bias
+    }
+
+    /// Sets the fraction of service braking assigned to the front axle (`0.0` to `1.0`).
+    pub fn set_brake_bias(&mut self, bias: Real) {
+        if bias.is_finite() {
+            self.powertrain.config.dynamics.brake_bias = bias.clamp(0.0, 1.0);
+        }
+    }
+
     /// Adds a new tire type to the controller
     pub fn add_tire_type(&mut self, tire_type: &str, peak: Real, sliding: Real) {
         self.tire_types.insert(
@@ -6681,6 +6693,23 @@ mod tests {
         assert!((counter_steer_assist_speed_activation(7.5) - 0.5).abs() < 1.0e-5);
         assert_eq!(counter_steer_assist_speed_activation(10.0), 1.0);
         assert_eq!(counter_steer_assist_speed_activation(20.0), 1.0);
+    }
+
+    #[test]
+    fn runtime_brake_bias_is_clamped_and_rejects_non_finite_values() {
+        let mut controller = DynamicRayCastVehicleController::new(
+            RigidBodyHandle::invalid(),
+            VehicleControllerConfig::default(),
+        );
+
+        controller.set_brake_bias(0.65);
+        assert_eq!(controller.brake_bias(), 0.65);
+        controller.set_brake_bias(2.0);
+        assert_eq!(controller.brake_bias(), 1.0);
+        controller.set_brake_bias(-1.0);
+        assert_eq!(controller.brake_bias(), 0.0);
+        controller.set_brake_bias(Real::NAN);
+        assert_eq!(controller.brake_bias(), 0.0);
     }
 
     #[test]
