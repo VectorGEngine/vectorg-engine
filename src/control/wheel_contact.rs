@@ -8,6 +8,8 @@ use parry::query::visitors::BoundingVolumeIntersectionsVisitor;
 use parry::query::ShapeCastOptions;
 use parry::shape::{Cylinder, Shape, TypedShape};
 
+mod triangle;
+
 pub(super) const MIN_SUPPORT_COS: Real = 0.1;
 const CONTACT_EPS: Real = 1.0e-4;
 
@@ -68,29 +70,9 @@ impl WheelSweep {
             let point = support - normal * normal.dot(&(support - plane));
             // The finite face must actually contain the tire support. Otherwise
             // its edge/corner is handled by the convex shape cast below.
-            let on_face = match shape.as_typed_shape() {
-                TypedShape::Triangle(triangle) => {
-                    // Barycentric projection loses precision on large triangles,
-                    // especially at their shared diagonal. Test edge half-planes.
-                    let point = pose.inverse_transform_point(&point);
-                    let normal = triangle.normal().unwrap();
-                    [
-                        (triangle.a, triangle.b),
-                        (triangle.b, triangle.c),
-                        (triangle.c, triangle.a),
-                    ]
-                    .into_iter()
-                    .all(|(a, b)| {
-                        let edge = b - a;
-                        edge.cross(&(point - a)).dot(&normal) >= -CONTACT_EPS * edge.norm()
-                    })
-                }
-                _ => {
-                    halfspace
-                        || (shape.project_point(pose, &point, false).point - point).norm_squared()
-                            <= CONTACT_EPS * CONTACT_EPS
-                }
-            };
+            let on_face = halfspace
+                || (shape.project_point(pose, &point, false).point - point).norm_squared()
+                    <= CONTACT_EPS * CONTACT_EPS;
             if !on_face {
                 return;
             }
@@ -114,15 +96,6 @@ impl WheelSweep {
                             false,
                         );
                     }
-                }
-            }
-            TypedShape::Triangle(triangle) => {
-                if let Some(normal) = triangle.normal() {
-                    let mut normal = pose * *normal;
-                    if normal.dot(&self.direction) > 0.0 {
-                        normal = -normal;
-                    }
-                    face(normal, pose * triangle.a, false);
                 }
             }
             _ => {}
@@ -163,6 +136,7 @@ impl WheelSweep {
             .merged(&cylinder.compute_aabb(&end))
             .loosened(CONTACT_EPS);
         let mut best: Option<WheelSupport> = None;
+        let mut best_is_face = false;
         let mut rejected = None;
         queries.colliders_with_aabb_intersecting_aabb(&bounds, |handle| {
             let collider = &colliders[*handle];
@@ -172,9 +146,24 @@ impl WheelSweep {
                     collider.position(),
                     &bounds,
                     &mut |shape, pose| {
-                        let (length, normal, mut point) =
-                            if let Some(hit) = self.planar_support(shape, pose) {
-                                hit
+                        let is_triangle = matches!(shape.as_typed_shape(), TypedShape::Triangle(_));
+                        let (length, normal, mut point, is_face) =
+                            if let TypedShape::Triangle(triangle) = shape.as_typed_shape() {
+                                let Some((time, normal, point, face)) = triangle::cast(
+                                    triangle,
+                                    pose,
+                                    &start,
+                                    &self.direction,
+                                    distance,
+                                    &cylinder,
+                                ) else {
+                                    return;
+                                };
+                                (self.min_length + time, normal, point, face)
+                            } else if let Some((length, normal, point)) =
+                                self.planar_support(shape, pose)
+                            {
+                                (length, normal, point, true)
                             } else {
                                 let relative_pose = pose.inv_mul(&start);
                                 let velocity = pose.inverse_transform_vector(&self.direction);
@@ -197,6 +186,7 @@ impl WheelSweep {
                                     self.min_length + hit.time_of_impact,
                                     pose * *hit.normal1,
                                     pose * hit.witness1,
+                                    false,
                                 )
                             };
                         let incidence = -normal.dot(&self.direction);
@@ -209,7 +199,9 @@ impl WheelSweep {
                         // return either cylinder shoulder for the same flat road.
                         let axial = normal.dot(&self.axle);
                         let radial = normal - self.axle * axial;
-                        if let Some(radial) = radial.try_normalize(CONTACT_EPS) {
+                        if let Some(radial) =
+                            radial.try_normalize(CONTACT_EPS).filter(|_| !is_triangle)
+                        {
                             let shoulder = if axial.abs() > 1.0e-3 {
                                 axial.signum()
                             } else {
@@ -238,10 +230,14 @@ impl WheelSweep {
                         let replace = best.as_ref().map_or(true, |old| {
                             length < old.length - CONTACT_EPS
                                 || ((length - old.length).abs() <= CONTACT_EPS
-                                    && incidence > -old.normal.dot(&self.direction) + CONTACT_EPS)
+                                    && ((is_face && !best_is_face)
+                                        || (is_face == best_is_face
+                                            && incidence
+                                                > -old.normal.dot(&self.direction) + CONTACT_EPS)))
                         });
                         if replace {
                             best = Some(candidate);
+                            best_is_face = is_face;
                         }
                     },
                 );
@@ -297,6 +293,10 @@ mod tests {
     use crate::geometry::ColliderBuilder;
 
     fn sample(x: Real, mesh: bool) -> WheelSupport {
+        sample_curb(x, mesh, 2.0)
+    }
+
+    fn sample_curb(x: Real, mesh: bool, extent: Real) -> WheelSupport {
         let mut bodies = RigidBodySet::new();
         let chassis = bodies.insert(RigidBodyBuilder::dynamic());
         let mut colliders = ColliderSet::new();
@@ -304,14 +304,14 @@ mod tests {
             colliders.insert(
                 ColliderBuilder::trimesh(
                     vec![
-                        Point::new(-2.0, 0.0, -2.0),
-                        Point::new(0.0, 0.0, -2.0),
-                        Point::new(0.0, 0.0, 2.0),
-                        Point::new(-2.0, 0.0, 2.0),
-                        Point::new(0.0, 0.1, -2.0),
-                        Point::new(2.0, 0.1, -2.0),
-                        Point::new(2.0, 0.1, 2.0),
-                        Point::new(0.0, 0.1, 2.0),
+                        Point::new(-extent, 0.0, -extent),
+                        Point::new(0.0, 0.0, -extent),
+                        Point::new(0.0, 0.0, extent),
+                        Point::new(-extent, 0.0, extent),
+                        Point::new(0.0, 0.1, -extent),
+                        Point::new(extent, 0.1, -extent),
+                        Point::new(extent, 0.1, extent),
+                        Point::new(0.0, 0.1, extent),
                     ],
                     vec![
                         [0, 2, 1],
@@ -326,10 +326,15 @@ mod tests {
             );
         } else {
             colliders.insert(
-                ColliderBuilder::cuboid(2.0, 0.1, 2.0).translation(Vector::new(0.0, -0.1, 0.0)),
+                ColliderBuilder::cuboid(extent, 0.1, extent)
+                    .translation(Vector::new(0.0, -0.1, 0.0)),
             );
             colliders.insert(
-                ColliderBuilder::cuboid(1.0, 0.05, 2.0).translation(Vector::new(1.0, 0.05, 0.0)),
+                ColliderBuilder::cuboid(extent * 0.5, 0.05, extent).translation(Vector::new(
+                    extent * 0.5,
+                    0.05,
+                    0.0,
+                )),
             );
         }
         let mut queries = QueryPipeline::new();
@@ -405,6 +410,141 @@ mod tests {
                     assert_eq!(hit.normal, Vector::y(), "mesh={mesh}, {hit:?}");
                     assert!((hit.length - 0.4).abs() < 1.0e-6);
                     assert!((hit.point - Point::new(x, 0.0, x)).norm() < 1.0e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flat_triangle_seams_do_not_create_suspension_compression() {
+        for size in [50.0, 1500.0] {
+            for reverse in [false, true] {
+                let mut bodies = RigidBodySet::new();
+                let chassis = bodies.insert(RigidBodyBuilder::dynamic());
+                let mut colliders = ColliderSet::new();
+                let h = size * 0.5;
+                let mut indices = vec![[0, 3, 1], [1, 3, 2]];
+                if reverse {
+                    indices.reverse();
+                }
+                colliders.insert(
+                    ColliderBuilder::trimesh(
+                        vec![
+                            Point::new(-h, 0.0, -h),
+                            Point::new(h, 0.0, -h),
+                            Point::new(h, 0.0, h),
+                            Point::new(-h, 0.0, h),
+                        ],
+                        indices,
+                    )
+                    .unwrap(),
+                );
+                let mut queries = QueryPipeline::new();
+                queries.update(&colliders);
+                for camber in [0.0, 0.04, -0.12] {
+                    let axle: Vector<Real> = Rotation::new(Vector::z() * camber) * Vector::x();
+                    let expected = 0.7 - 0.3 * (1.0 - axle.y * axle.y).sqrt() - 0.1 * axle.y.abs();
+                    for ix in -25..=25 {
+                        for iz in -8..=8 {
+                            let x = ix as Real * 0.173 + 0.013;
+                            let z = -x + iz as Real * 0.05 + 0.021;
+                            let hit = WheelSweep {
+                                mount: Point::new(x, 0.7, z),
+                                direction: -Vector::y(),
+                                axle,
+                                radius: 0.3,
+                                width: 0.2,
+                                min_length: 0.0,
+                                max_length: 0.8,
+                            }
+                            .cast(
+                                &bodies,
+                                &colliders,
+                                &queries,
+                                QueryFilter::default(),
+                                chassis,
+                            )
+                            .0
+                            .unwrap();
+                            assert!((hit.length - expected).abs() < 5.0e-5,
+                                "size={size}, reverse={reverse}, camber={camber}, x={x}, z={z}, expected={expected}, hit={hit:?}");
+                            assert!((hit.normal - Vector::y()).norm() < 1.0e-5, "{hit:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_curb_triangles_keep_the_circular_edge_contact() {
+        for extent in [50.0, 1500.0] {
+            for i in -30..=10 {
+                let x = i as Real * 0.01;
+                let expected = sample(x, false);
+                let hit = sample_curb(x, true, extent);
+                assert!(
+                    (hit.length - expected.length).abs() < 0.002,
+                    "extent={extent}, x={x}, expected={expected:?}, hit={hit:?}"
+                );
+                assert!(
+                    (hit.point.x - expected.point.x).abs() < 0.002
+                        && (hit.point.y - expected.point.y).abs() < 0.002
+                        && hit.point.z.abs() <= 0.1 + CONTACT_EPS,
+                    "extent={extent}, x={x}, expected={expected:?}, hit={hit:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn triangle_support_handles_transforms_and_initial_overlap() {
+        for offset in [Vector::zeros(), Vector::new(500.0, 30.0, -300.0)] {
+            let pose =
+                Isometry::from_parts(offset.into(), Rotation::new(Vector::new(0.13, 0.7, -0.08)));
+            let mut bodies = RigidBodySet::new();
+            let chassis = bodies.insert(RigidBodyBuilder::dynamic());
+            let mut colliders = ColliderSet::new();
+            colliders.insert(
+                ColliderBuilder::trimesh(
+                    vec![
+                        Point::new(-750.0, 0.0, -750.0),
+                        Point::new(750.0, 0.0, -750.0),
+                        Point::new(750.0, 0.0, 750.0),
+                        Point::new(-750.0, 0.0, 750.0),
+                    ],
+                    vec![[0, 3, 1], [1, 3, 2]],
+                )
+                .unwrap()
+                .position(pose),
+            );
+            let mut queries = QueryPipeline::new();
+            queries.update(&colliders);
+            for height in [0.25, 0.3, 0.7, 1.1] {
+                for steering in [-0.35, 0.0, 0.35] {
+                    let hit = WheelSweep {
+                        mount: pose * Point::new(1.051, height, -1.125),
+                        direction: pose * -Vector::y(),
+                        axle: pose * (Rotation::new(Vector::y() * steering) * Vector::x()),
+                        radius: 0.3,
+                        width: 0.2,
+                        min_length: 0.0,
+                        max_length: 0.8,
+                    }
+                    .cast(
+                        &bodies,
+                        &colliders,
+                        &queries,
+                        QueryFilter::default(),
+                        chassis,
+                    )
+                    .0
+                    .unwrap();
+                    assert!(
+                        (hit.length - (height - 0.3).max(0.0)).abs() < 1.0e-4,
+                        "{hit:?}"
+                    );
+                    assert!((hit.normal - pose * Vector::y()).norm() < 1.0e-4, "{hit:?}");
                 }
             }
         }

@@ -72,8 +72,14 @@ Mesh and compound parts are considered separately so a rejected steep contact
 cannot hide supporting ground in the same collider. Contact normals must oppose
 travel with cosine at least 0.1; initial overlaps request penetration geometry.
 Contacts inside planar faces use exact cylinder support distances and face normals;
-edge/corner contacts use the engine's convex shape cast. This avoids noisy GJK
-normals on large flat road faces and preserves the circular approach to curbs.
+triangle edge/corner contacts use a convex shape cast on a clipped polygon around
+the wheel's entire travel volume. Clipping and recentering use f64 intermediates;
+the localized query uses the engine's scalar type and does not change track assets.
+An exact triangle-plane bound prevents premature hits. Convex witnesses must lie
+on the triangle and within the cylinder at the reported travel; invalid casts are
+recomputed by bounded conservative advancement. Exact face contacts win near-equal
+ties so a shared coplanar edge cannot disturb flat support. This preserves the
+circular approach to real curbs without large-triangle GJK compression spikes.
 The sweep witness and cylinder support determine the contact, including camber.
 A flat contact patch uses its central support when that point lies on the surface.
 There is one suspension/tire load per wheel, regardless of candidate count.
