@@ -293,10 +293,10 @@ mod tests {
     use crate::geometry::ColliderBuilder;
 
     fn sample(x: Real, mesh: bool) -> WheelSupport {
-        sample_curb(x, mesh, 2.0)
+        sample_kerb(x, mesh, 2.0)
     }
 
-    fn sample_curb(x: Real, mesh: bool, extent: Real) -> WheelSupport {
+    fn sample_kerb(x: Real, mesh: bool, extent: Real) -> WheelSupport {
         let mut bodies = RigidBodySet::new();
         let chassis = bodies.insert(RigidBodyBuilder::dynamic());
         let mut colliders = ColliderSet::new();
@@ -477,12 +477,12 @@ mod tests {
     }
 
     #[test]
-    fn large_curb_triangles_keep_the_circular_edge_contact() {
+    fn large_kerb_triangles_keep_the_circular_edge_contact() {
         for extent in [50.0, 1500.0] {
             for i in -30..=10 {
                 let x = i as Real * 0.01;
                 let expected = sample(x, false);
-                let hit = sample_curb(x, true, extent);
+                let hit = sample_kerb(x, true, extent);
                 assert!(
                     (hit.length - expected.length).abs() < 0.002,
                     "extent={extent}, x={x}, expected={expected:?}, hit={hit:?}"
@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn curb_support_rises_before_the_wheel_center_crosses_the_edge() {
+    fn kerb_support_rises_before_the_wheel_center_crosses_the_edge() {
         for mesh in [false, true] {
             let mut previous = sample(-0.4, mesh).length;
             for i in 1..=60 {

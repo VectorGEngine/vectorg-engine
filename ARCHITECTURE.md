@@ -79,7 +79,7 @@ An exact triangle-plane bound prevents premature hits. Convex witnesses must lie
 on the triangle and within the cylinder at the reported travel; invalid casts are
 recomputed by bounded conservative advancement. Exact face contacts win near-equal
 ties so a shared coplanar edge cannot disturb flat support. This preserves the
-circular approach to real curbs without large-triangle GJK compression spikes.
+circular approach to real kerbs without large-triangle GJK compression spikes.
 The sweep witness and cylinder support determine the contact, including camber.
 A flat contact patch uses its central support when that point lies on the surface.
 There is one suspension/tire load per wheel, regardless of candidate count.

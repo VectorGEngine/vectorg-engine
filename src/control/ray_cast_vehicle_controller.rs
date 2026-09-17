@@ -6096,7 +6096,7 @@ mod tests {
     }
 
     #[test]
-    fn curb_suspension_response_remains_bounded_across_timesteps() {
+    fn kerb_suspension_response_remains_bounded_across_timesteps() {
         use crate::geometry::ColliderBuilder;
         for speed in [2.0, 5.0, 10.0] {
             let mut peaks = Vec::new();
@@ -6181,7 +6181,7 @@ mod tests {
                 assert!(peak < 2.0, "speed={speed} hz={hz} peak={peak}");
                 peaks.push(peak);
             }
-            eprintln!("curb speed={speed}: peak vertical speeds at 30/60/120 Hz: {peaks:?}");
+            eprintln!("kerb speed={speed}: peak vertical speeds at 30/60/120 Hz: {peaks:?}");
             assert!(
                 peaks.iter().copied().fold(0.0, Real::max)
                     - peaks.iter().copied().fold(Real::MAX, Real::min)

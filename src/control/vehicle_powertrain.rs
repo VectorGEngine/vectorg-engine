@@ -1337,7 +1337,8 @@ impl VehiclePowertrain {
         }
 
         self.state.current_gear = self.shift_target;
-        if self.state.current_gear > 0 {
+        // Pedals swap only while reverse is engaged; neutral always drives on throttle.
+        if self.state.current_gear >= 0 {
             self.state.reverse_direction = false;
         }
         self.shift_cooldown = self.config.transmission.shift_cooldown;
@@ -2069,32 +2070,64 @@ mod tests {
 
     #[test]
     fn reverse_braking_requires_a_new_stationary_launch_press() {
-        for use_throttle in [false, true] {
+        let mut powertrain = automatic_powertrain();
+        settle_for_direction(&mut powertrain);
+        direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
+        let output = direction_tick(&mut powertrain, -5.0, 5.0, 0.0, 1.0);
+        assert_eq!(output.drive_throttle, 1.0);
+        direction_tick(&mut powertrain, -5.0, 5.0, 0.0, 0.0);
+        let output = direction_tick(&mut powertrain, -5.0, 5.0, 0.0, 1.0);
+        assert_eq!(output.service_brake, 1.0);
+        assert_eq!(output.drive_throttle, 0.0);
+        for _ in 0..30 {
+            let output = direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
+            assert_eq!(output.service_brake, 1.0);
+            assert_eq!(output.drive_throttle, 0.0);
+        }
+        assert_eq!(powertrain.state.current_gear, 0);
+        assert!(!powertrain.state.reverse_direction);
+        direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 0.0);
+        let output = direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
+        assert_eq!(output.drive_throttle, 1.0);
+        assert_eq!(output.service_brake, 0.0);
+        assert_eq!(powertrain.state.current_gear, -1);
+    }
+
+    #[test]
+    fn throttle_brakes_only_while_reverse_is_engaged() {
+        let mut powertrain = automatic_powertrain();
+        settle_for_direction(&mut powertrain);
+        direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
+        direction_tick(&mut powertrain, -5.0, 5.0, 0.0, 1.0);
+        direction_tick(&mut powertrain, -5.0, 5.0, 0.0, 0.0);
+        let output = direction_tick(&mut powertrain, -5.0, 5.0, 1.0, 0.0);
+        assert_eq!(powertrain.state.current_gear, -1);
+        assert_eq!(output.service_brake, 1.0);
+        assert_eq!(output.drive_throttle, 0.0);
+
+        // Stopping drops reverse to neutral, where the held throttle drives.
+        direction_tick(&mut powertrain, 0.0, 0.0, 1.0, 0.0);
+        assert_eq!(powertrain.state.current_gear, 0);
+        assert!(!powertrain.state.reverse_direction);
+        let output = direction_tick(&mut powertrain, 0.0, 0.0, 1.0, 0.0);
+        assert_eq!(output.drive_throttle, 1.0);
+        assert_eq!(output.service_brake, 0.0);
+        assert_eq!(powertrain.state.current_gear, 1);
+    }
+
+    #[test]
+    fn neutral_after_reverse_drives_on_throttle_while_rolling() {
+        for speed in [-2.0, 0.0, 2.0] {
             let mut powertrain = automatic_powertrain();
             settle_for_direction(&mut powertrain);
             direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 1.0);
-            let output = direction_tick(&mut powertrain, -5.0, 5.0, 0.0, 1.0);
-            assert_eq!(output.drive_throttle, 1.0);
-            direction_tick(&mut powertrain, -5.0, 5.0, 0.0, 0.0);
-            let (throttle, brake) = if use_throttle { (1.0, 0.0) } else { (0.0, 1.0) };
-            let output = direction_tick(&mut powertrain, -5.0, 5.0, throttle, brake);
-            assert_eq!(output.service_brake, 1.0);
-            assert_eq!(output.drive_throttle, 0.0);
-            for _ in 0..30 {
-                let output = direction_tick(&mut powertrain, 0.0, 0.0, throttle, brake);
-                assert_eq!(output.service_brake, 1.0);
-                assert_eq!(output.drive_throttle, 0.0);
-                assert!(powertrain.state.reverse_direction);
-            }
-            assert_eq!(powertrain.state.current_gear, 0);
+            direction_tick(&mut powertrain, -5.0, 5.0, 0.0, 1.0);
             direction_tick(&mut powertrain, 0.0, 0.0, 0.0, 0.0);
-            let output = direction_tick(&mut powertrain, 0.0, 0.0, throttle, brake);
-            assert_eq!(output.drive_throttle, 1.0);
-            assert_eq!(output.service_brake, 0.0);
-            assert_eq!(
-                powertrain.state.current_gear,
-                if use_throttle { 1 } else { -1 }
-            );
+            assert_eq!(powertrain.state.current_gear, 0);
+            let output = direction_tick(&mut powertrain, speed, speed.abs(), 1.0, 0.0);
+            assert_eq!(output.drive_throttle, 1.0, "speed {speed}");
+            assert_eq!(output.service_brake, 0.0, "speed {speed}");
+            assert_eq!(powertrain.state.current_gear, 1, "speed {speed}");
         }
     }
 

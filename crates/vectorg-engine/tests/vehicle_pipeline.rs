@@ -202,7 +202,7 @@ fn airborne_vehicle_receives_gravity_once() {
 }
 
 #[test]
-fn curb_crossing_and_landing_settle_through_the_physics_pipeline() {
+fn kerb_crossing_and_landing_settle_through_the_physics_pipeline() {
     for hz in [30, 60, 120] {
         for one_side in [false, true] {
             let mut scene = Scene::new(hz, 4, 0.0, 0.0);
@@ -230,7 +230,7 @@ fn curb_crossing_and_landing_settle_through_the_physics_pipeline() {
                 peak = peak.max(scene.bodies[chassis].linvel().y);
                 assert!(scene.position().y < 1.2 && scene.position().y > 0.3);
             }
-            assert!(scene.position().z > 4.0, "car must cross the curb");
+            assert!(scene.position().z > 4.0, "car must cross the kerb");
             assert!(peak < 2.0, "hz={hz} one_side={one_side} peak={peak}");
             scene.vehicle.set_input(VehicleInput {
                 brake: 1.0,
