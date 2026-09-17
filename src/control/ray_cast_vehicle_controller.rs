@@ -5,6 +5,7 @@ use crate::pipeline::{QueryFilter, QueryPipeline};
 use crate::utils::SimdDot;
 use std::collections::HashMap;
 
+use super::vehicle_differential::{acceleration_mode, clutch_impulse_limit};
 use super::vehicle_powertrain::{
     VehicleControllerConfig, VehicleEngineState, VehicleInput, VehiclePowertrain,
     VehicleShiftOutcome, VehicleState, WheelAxle, WheelRole,
@@ -54,6 +55,7 @@ pub struct DynamicRayCastVehicleController {
     forward_ws: Vec<Vector<Real>>,
     axle: Vec<Vector<Real>>,
     contact_solver: VehicleContactSolver,
+    differential_accelerating: [bool; 2],
     /// The current forward speed of the vehicle.
     pub current_vehicle_speed: Real,
     /// Electronic stability control strength (`0.0` = off, `1.0` = full strength).
@@ -217,7 +219,7 @@ pub struct Wheel {
     pub target_rotation: Real,
     angular_velocity: Real,
     angular_load: Real,
-    drive_torque_transfer: Real,
+    differential_torque: Real,
     wheel_coupling_torque: Real,
     drive_throttle: Real,
     drivetrain_connected: bool,
@@ -307,7 +309,7 @@ impl Wheel {
             target_rotation: 0.0,
             angular_velocity: 0.0,
             angular_load: 0.0,
-            drive_torque_transfer: 0.0,
+            differential_torque: 0.0,
             wheel_coupling_torque: 0.0,
             drive_throttle: 0.0,
             drivetrain_connected: false,
@@ -352,7 +354,7 @@ impl Wheel {
         self.delta_rotation = 0.0;
         self.angular_velocity = 0.0;
         self.angular_load = 0.0;
-        self.drive_torque_transfer = 0.0;
+        self.differential_torque = 0.0;
         self.target_rotation = 0.0;
         self.wheel_coupling_torque = 0.0;
         self.drive_throttle = 0.0;
@@ -585,6 +587,7 @@ fn braked_contact_impulses(
     (forward, braking)
 }
 
+#[cfg(test)]
 fn apply_opposing_angular_impulse(
     angular_velocity: &mut Real,
     reference_angular_velocity: Real,
@@ -743,6 +746,7 @@ impl DynamicRayCastVehicleController {
             forward_ws: vec![],
             axle: vec![],
             contact_solver: VehicleContactSolver::default(),
+            differential_accelerating: [false; 2],
             current_vehicle_speed: 0.0,
             esc: config.dynamics.esc_strength,
             chassis,
@@ -787,6 +791,7 @@ impl DynamicRayCastVehicleController {
 
     /// Restores all transient simulation state while preserving vehicle configuration and tuning.
     pub fn reset(&mut self) {
+        self.differential_accelerating = [false; 2];
         self.powertrain.reset();
         self.current_vehicle_speed = 0.0;
         self.forward_ws.clear();
@@ -1161,28 +1166,49 @@ impl DynamicRayCastVehicleController {
             + wheel.wheel_direction_ws * wheel.raycast_info.suspension_length;
     }
 
-    fn driven_wheel_speed_and_radius(&self) -> (Real, Real) {
-        let mut driven_speed: Real = 0.0;
-        let mut radius_sum: Real = 0.0;
-        let mut driven_count: usize = 0;
-
-        for wheel in &self.wheels {
+    fn driven_axles(&self) -> [Vec<usize>; 2] {
+        let mut axles = [Vec::new(), Vec::new()];
+        for (i, wheel) in self.wheels.iter().enumerate() {
             if wheel.role.driven {
-                let speed = wheel.angular_velocity * wheel.radius;
-                if speed.abs() > driven_speed.abs() {
-                    driven_speed = speed;
-                }
-                radius_sum += wheel.radius;
-                driven_count += 1;
+                axles[usize::from(wheel.role.axle == WheelAxle::Rear)].push(i);
             }
         }
+        axles
+    }
 
-        let average_radius = if driven_count == 0 {
-            0.35
-        } else {
-            radius_sum / driven_count as Real
+    fn drive_weights(&self) -> Vec<Real> {
+        let axles = self.driven_axles();
+        let rear = match (axles[0].is_empty(), axles[1].is_empty()) {
+            (false, false) => self.powertrain.config.differential.center_rear_bias,
+            (true, _) => 1.0,
+            _ => 0.0,
         };
-        (driven_speed, average_radius)
+        let mut weights = vec![0.0; self.wheels.len()];
+        for (axle, ids) in axles.iter().enumerate() {
+            let share = if axle == 0 { 1.0 - rear } else { rear };
+            for &i in ids {
+                weights[i] = share / ids.len() as Real;
+            }
+        }
+        weights
+    }
+
+    fn driven_wheel_speed_and_radius(&self) -> (Real, Real) {
+        let weights = self.drive_weights();
+        let radius: Real = self
+            .wheels
+            .iter()
+            .zip(&weights)
+            .map(|(w, a)| w.radius * a)
+            .sum();
+        let omega: Real = self
+            .wheels
+            .iter()
+            .zip(&weights)
+            .map(|(w, a)| w.angular_velocity * a)
+            .sum();
+        let radius = if radius > 0.0 { radius } else { 0.35 };
+        (omega * radius, radius)
     }
 
     fn update_powertrain(
@@ -1191,32 +1217,45 @@ impl DynamicRayCastVehicleController {
         movement_speed: Real,
     ) -> super::vehicle_powertrain::PowertrainOutput {
         let (speed, radius) = self.driven_wheel_speed_and_radius();
-        let driven_count = self.wheels.iter().filter(|w| w.role.driven).count();
-        // Match the wheel used for the existing fastest-driven-wheel RPM signal.
-        let wheel = self.wheels.iter().filter(|w| w.role.driven).reduce(|a, b| {
-            if (b.angular_velocity * b.radius).abs() > (a.angular_velocity * a.radius).abs() {
-                b
-            } else {
-                a
+        let weights = self.drive_weights();
+        let mut response: Vec<_> = self
+            .wheels
+            .iter()
+            .zip(&weights)
+            .map(|(w, a)| a / wheel_angular_inertia(w.radius))
+            .collect();
+        for (axle, ids) in self.driven_axles().iter().enumerate() {
+            if ids.len() == 2
+                && self
+                    .powertrain
+                    .config
+                    .differential
+                    .lock(axle, self.differential_accelerating[axle])
+                    == 1.0
+            {
+                let [a, b] = [ids[0], ids[1]];
+                let inertia = wheel_angular_inertia(self.wheels[a].radius)
+                    + wheel_angular_inertia(self.wheels[b].radius);
+                response[a] = (weights[a] + weights[b]) / inertia;
+                response[b] = response[a];
             }
-        });
-        let (inverse_inertia, load_acceleration, drive_fraction) = wheel
-            .map(|w| {
-                let scale = w.radius / radius / wheel_angular_inertia(w.radius);
-                (
-                    scale / driven_count as Real,
-                    // The base coupling response uses an equal torque split.
-                    // Account for the additive torque actually transferred to
-                    // this wheel, so it is not mistaken for extra clutch load.
-                    (w.angular_load - w.drive_torque_transfer) * scale,
-                    if w.traction_control > 0.0 {
-                        1.0 - w.traction_control_cut
-                    } else {
-                        1.0
-                    },
-                )
-            })
-            .unwrap_or((0.0, 0.0, 1.0));
+        }
+        let inverse_inertia = weights.iter().zip(&response).map(|(a, r)| a * r).sum();
+        // Internal differential reactions are not additional engine load. The
+        // same shaft Jacobian maps torque delivery, inertia and external loads.
+        let load_acceleration = self
+            .wheels
+            .iter()
+            .zip(&response)
+            .map(|(w, r)| (w.angular_load - w.differential_torque) * r)
+            .sum();
+        let drive_fraction = self
+            .wheels
+            .iter()
+            .zip(&weights)
+            .filter(|(_, a)| **a > 0.0)
+            .map(|(w, _)| 1.0 - w.traction_control_cut)
+            .fold(1.0, Real::min);
         self.powertrain.update_with_wheel_dynamics(
             dt,
             self.current_vehicle_speed,
@@ -1410,23 +1449,21 @@ impl DynamicRayCastVehicleController {
     fn apply_powertrain_output(&mut self, output: super::vehicle_powertrain::PowertrainOutput) {
         let input = self.powertrain.input();
         let dynamics = &self.powertrain.config.dynamics;
-        let driven_count = self.wheels.iter().filter(|wheel| wheel.role.driven).count();
-        let driven_divisor = driven_count.max(1) as Real;
+        let weights = self.drive_weights();
         let motion_sign = if self.current_vehicle_speed.abs() > 0.1 {
             self.current_vehicle_speed.signum()
         } else {
             0.0
         };
 
-        for wheel in &mut self.wheels {
+        for (wheel, weight) in self.wheels.iter_mut().zip(weights) {
             if wheel.role.driven {
                 let radius = wheel.radius.max(0.01);
-                let drive_force = output.drive_torque / (radius * driven_divisor);
-                let engine_brake_force =
-                    output.engine_brake_torque / (radius * driven_divisor) * motion_sign;
+                let drive_force = output.drive_torque * weight / radius;
+                let engine_brake_force = output.engine_brake_torque * weight / radius * motion_sign;
                 wheel.engine_force = drive_force - engine_brake_force;
                 wheel.target_rotation = output.wheel_target_velocity;
-                wheel.wheel_coupling_torque = output.wheel_coupling_torque / driven_divisor;
+                wheel.wheel_coupling_torque = output.wheel_coupling_torque * weight;
                 wheel.drive_throttle = output.drive_throttle;
                 wheel.drivetrain_connected = output.drivetrain_connected;
             } else {
@@ -1847,67 +1884,6 @@ impl DynamicRayCastVehicleController {
         }
     }
 
-    // Experimental rear-axle drive allocation: balance positive surface-speed
-    // excess over each wheel's own road speed, not the wheel angular velocities.
-    fn redistribute_rear_drive_torque(
-        &self,
-        contacts: &[WheelContactState],
-        drive_torques: &mut [Real],
-        dt: Real,
-    ) {
-        if dt <= Real::EPSILON {
-            return;
-        }
-        let mut rear = self
-            .wheels
-            .iter()
-            .enumerate()
-            .filter(|(_, wheel)| wheel.role.driven && wheel.role.axle == WheelAxle::Rear);
-        let (Some((a, first)), Some((b, second))) = (rear.next(), rear.next()) else {
-            return;
-        };
-        if rear.next().is_some()
-            || !contacts[a].is_grounded
-            || !contacts[b].is_grounded
-            || !first.drivetrain_connected
-            || !second.drivetrain_connected
-            || first.drive_throttle <= 0.0
-            || second.drive_throttle <= 0.0
-            || first.brake > 0.0
-            || second.brake > 0.0
-        {
-            return;
-        }
-        let direction = first.target_rotation.signum();
-        let first_torque = drive_torques[a] * direction;
-        let second_torque = drive_torques[b] * direction;
-        if direction == 0.0
-            || second.target_rotation.signum() != direction
-            || first_torque <= 0.0
-            || second_torque <= 0.0
-        {
-            return;
-        }
-        let first_radius = first.radius.max(0.01);
-        let second_radius = second.radius.max(0.01);
-        let first_excess = ((first.angular_velocity * first_radius - contacts[a].forward_speed)
-            * direction)
-            .max(0.0);
-        let second_excess = ((second.angular_velocity * second_radius - contacts[b].forward_speed)
-            * direction)
-            .max(0.0);
-        let response = dt
-            * (first_radius / wheel_angular_inertia(first_radius)
-                + second_radius / wheel_angular_inertia(second_radius));
-        // Equal and opposite torque changes correct the excess-spin difference.
-        // The only bound is available drive torque: never create donor braking
-        // or additional axle torque. Tire reaction and assists still solve below.
-        let transfer =
-            ((first_excess - second_excess) / response).clamp(-second_torque, first_torque);
-        drive_torques[a] -= transfer * direction;
-        drive_torques[b] += transfer * direction;
-    }
-
     #[profiling::function]
     fn update_friction(&mut self, bodies: &mut RigidBodySet, colliders: &ColliderSet, dt: Real) {
         let num_wheels = self.wheels.len();
@@ -1932,7 +1908,7 @@ impl DynamicRayCastVehicleController {
 
         for wheel in &mut self.wheels {
             wheel.brake_impulse = 0.0;
-            wheel.drive_torque_transfer = 0.0;
+            wheel.differential_torque = 0.0;
             wheel.side_impulse = 0.0;
             wheel.forward_impulse = 0.0;
             wheel.is_anti_lock_brake = false;
@@ -1999,16 +1975,13 @@ impl DynamicRayCastVehicleController {
             };
         }
 
-        let mut drive_torques: Vec<_> = self
+        let drive_torques: Vec<_> = self
             .wheels
             .iter()
             .map(|wheel| {
                 wheel.wheel_coupling_torque * force_scale * (1.0 - esc_intervention.engine_cut)
             })
             .collect();
-        if esc_intervention.brake_strength == 0.0 {
-            self.redistribute_rear_drive_torque(&contacts, &mut drive_torques, dt);
-        }
 
         let mut solver = std::mem::take(&mut self.contact_solver);
         solver.contacts.clear();
@@ -2053,27 +2026,9 @@ impl DynamicRayCastVehicleController {
 
             if !contact.is_grounded {
                 wheel.sliding_grip = 1.0;
-                wheel.traction_control_cut = 0.0;
-                wheel.abs_release = 0.0;
-                let drive_angular_impulse = raw_wheel_torque * dt;
-                let mut angular_velocity = wheel.angular_velocity + drive_angular_impulse / inertia;
-                let reference_angular_velocity = angular_velocity;
-                apply_opposing_angular_impulse(
-                    &mut angular_velocity,
-                    reference_angular_velocity,
-                    inertia,
-                    requested_brake_impulse * radius,
-                );
-                wheel.angular_velocity = angular_velocity;
-                wheel.angular_load = if dt > Real::EPSILON {
-                    (reference_angular_velocity - angular_velocity) * inertia / dt
-                } else {
-                    0.0
-                };
-                wheel.lock =
-                    brake > Real::EPSILON && wheel.angular_velocity.abs() <= WHEEL_STOP_EPSILON;
-                wheel.last_skid_info = wheel.skid_info;
-                continue;
+                // Airborne wheels remain in the rotational solve with no tire
+                // impulse budget; brakes and axle coupling still act on them.
+                self.axle[wheel_id] = Vector::zeros();
             }
 
             let raw_drive_angular_impulse = raw_wheel_torque * dt;
@@ -2126,12 +2081,13 @@ impl DynamicRayCastVehicleController {
                     brake_budget: requested_brake_impulse * radius,
                 },
                 drive_delta: raw_drive_angular_impulse / inertia,
-                tc: if powered_acceleration && tc_requested {
+                tc: if contact.is_grounded && powered_acceleration && tc_requested {
                     wheel.traction_control
                 } else {
                     0.0
                 },
-                abs: if !wheel.handbrake_overrides_abs
+                abs: if contact.is_grounded
+                    && !wheel.handbrake_overrides_abs
                     && self.current_vehicle_speed.abs() > 1.0
                     && contact.forward_speed.abs() > 1.0
                 {
@@ -2154,7 +2110,40 @@ impl DynamicRayCastVehicleController {
                     .unwrap_or([Vector::zeros(); 2]),
             });
         }
+        solver.axles.clear();
+        for (axle, ids) in self.driven_axles().iter().enumerate() {
+            if ids.len() != 2 {
+                continue;
+            }
+            let [a, b] = [ids[0], ids[1]];
+            let torque =
+                self.wheels[a].wheel_coupling_torque + self.wheels[b].wheel_coupling_torque;
+            self.differential_accelerating[axle] = acceleration_mode(
+                self.differential_accelerating[axle],
+                self.wheels[a].drivetrain_connected && self.wheels[b].drivetrain_connected,
+                torque,
+                (self.wheels[a].angular_velocity + self.wheels[b].angular_velocity) * 0.5,
+                (self.powertrain.state().current_gear as Real).signum(),
+            );
+            let lock = self
+                .powertrain
+                .config
+                .differential
+                .lock(axle, self.differential_accelerating[axle]);
+            if lock > 0.0 {
+                solver.axles.push(AxleClutch {
+                    a,
+                    b,
+                    lock,
+                    torque: drive_torques[a] + drive_torques[b],
+                    impulse: 0.0,
+                    next_impulse: 0.0,
+                    limit: 0.0,
+                });
+            }
+        }
         solver.solve(&bodies[self.chassis], bodies, dt);
+        solver.finish_brake_holding();
         let mut chassis_impulse = Vector::zeros();
         let mut chassis_torque = Vector::zeros();
         solver.ground_impulses.clear();
@@ -2163,19 +2152,10 @@ impl DynamicRayCastVehicleController {
             let wheel_id = prepared.wheel_id;
             let wheel = &mut self.wheels[wheel_id];
             let actuation = solver.actuations[i];
-            let final_contact = prepared.contact(solver.speed_without_self(i), actuation);
+            let final_contact = solver.contact(i, actuation);
             let mut result = final_contact.solve();
             result.tangent = solver.impulses[i];
-            // Brake holding is an algebraic interval constraint. Remove the tiny
-            // relaxation residue without synchronizing a rolling wheel to road speed.
-            let holding_brake = result.tangent[0] * final_contact.radius
-                - final_contact.omega * final_contact.inertia;
-            if result.omega == 0.0 && holding_brake.abs() <= final_contact.brake_budget {
-                solver.brakes[i] = holding_brake;
-            }
-            result.omega = final_contact.omega
-                + (solver.brakes[i] - result.tangent[0] * final_contact.radius)
-                    / final_contact.inertia;
+            result.omega = solver.omega(i);
             let unbraked = CoupledContact {
                 brake_budget: 0.0,
                 ..final_contact
@@ -2183,7 +2163,7 @@ impl DynamicRayCastVehicleController {
             .solve();
             let cut = 1.0 - actuation.drive;
             let brake_fraction = actuation.brake;
-            let drive_angular_velocity = final_contact.omega;
+
             let raw_wheel_torque = drive_torques[wheel_id];
             let powered_acceleration = wheel.role.driven
                 && wheel.drivetrain_connected
@@ -2194,14 +2174,9 @@ impl DynamicRayCastVehicleController {
                 && wheel.traction_control > 0.0;
             let axes = prepared.axes;
             let angular_axes = prepared.angular_axes;
-            let inertia = final_contact.inertia;
+            let inertia = prepared.base.inertia;
             wheel.skid_info = final_contact.skid_info(result);
             wheel.sliding_grip = actuation.grip;
-            let base_drive_torque =
-                wheel.wheel_coupling_torque * force_scale * (1.0 - esc_intervention.engine_cut);
-            // Record only the transfer that reaches the wheel after TC. The
-            // road/brake angular_load below remains the physical contact load.
-            wheel.drive_torque_transfer = (raw_wheel_torque - base_drive_torque) * (1.0 - cut);
             wheel.is_anti_lock_brake = brake_fraction < 1.0;
             wheel.abs_release = 1.0 - brake_fraction;
             // Limiter/coast torque must not apply TC to negative torque, but a
@@ -2223,7 +2198,14 @@ impl DynamicRayCastVehicleController {
             }
             wheel.angular_velocity = final_angular_velocity;
             wheel.angular_load = if dt > Real::EPSILON {
-                (drive_angular_velocity - final_angular_velocity) * inertia / dt
+                (result.tangent[0] * wheel.radius - solver.brakes[i]) / dt
+            } else {
+                0.0
+            };
+            wheel.differential_torque = if dt > Real::EPSILON {
+                (final_angular_velocity - prepared.base.omega) * inertia / dt
+                    - raw_wheel_torque * actuation.drive
+                    + wheel.angular_load
             } else {
                 0.0
             };
@@ -2291,67 +2273,14 @@ struct PreparedVehicleContact {
     ground_angular_axes: [Vector<Real>; 2],
 }
 
-impl PreparedVehicleContact {
-    fn contact(&self, speed: [Real; 2], actuation: ContactActuation) -> CoupledContact {
-        CoupledContact {
-            speed,
-            omega: self.base.omega + self.drive_delta * actuation.drive,
-            brake_budget: self.base.brake_budget * actuation.brake,
-            grip_impulse: self.base.grip_impulse * actuation.grip,
-            ..self.base
-        }
-    }
-
-    // Every preview starts from the immutable tick state. In particular, repeated
-    // contact/assist iterations never integrate drive torque or grip recovery again.
-    fn select_actuation(&self, speed: [Real; 2], dt: Real) -> ContactActuation {
-        let solve = |drive, brake| {
-            solve_with_grip_recovery(
-                self.contact(
-                    speed,
-                    ContactActuation {
-                        drive,
-                        brake,
-                        grip: 1.0,
-                    },
-                ),
-                self.kinetic_grip,
-                self.previous_grip,
-                self.sliding_floor,
-                dt,
-            )
-        };
-        let drive_for = |brake| {
-            traction_control_torque_fraction(self.tc, |drive| {
-                let result = solve(drive, brake).0;
-                (result.omega * self.base.radius - result.speed[0]) * self.drive_direction
-            })
-        };
-        let brake = if self.base.brake_budget > 0.0 {
-            anti_lock_brake_torque_fraction(self.abs, self.direction, |brake| {
-                let result = solve(drive_for(brake), brake).0;
-                (result.omega * self.base.radius, result.speed[0])
-            })
-        } else {
-            1.0
-        };
-        let drive = drive_for(brake);
-        let grip = recovered_contact_grip(
-            self.contact(
-                speed,
-                ContactActuation {
-                    drive,
-                    brake,
-                    grip: 1.0,
-                },
-            ),
-            self.kinetic_grip,
-            self.previous_grip,
-            self.sliding_floor,
-            dt,
-        );
-        ContactActuation { drive, brake, grip }
-    }
+struct AxleClutch {
+    a: usize,
+    b: usize,
+    lock: Real,
+    torque: Real,
+    impulse: Real,
+    next_impulse: Real,
+    limit: Real,
 }
 
 // Scratch contact-space velocities are base_speed + response * accumulated_impulse.
@@ -2360,6 +2289,12 @@ impl PreparedVehicleContact {
 #[derive(Default)]
 struct VehicleContactSolver {
     contacts: Vec<PreparedVehicleContact>,
+    axles: Vec<AxleClutch>,
+    rotation_response: Vec<Real>,
+    base_omegas: Vec<Real>,
+    drive_deltas: Vec<Real>,
+    angular_deltas: Vec<Real>,
+    dt: Real,
     response: Vec<[[Real; 2]; 2]>,
     impulses: Vec<[Real; 2]>,
     brakes: Vec<Real>,
@@ -2379,6 +2314,289 @@ const CONTACT_SOLVER_MAX_ASSIST_ITERATIONS: usize = 8;
 const CONTACT_SOLVER_TOLERANCE: Real = 0.0001;
 
 impl VehicleContactSolver {
+    fn prepare_rotation(&mut self) {
+        let n = self.contacts.len();
+        self.rotation_response.resize(n * n, 0.0);
+        self.rotation_response.fill(0.0);
+        self.base_omegas.clear();
+        self.base_omegas
+            .extend(self.contacts.iter().map(|c| c.base.omega));
+        self.drive_deltas.resize(n, 0.0);
+        self.angular_deltas.resize(n, 0.0);
+        for i in 0..n {
+            self.rotation_response[i * n + i] = 1.0 / self.contacts[i].base.inertia;
+        }
+        for axle in &mut self.axles {
+            axle.impulse = 0.0;
+            axle.next_impulse = 0.0;
+            if axle.lock == 1.0 {
+                let a = self.contacts[axle.a].base;
+                let b = self.contacts[axle.b].base;
+                let inertia = a.inertia + b.inertia;
+                let omega = (a.omega * a.inertia + b.omega * b.inertia) / inertia;
+                for i in [axle.a, axle.b] {
+                    self.base_omegas[i] = omega;
+                    for j in [axle.a, axle.b] {
+                        self.rotation_response[i * n + j] = 1.0 / inertia;
+                    }
+                }
+            }
+        }
+        for i in 0..n {
+            self.drive_deltas[i] = (0..n)
+                .map(|j| {
+                    self.rotation_response[i * n + j]
+                        * self.contacts[j].drive_delta
+                        * self.contacts[j].base.inertia
+                })
+                .sum();
+        }
+    }
+
+    fn angular_impulse(&self, i: usize, drive: Real) -> Real {
+        let mut impulse = self.brakes[i] - self.impulses[i][0] * self.contacts[i].base.radius;
+        for axle in &self.axles {
+            if axle.lock < 1.0 {
+                let limit = clutch_impulse_limit(axle.lock, axle.torque * drive, self.dt);
+                let j = axle.impulse.clamp(-limit, limit);
+                if i == axle.a {
+                    impulse += j;
+                }
+                if i == axle.b {
+                    impulse -= j;
+                }
+            }
+        }
+        impulse
+    }
+
+    fn omega(&self, i: usize) -> Real {
+        let drive = self.actuations[i].drive;
+        self.base_omegas[i]
+            + self.drive_deltas[i] * drive
+            + (0..self.contacts.len())
+                .map(|j| {
+                    self.rotation_response[i * self.contacts.len() + j]
+                        * self.angular_impulse(j, drive)
+                })
+                .sum::<Real>()
+    }
+
+    fn finish_brake_holding(&mut self) {
+        // Eliminate the relaxation residue of the brake interval constraint.
+        // This changes only feasible brake impulses, never tire impulses or
+        // wheel speeds. A rigid axle has one shared brake balance equation.
+        for axle in &self.axles {
+            if axle.lock != 1.0 {
+                continue;
+            }
+            let [a, b] = [axle.a, axle.b];
+            let ca = self.contact(a, self.actuations[a]);
+            let cb = self.contact(b, self.actuations[b]);
+            let budget = ca.brake_budget + cb.brake_budget;
+            let required = self.brakes[a] + self.brakes[b]
+                - self.omega(a) * (self.contacts[a].base.inertia + self.contacts[b].base.inertia);
+            if budget > 0.0
+                && required.abs() <= budget
+                && (ca.solve().omega == 0.0 || cb.solve().omega == 0.0)
+            {
+                let correction = required - self.brakes[a] - self.brakes[b];
+                let lower = (-ca.brake_budget).max(required - cb.brake_budget);
+                let upper = ca.brake_budget.min(required + cb.brake_budget);
+                self.brakes[a] =
+                    (self.brakes[a] + correction * ca.brake_budget / budget).clamp(lower, upper);
+                self.brakes[b] = required - self.brakes[a];
+            }
+        }
+        for i in 0..self.contacts.len() {
+            if self
+                .axles
+                .iter()
+                .any(|a| a.lock == 1.0 && (a.a == i || a.b == i))
+            {
+                continue;
+            }
+            let contact = self.contact(i, self.actuations[i]);
+            let required = self.impulses[i][0] * contact.radius - contact.omega * contact.inertia;
+            if contact.solve().omega == 0.0 && required.abs() <= contact.brake_budget {
+                self.brakes[i] = required;
+            }
+        }
+    }
+
+    fn contact(&self, i: usize, actuation: ContactActuation) -> CoupledContact {
+        let n = self.contacts.len();
+        let base = self.contacts[i].base;
+        let mut omega = self.base_omegas[i] + self.drive_deltas[i] * actuation.drive;
+        for j in 0..n {
+            let mut impulse = self.angular_impulse(j, actuation.drive);
+            if i == j {
+                impulse -= self.brakes[j] - self.impulses[j][0] * base.radius;
+            }
+            omega += self.rotation_response[i * n + j] * impulse;
+        }
+        CoupledContact {
+            speed: self.speed_without_self(i),
+            omega,
+            inertia: 1.0 / self.rotation_response[i * n + i],
+            brake_budget: base.brake_budget * actuation.brake,
+            grip_impulse: base.grip_impulse * actuation.grip,
+            ..base
+        }
+    }
+
+    // A rigid axle cannot roll independently at two different road speeds. Use
+    // the load-weighted rolling speed of the axle for longitudinal assistance;
+    // actual per-tire slip still controls friction and skid reporting.
+    fn assist_reference(&self, i: usize, speed: Real) -> Real {
+        for axle in &self.axles {
+            let sticking = axle.lock == 1.0
+                || (axle.impulse.abs() < axle.limit * 0.9999
+                    && (self.omega(axle.a) - self.omega(axle.b)).abs() < CONTACT_SOLVER_TOLERANCE);
+            if axle.a == i || axle.b == i {
+                let mut numerator = 0.0;
+                let mut denominator = 0.0;
+                for j in [axle.a, axle.b] {
+                    let c = self.contacts[j].base;
+                    let own = multiply(c.response, self.impulses[j]);
+                    let road = self.speed_without_self(j)[0] + own[0];
+                    numerator += c.grip_impulse * c.radius * road;
+                    denominator += c.grip_impulse * c.radius * c.radius;
+                }
+                if denominator > 0.0 {
+                    let rolling = numerator / denominator * self.contacts[i].base.radius;
+                    if sticking {
+                        return rolling;
+                    }
+                    // A finite clutch can itself create cornering scrub even at
+                    // zero engine torque. Allow only its angular contribution,
+                    // capped by the geometric difference to rigid-axle rolling.
+                    // Straight-line wheelspin therefore receives no extra gap.
+                    let geometric = rolling - speed;
+                    let coupling = axle.impulse * (if axle.a == i { 1.0 } else { -1.0 })
+                        / self.contacts[i].base.inertia
+                        * self.contacts[i].base.radius;
+                    if geometric * coupling > 0.0 {
+                        let c = self.contacts[i].base;
+                        let grip = c.grip_impulse * self.actuations[i].grip;
+                        let longitudinal = axle.impulse.abs() / c.radius;
+                        // At sustained lateral slip the friction disk must also
+                        // supply the clutch's longitudinal reaction. Its force
+                        // direction implies this unavoidable longitudinal slip.
+                        let side = self.speed_without_self(i)[1]
+                            + multiply(c.response, self.impulses[i])[1];
+                        let steady = if longitudinal < grip {
+                            side.abs() * longitudinal
+                                / (grip * grip - longitudinal * longitudinal)
+                                    .sqrt()
+                                    .max(Real::EPSILON)
+                        } else {
+                            geometric.abs()
+                        };
+                        return speed
+                            + geometric.signum() * geometric.abs().min(coupling.abs().max(steady));
+                    }
+                }
+            }
+        }
+        speed
+    }
+
+    fn assist_reference_for(&self, i: usize, speed: Real, direction: Real) -> Real {
+        let reference = self.assist_reference(i, speed);
+        if (reference - speed) * direction > 0.0 {
+            reference
+        } else {
+            speed
+        }
+    }
+
+    fn select_actuation(&self, i: usize) -> ContactActuation {
+        let prepared = &self.contacts[i];
+        let solve = |drive, brake| {
+            solve_with_grip_recovery(
+                self.contact(
+                    i,
+                    ContactActuation {
+                        drive,
+                        brake,
+                        grip: 1.0,
+                    },
+                ),
+                prepared.kinetic_grip,
+                prepared.previous_grip,
+                prepared.sliding_floor,
+                self.dt,
+            )
+        };
+        let drive_for = |brake| {
+            traction_control_torque_fraction(prepared.tc, |drive| {
+                let result = solve(drive, brake).0;
+                (result.omega * prepared.base.radius
+                    - self.assist_reference_for(i, result.speed[0], prepared.drive_direction))
+                    * prepared.drive_direction
+            })
+        };
+        let brake = if prepared.base.brake_budget > 0.0 {
+            anti_lock_brake_torque_fraction(prepared.abs, prepared.direction, |brake| {
+                let result = solve(drive_for(brake), brake).0;
+                (
+                    result.omega * prepared.base.radius,
+                    self.assist_reference_for(i, result.speed[0], -prepared.direction),
+                )
+            })
+        } else {
+            1.0
+        };
+        let drive = drive_for(brake);
+        ContactActuation {
+            drive,
+            brake,
+            grip: solve(drive, brake).1,
+        }
+    }
+
+    fn select_actuations(&mut self) {
+        self.next_actuations.clear();
+        let mut drive: Real = 1.0;
+        for i in 0..self.contacts.len() {
+            let actuation = self.select_actuation(i);
+            drive = drive.min(actuation.drive);
+            self.next_actuations.push(actuation);
+        }
+        // There is one engine torque source. Individual tire targets choose the
+        // limiting cut, without turning an open differential into torque vectoring.
+        for i in 0..self.contacts.len() {
+            let mut actuation = self.next_actuations[i];
+            actuation.drive = drive;
+            let prepared = &self.contacts[i];
+            actuation.grip = recovered_contact_grip(
+                self.contact(
+                    i,
+                    ContactActuation {
+                        grip: 1.0,
+                        ..actuation
+                    },
+                ),
+                prepared.kinetic_grip,
+                prepared.previous_grip,
+                prepared.sliding_floor,
+                self.dt,
+            );
+            self.next_actuations[i] = actuation;
+        }
+    }
+
+    fn update_clutch_limits(&mut self) {
+        let drive = self.actuations.first().map_or(1.0, |a| a.drive);
+        for axle in &mut self.axles {
+            if axle.lock < 1.0 {
+                axle.limit = clutch_impulse_limit(axle.lock, axle.torque * drive, self.dt);
+                axle.impulse = axle.impulse.clamp(-axle.limit, axle.limit);
+            }
+        }
+    }
+
     fn speed_without_self(&self, i: usize) -> [Real; 2] {
         let mut speed = self.contacts[i].base.speed;
         for (j, impulse) in self.impulses.iter().enumerate() {
@@ -2395,7 +2613,7 @@ impl VehicleContactSolver {
         &self,
         i: usize,
         result: CoupledContactSolution,
-        actuation: ContactActuation,
+        _actuation: ContactActuation,
     ) -> Real {
         let base = self.contacts[i].base;
         let delta = [
@@ -2403,9 +2621,7 @@ impl VehicleContactSolver {
             result.tangent[1] - self.impulses[i][1],
         ];
         let speed = multiply(base.response, delta);
-        let omega = base.omega
-            + self.contacts[i].drive_delta * actuation.drive
-            + (self.brakes[i] - self.impulses[i][0] * base.radius) / base.inertia;
+        let omega = self.omega(i);
         speed[0]
             .abs()
             .max(speed[1].abs())
@@ -2417,9 +2633,7 @@ impl VehicleContactSolver {
         // Relaxation bounds the aggregate response of contacts sharing a body;
         // interpolating TOTAL tangent/brake impulses preserves their convex limits.
         if self.contacts.len() == 1 {
-            let result = self.contacts[0]
-                .contact(self.contacts[0].base.speed, self.actuations[0])
-                .solve();
+            let result = self.contact(0, self.actuations[0]).solve();
             self.impulses[0] = result.tangent;
             self.brakes[0] = result.brake;
             self.residual = 0.0;
@@ -2430,8 +2644,7 @@ impl VehicleContactSolver {
             self.iterations += 1;
             self.residual = 0.0;
             for i in 0..self.contacts.len() {
-                let mut contact =
-                    self.contacts[i].contact(self.speed_without_self(i), self.actuations[i]);
+                let mut contact = self.contact(i, self.actuations[i]);
                 let own = multiply(contact.response, self.impulses[i]);
                 // A scalar body-response majorizer leaves a pure rolling demand
                 // longitudinal. Full local inverses otherwise introduce opposing
@@ -2452,6 +2665,26 @@ impl VehicleContactSolver {
                 self.next_impulses[i] = result.tangent;
                 self.next_brakes[i] = result.brake;
             }
+            for k in 0..self.axles.len() {
+                let axle = &self.axles[k];
+                if axle.lock == 1.0 {
+                    continue;
+                }
+                let n = self.contacts.len();
+                let response = self.rotation_response[axle.a * n + axle.a]
+                    + self.rotation_response[axle.b * n + axle.b];
+                let next = (axle.impulse + (self.omega(axle.b) - self.omega(axle.a)) / response)
+                    .clamp(-axle.limit, axle.limit);
+                self.residual = self.residual.max(
+                    (next - axle.impulse).abs()
+                        * response
+                        * self.contacts[axle.a]
+                            .base
+                            .radius
+                            .max(self.contacts[axle.b].base.radius),
+                );
+                self.axles[k].next_impulse = next;
+            }
             // All errors refer to one common state, including each wheel's own
             // accumulated impulse and the corrections from every other wheel.
             if self.residual <= CONTACT_SOLVER_TOLERANCE {
@@ -2463,21 +2696,39 @@ impl VehicleContactSolver {
             // locked/lateral contacts take a smaller one. Unlike a fixed 1/N
             // relaxation this does not spend dozens of passes integrating the
             // same almost-independent wheel-inertia correction.
+            for i in 0..self.contacts.len() {
+                self.angular_deltas[i] = self.next_brakes[i]
+                    - self.brakes[i]
+                    - self.contacts[i].base.radius
+                        * (self.next_impulses[i][0] - self.impulses[i][0]);
+            }
+            for axle in &self.axles {
+                if axle.lock < 1.0 {
+                    let delta = axle.next_impulse - axle.impulse;
+                    self.angular_deltas[axle.a] += delta;
+                    self.angular_deltas[axle.b] -= delta;
+                }
+            }
             let mut linear = 0.0;
             let mut curvature = 0.0;
             for i in 0..self.contacts.len() {
-                let c = self.contacts[i].contact(self.speed_without_self(i), self.actuations[i]);
+                let c = self.contact(i, self.actuations[i]);
                 let own = multiply(c.response, self.impulses[i]);
                 let delta = [
                     self.next_impulses[i][0] - self.impulses[i][0],
                     self.next_impulses[i][1] - self.impulses[i][1],
                 ];
-                let angular = self.next_brakes[i] - self.brakes[i] - c.radius * delta[0];
-                let omega = c.omega + (self.brakes[i] - c.radius * self.impulses[i][0]) / c.inertia;
+                let angular = self.angular_deltas[i];
                 linear += (c.speed[0] + own[0]) * delta[0]
                     + (c.speed[1] + own[1]) * delta[1]
-                    + omega * angular;
-                curvature += angular * angular / c.inertia;
+                    + self.omega(i) * angular;
+                curvature += (0..self.contacts.len())
+                    .map(|j| {
+                        angular
+                            * self.rotation_response[i * self.contacts.len() + j]
+                            * self.angular_deltas[j]
+                    })
+                    .sum::<Real>();
                 for j in 0..self.contacts.len() {
                     let other_delta = [
                         self.next_impulses[j][0] - self.impulses[j][0],
@@ -2493,10 +2744,16 @@ impl VehicleContactSolver {
                 // For exact feasible block minima the optimum step is at
                 // least 1/N (Cauchy-Schwarz on the shared-body response).
                 // Retain that safe descent step when f32 cancellation dominates.
-                (-linear / curvature).clamp(1.0 / self.contacts.len() as Real, 1.0)
+                (-linear / curvature)
+                    .clamp(1.0 / (self.contacts.len() + self.axles.len()) as Real, 1.0)
             } else {
                 1.0
             };
+            for axle in &mut self.axles {
+                if axle.lock < 1.0 {
+                    axle.impulse += relaxation * (axle.next_impulse - axle.impulse);
+                }
+            }
             for i in 0..self.contacts.len() {
                 for axis in 0..2 {
                     self.impulses[i][axis] +=
@@ -2509,6 +2766,8 @@ impl VehicleContactSolver {
 
     fn solve(&mut self, chassis: &RigidBody, bodies: &RigidBodySet, dt: Real) {
         let count = self.contacts.len();
+        self.dt = dt;
+        self.prepare_rotation();
         self.iterations = 0;
         self.residual = 0.0;
         self.assist_residual = 0.0;
@@ -2546,29 +2805,38 @@ impl VehicleContactSolver {
         self.brakes.fill(0.0);
         self.next_impulses.resize(count, [0.0; 2]);
         self.next_brakes.resize(count, 0.0);
-        self.actuations.clear();
-        self.actuations.extend(
-            self.contacts
-                .iter()
-                .map(|c| c.select_actuation(c.base.speed, dt)),
+        self.actuations.resize(
+            count,
+            ContactActuation {
+                drive: 1.0,
+                brake: 1.0,
+                grip: 1.0,
+            },
         );
+        self.actuations.fill(ContactActuation {
+            drive: 1.0,
+            brake: 1.0,
+            grip: 1.0,
+        });
+        self.update_clutch_limits();
+        self.select_actuations();
+        std::mem::swap(&mut self.actuations, &mut self.next_actuations);
+        self.update_clutch_limits();
         for _ in 0..CONTACT_SOLVER_MAX_ASSIST_ITERATIONS {
             self.solve_fixed();
-            self.next_actuations.clear();
+            self.select_actuations();
             self.assist_residual = 0.0;
             for i in 0..count {
-                let speed = self.speed_without_self(i);
-                let actuation = self.contacts[i].select_actuation(speed, dt);
-                let candidate = self.contacts[i].contact(speed, actuation).solve();
+                let candidate = self.contact(i, self.next_actuations[i]).solve();
                 self.assist_residual =
                     self.assist_residual
                         .max(self.solution_error(i, candidate, self.actuations[i]));
-                self.next_actuations.push(actuation);
             }
             if self.assist_residual <= CONTACT_SOLVER_TOLERANCE {
                 return;
             }
             std::mem::swap(&mut self.actuations, &mut self.next_actuations);
+            self.update_clutch_limits();
             // A changed envelope must remain feasible throughout its solve.
             for i in 0..count {
                 let limit = self.contacts[i].base.grip_impulse * self.actuations[i].grip;
@@ -2588,9 +2856,8 @@ impl VehicleContactSolver {
         self.solve_fixed();
         self.assist_residual = 0.0;
         for i in 0..count {
-            let speed = self.speed_without_self(i);
-            let actuation = self.contacts[i].select_actuation(speed, dt);
-            let candidate = self.contacts[i].contact(speed, actuation).solve();
+            let actuation = self.select_actuation(i);
+            let candidate = self.contact(i, actuation).solve();
             self.assist_residual =
                 self.assist_residual
                     .max(self.solution_error(i, candidate, self.actuations[i]));
@@ -3571,7 +3838,7 @@ mod tests {
         (controller, bodies, colliders)
     }
 
-    fn four_wheel_test_vehicle(
+    pub(super) fn four_wheel_test_vehicle(
         speed: Real,
         traction_control: Real,
     ) -> (DynamicRayCastVehicleController, RigidBodySet, ColliderSet) {
@@ -3734,9 +4001,8 @@ mod tests {
                                 "{hz} Hz, direction {direction}, assist {assist}, brake {brake}, moving {moving}: contact residual {}", solver.residual);
                             assert!(solver.assist_residual <= CONTACT_SOLVER_TOLERANCE * 2.0,
                                 "{hz} Hz, direction {direction}, assist {assist}, brake {brake}, moving {moving}: assist residual {}", solver.assist_residual);
-                            for (i, contact) in solver.contacts.iter().enumerate() {
-                                let limits = contact
-                                    .contact(solver.speed_without_self(i), solver.actuations[i]);
+                            for i in 0..solver.contacts.len() {
+                                let limits = solver.contact(i, solver.actuations[i]);
                                 assert!(
                                     solver.impulses[i][0].hypot(solver.impulses[i][1])
                                         <= limits.grip_impulse + 1e-4
@@ -3909,7 +4175,7 @@ mod tests {
         }
     }
 
-    fn set_test_drive(controller: &mut DynamicRayCastVehicleController, torque: Real) {
+    pub(super) fn set_test_drive(controller: &mut DynamicRayCastVehicleController, torque: Real) {
         for wheel in &mut controller.wheels {
             if wheel.role.driven {
                 wheel.wheel_coupling_torque = torque;
@@ -6260,125 +6526,6 @@ mod tests {
     }
 
     #[test]
-    fn rear_drive_allocation_preserves_cornering_speed_difference() {
-        let (mut controller, _, _) = four_wheel_test_vehicle(10.0, 0.0);
-        set_test_drive(&mut controller, 500.0);
-        let mut contacts = vec![WheelContactState::default(); 4];
-        for (id, road_speed) in [(2, 8.0), (3, 12.0)] {
-            contacts[id].is_grounded = true;
-            contacts[id].forward_speed = road_speed;
-            controller.wheels[id].angular_velocity = (road_speed + 2.0) / 0.35;
-        }
-        let mut torques = [0.0, 0.0, 500.0, 500.0];
-        controller.redistribute_rear_drive_torque(&contacts, &mut torques, 1.0 / 60.0);
-        assert!((torques[2] - 500.0).abs() < 0.001);
-        assert!((torques[3] - 500.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn rear_drive_allocation_corrects_excess_spin_with_inertia_and_timestep() {
-        for hz in [30, 60, 120] {
-            for direction in [-1.0, 1.0] {
-                let (mut controller, _, _) = four_wheel_test_vehicle(10.0 * direction, 0.0);
-                set_test_drive(&mut controller, 1_000.0 * direction);
-                controller.wheels[3].radius = 0.4;
-                let mut contacts = vec![WheelContactState::default(); 4];
-                for (id, road_speed, excess) in [(2, 8.0, 3.0), (3, 12.0, 1.0)] {
-                    contacts[id].is_grounded = true;
-                    contacts[id].forward_speed = road_speed * direction;
-                    controller.wheels[id].angular_velocity =
-                        (road_speed + excess) * direction / controller.wheels[id].radius;
-                }
-                let dt = 1.0 / hz as Real;
-                let mut torques = [0.0, 0.0, 1_000.0 * direction, 1_000.0 * direction];
-                controller.redistribute_rear_drive_torque(&contacts, &mut torques, dt);
-                let transfer = 1_000.0 - torques[2] * direction;
-                let correction = transfer
-                    * dt
-                    * (0.35 / wheel_angular_inertia(0.35) + 0.4 / wheel_angular_inertia(0.4));
-                assert!(transfer > 0.0);
-                assert!((correction - 2.0).abs() < 0.001);
-                assert!((torques[2] + torques[3] - 2_000.0 * direction).abs() < 0.001);
-            }
-        }
-    }
-
-    #[test]
-    fn rear_drive_allocation_can_transfer_all_drive_but_cannot_create_braking() {
-        for spinning_id in [2, 3] {
-            for direction in [-1.0, 1.0] {
-                let (mut controller, _, _) = four_wheel_test_vehicle(0.0, 0.0);
-                set_test_drive(&mut controller, 100.0 * direction);
-                controller.wheels[spinning_id].angular_velocity = 100.0 * direction;
-                let mut contacts = vec![WheelContactState::default(); 4];
-                contacts[2].is_grounded = true;
-                contacts[3].is_grounded = true;
-                let mut torques = [0.0, 0.0, 100.0 * direction, 100.0 * direction];
-                controller.redistribute_rear_drive_torque(&contacts, &mut torques, 1.0 / 60.0);
-                assert_eq!(torques[spinning_id], 0.0);
-                assert_eq!(torques[5 - spinning_id], 200.0 * direction);
-            }
-        }
-    }
-
-    #[test]
-    fn rear_drive_allocation_bypasses_unpowered_braked_or_ungrounded_pairs() {
-        for case in 0..8 {
-            let (mut controller, _, _) = four_wheel_test_vehicle(0.0, 0.0);
-            set_test_drive(&mut controller, 100.0);
-            controller.wheels[2].angular_velocity = 100.0;
-            let mut contacts = vec![WheelContactState::default(); 4];
-            contacts[2].is_grounded = true;
-            contacts[3].is_grounded = true;
-            let mut torques = [0.0, 0.0, 100.0, 100.0];
-            match case {
-                0 => contacts[2].is_grounded = false,
-                1 => controller.wheels[3].brake = 0.5,
-                2 => controller.wheels[2].drive_throttle = 0.0,
-                3 => controller.wheels[3].drivetrain_connected = false,
-                4 => controller.wheels[3].role.driven = false,
-                5 => controller.wheels[3].target_rotation = -100.0,
-                6 => torques[2] = -100.0,
-                _ => controller.wheels[3].role.axle = WheelAxle::Front,
-            }
-            let original = torques;
-            controller.redistribute_rear_drive_torque(&contacts, &mut torques, 1.0 / 60.0);
-            assert_eq!(torques, original, "case {case}");
-        }
-    }
-
-    #[test]
-    fn rear_drive_allocation_sends_real_contact_force_to_the_loaded_wheel() {
-        for hz in [30, 60, 120] {
-            let mut results = Vec::new();
-            for redistribution in [false, true] {
-                let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(10.0, 0.0);
-                set_test_drive(&mut controller, 1_000.0);
-                controller.wheels[2].angular_velocity += 10.0 / 0.35;
-                controller.wheels[2].wheel_suspension_force = 1_000.0;
-                controller.wheels[3].wheel_suspension_force = 8_000.0;
-                for wheel in &mut controller.wheels[2..] {
-                    wheel.friction_slip = 1.0;
-                    if !redistribution {
-                        // Keep identical wheel torque, bypass only the new allocation.
-                        wheel.drive_throttle = 0.0;
-                    }
-                }
-                controller.update_friction(&mut bodies, &colliders, 1.0 / hz as Real);
-                results.push((
-                    controller.wheels[2].angular_velocity,
-                    controller.wheels[3].forward_impulse,
-                ));
-            }
-            assert!(results[1].0 < results[0].0, "{hz} Hz: donor must spin less");
-            assert!(
-                results[1].1 > results[0].1,
-                "{hz} Hz: recipient must gain tire force"
-            );
-        }
-    }
-
-    #[test]
     fn opposing_angular_impulse_stops_without_reversing_the_wheel() {
         let inertia = wheel_angular_inertia(WHEEL_REFERENCE_RADIUS);
         let mut angular_velocity = 2.0;
@@ -6387,93 +6534,6 @@ mod tests {
 
         assert_eq!(angular_velocity, 0.0);
         assert!((remaining - inertia).abs() < 1.0e-5);
-    }
-
-    #[test]
-    fn redistributed_drive_feedback_does_not_create_an_engine_rpm_deficit() {
-        for hz in [30, 60, 120] {
-            for direction in [-1.0, 1.0] {
-                for transfer in [-300.0, 300.0] {
-                    let (mut controller, _, _) = four_wheel_test_vehicle(15.0 * direction, 0.0);
-                    let gear = if direction > 0.0 { 1 } else { -1 };
-                    controller.set_gear(gear);
-                    controller.powertrain.config.transmission.auto_clutch = false;
-                    controller.powertrain.config.turbo.enabled = false;
-                    controller.set_input(VehicleInput {
-                        throttle: 1.0,
-                        ..VehicleInput::default()
-                    });
-                    controller.powertrain.state_mut().engine_rpm = 5_000.0;
-                    let config = &controller.powertrain.config;
-                    let ratio = if gear > 0 {
-                        config.transmission.forward_ratios[0]
-                    } else {
-                        config.transmission.reverse_ratio
-                    };
-                    let gearing = ratio * config.transmission.final_drive_ratio;
-                    let base_torque = 600.0
-                        * ratio.abs().powf(config.engine.gear_force_exponent)
-                        * config.transmission.final_drive_ratio
-                        * config.engine.drivetrain_efficiency
-                        * config.engine.force_scale
-                        * direction
-                        / 2.0;
-                    let omega = 5_000.0 * std::f64::consts::TAU as Real / 60.0 / gearing;
-                    controller.wheels[2].angular_velocity = omega * 0.9;
-                    controller.wheels[3].angular_velocity = omega;
-                    // Steady wheel motion: road load exactly balances the actual
-                    // redistributed torque, including when the fastest wheel donates.
-                    for (id, signed_transfer) in [(2, -transfer), (3, transfer)] {
-                        controller.wheels[id].drive_torque_transfer = signed_transfer * direction;
-                        controller.wheels[id].angular_load =
-                            base_torque + signed_transfer * direction;
-                    }
-                    for _ in 0..hz * 60 {
-                        controller.update_powertrain(
-                            1.0 / hz as Real,
-                            controller.current_vehicle_speed.abs(),
-                        );
-                    }
-                    assert!(
-                        (controller.state().engine_rpm - 5_000.0).abs() < 1.0,
-                        "{hz} Hz direction {direction} transfer {transfer}: RPM {}",
-                        controller.state().engine_rpm
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn drive_transfer_feedback_tracks_the_actual_torque_after_tc_and_clears_on_bypass() {
-        for strength in [0.0, 0.5, 1.0] {
-            let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(10.0, strength);
-            set_test_drive(&mut controller, 1_000.0);
-            controller.wheels[2].angular_velocity += 10.0 / 0.35;
-            controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
-            for (id, transfer) in [(2, -1_000.0), (3, 1_000.0)] {
-                let wheel = &controller.wheels[id];
-                let expected = transfer * (1.0 - wheel.traction_control_cut);
-                assert!((wheel.drive_torque_transfer - expected).abs() < 0.001);
-            }
-            controller.wheels[2].raycast_info.ground_object = None;
-            controller.wheels[2].raycast_info.is_in_contact = false;
-            controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
-            assert_eq!(controller.wheels[2].drive_torque_transfer, 0.0);
-            assert_eq!(controller.wheels[3].drive_torque_transfer, 0.0);
-        }
-    }
-
-    #[test]
-    fn wheel_rotation_uses_integrated_angular_velocity() {
-        let mut wheel = test_wheel();
-        wheel.angular_velocity = -12.0;
-        let dt = 1.0 / 60.0;
-
-        update_wheel_rotation(&mut wheel, dt);
-
-        assert!((wheel.rotation + 0.2).abs() < 1.0e-6);
-        assert!((wheel.delta_rotation + 0.2).abs() < 1.0e-6);
     }
 
     #[test]
@@ -7091,7 +7151,7 @@ mod tests {
         wheel.delta_rotation = 2.0;
         wheel.target_rotation = 3.0;
         wheel.angular_velocity = 20.0;
-        wheel.drive_torque_transfer = 300.0;
+        wheel.differential_torque = 300.0;
         wheel.abs_release = 0.7;
         wheel.traction_control_cut = 0.6;
         wheel.traction_control = 0.35;
@@ -7121,7 +7181,7 @@ mod tests {
         assert_eq!(wheel.delta_rotation, 0.0);
         assert_eq!(wheel.target_rotation, 0.0);
         assert_eq!(wheel.angular_velocity, 0.0);
-        assert_eq!(wheel.drive_torque_transfer, 0.0);
+        assert_eq!(wheel.differential_torque, 0.0);
         assert_eq!(wheel.traction_control, 0.35);
         assert_eq!(wheel.traction_control_cut, 0.0);
         assert_eq!(wheel.abs_release, 0.0);
@@ -7277,3 +7337,7 @@ impl TireType {
         self.surface_friction.keys().collect()
     }
 }
+
+#[cfg(test)]
+#[path = "vehicle_differential_tests.rs"]
+mod differential_tests;

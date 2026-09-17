@@ -293,6 +293,8 @@ impl Default for SteeringConfig {
 /// Complete mandatory configuration for a ray-cast vehicle controller.
 #[derive(Clone, Debug, Default)]
 pub struct VehicleControllerConfig {
+    /// Axle differential clutches and AWD torque distribution.
+    pub differential: super::VehicleDifferentialConfig,
     /// Engine configuration.
     pub engine: EngineConfig,
     /// Transmission configuration.
@@ -1640,6 +1642,10 @@ impl VehiclePowertrain {
 }
 
 fn sanitize_config(config: &mut VehicleControllerConfig) {
+    assert!(
+        config.differential.is_valid(),
+        "Differential settings must be finite in 0..=1"
+    );
     config.engine.idle_rpm = config.engine.idle_rpm.max(1.0);
     config.engine.max_rpm = config.engine.max_rpm.max(config.engine.idle_rpm + 1.0);
     config.engine.rev_limit_rpm = config

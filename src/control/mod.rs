@@ -11,6 +11,8 @@ pub use self::ray_cast_vehicle_controller::{
     DynamicRayCastVehicleController, TireFriction, Wheel, WheelTuning,
 };
 #[cfg(feature = "dim3")]
+pub use self::vehicle_differential::VehicleDifferentialConfig;
+#[cfg(feature = "dim3")]
 pub use self::vehicle_powertrain::{
     EngineConfig, SteeringConfig, TransmissionConfig, TurboConfig, VehicleControllerConfig,
     VehicleDownforceConfig, VehicleDownforcePoint, VehicleDynamicsConfig, VehicleEngineState,
@@ -22,6 +24,8 @@ mod character_controller;
 mod pid_controller;
 #[cfg(feature = "dim3")]
 mod ray_cast_vehicle_controller;
+#[cfg(feature = "dim3")]
+mod vehicle_differential;
 #[cfg(feature = "dim3")]
 mod vehicle_powertrain;
 #[cfg(feature = "dim3")]

@@ -106,3 +106,25 @@ mass, multiplied by the car's nonnegative `drag_per_downforce` ratio (default
 0.2). This drag opposes forward or reverse motion, uses the same curve and cap,
 and is additional to body drag and rolling resistance. Points replace the
 center-of-mass fallback in both the load and drag calculation.
+
+Axle differentials live in the same tire/brake contact solve. Driven front and
+rear pairs use independent acceleration/coast clutch settings; positive
+mechanical power selects acceleration (also in reverse), disconnected drive
+selects coast, and a torque deadband holds the mode through momentary cuts.
+Intermediate locking is a passive bounded angular impulse, equal and opposite
+at the two wheels. Its torque capacity is `p/(1-p) * (50 Nm + |axle torque|/2)`;
+`p=0` is open and `p=1` instead uses an exact shared rotational degree of freedom.
+Thus full lock gives identical angular speeds under all contact/brake conditions,
+including unequal wheel radii, without post-solve speed edits or fictitious grip.
+A percentage controls clutch strength, not a fixed percentage of speed difference.
+The angular response and tire/brake impulses converge together; the full-lock
+constraint remains exact even if the bounded contact solve reaches its cap.
+
+AWD center balance is the rear share of incoming torque, not a center speed lock.
+The same weights define shaft speed, equivalent inertia, torque distribution,
+and road-load feedback. Internal axle reactions are excluded from engine load.
+TC chooses a common cut of the incoming torque; axle reaction stays internal.
+ABS/TC previews use the coupled rotational response and allow the unavoidable
+corner scrub of a locked or slipping clutch. Individual tire slip still drives
+the existing friction, grip recovery and skid calculations. Airborne wheels
+participate in axle/brake rotation but provide no road grip or assist sensing.
