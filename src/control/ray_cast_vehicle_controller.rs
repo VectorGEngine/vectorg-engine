@@ -4348,6 +4348,7 @@ mod tests {
                         let output = controller.update_powertrain(dt, velocity.norm());
                         assert_eq!(output.drive_throttle, 0.0);
                         assert_eq!(output.service_brake, 1.0);
+                        assert!(controller.state().engine_running);
                         controller.apply_powertrain_output(output);
                         controller.update_friction(&mut bodies, &colliders, dt);
                     }
@@ -4356,6 +4357,8 @@ mod tests {
                         "{hz} Hz direction {direction}, reverse mode {reverse}"
                     );
                     assert_eq!(controller.state().current_gear, 0);
+                    let idle = controller.powertrain.config.engine.idle_rpm;
+                    assert!((controller.state().engine_rpm - idle).abs() < idle * 0.005);
                 }
             }
         }
