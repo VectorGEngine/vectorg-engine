@@ -1178,14 +1178,14 @@ impl DynamicRayCastVehicleController {
 
     fn drive_weights(&self) -> Vec<Real> {
         let axles = self.driven_axles();
-        let rear = match (axles[0].is_empty(), axles[1].is_empty()) {
-            (false, false) => self.powertrain.config.differential.center_rear_bias,
-            (true, _) => 1.0,
-            _ => 0.0,
+        let front = match (axles[0].is_empty(), axles[1].is_empty()) {
+            (false, false) => self.powertrain.config.differential.center_balance,
+            (true, _) => 0.0,
+            _ => 1.0,
         };
         let mut weights = vec![0.0; self.wheels.len()];
         for (axle, ids) in axles.iter().enumerate() {
-            let share = if axle == 0 { 1.0 - rear } else { rear };
+            let share = if axle == 0 { front } else { 1.0 - front };
             for &i in ids {
                 weights[i] = share / ids.len() as Real;
             }

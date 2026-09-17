@@ -7,7 +7,7 @@ fn locks(controller: &mut DynamicRayCastVehicleController, value: Real) {
         front_decel_lock: value,
         rear_accel_lock: value,
         rear_decel_lock: value,
-        center_rear_bias: 0.5,
+        center_balance: 0.5,
     };
 }
 
@@ -128,26 +128,26 @@ fn differential_modes_switch_and_clutch_disconnection_uses_coast() {
 }
 
 #[test]
-fn differential_awd_weights_and_shaft_speed_follow_center_bias() {
+fn differential_awd_weights_and_shaft_speed_follow_center_balance() {
     for bias in [0.0, 0.25, 0.5, 0.75, 1.0] {
         let (mut c, _, _) = four_wheel_test_vehicle(0.0, 0.0);
         for (i, w) in c.wheels.iter_mut().enumerate() {
             w.role.driven = true;
             w.angular_velocity = [10.0, 30.0, 50.0, 70.0][i];
         }
-        c.powertrain.config.differential.center_rear_bias = bias;
+        c.powertrain.config.differential.center_balance = bias;
         let weights = c.drive_weights();
         assert_eq!(
             weights,
             vec![
-                (1.0 - bias) * 0.5,
-                (1.0 - bias) * 0.5,
                 bias * 0.5,
-                bias * 0.5
+                bias * 0.5,
+                (1.0 - bias) * 0.5,
+                (1.0 - bias) * 0.5
             ]
         );
         let (speed, radius) = c.driven_wheel_speed_and_radius();
-        assert!((speed / radius - (20.0 * (1.0 - bias) + 60.0 * bias)).abs() < 0.00001);
+        assert!((speed / radius - (20.0 * bias + 60.0 * (1.0 - bias))).abs() < 0.00001);
         c.apply_powertrain_output(super::super::vehicle_powertrain::PowertrainOutput {
             drive_torque: 1000.0,
             engine_brake_torque: 0.0,

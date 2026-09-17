@@ -120,7 +120,7 @@ A percentage controls clutch strength, not a fixed percentage of speed differenc
 The angular response and tire/brake impulses converge together; the full-lock
 constraint remains exact even if the bounded contact solve reaches its cap.
 
-AWD center balance is the rear share of incoming torque, not a center speed lock.
+AWD center balance is the front share of incoming torque, not a center speed lock.
 The same weights define shaft speed, equivalent inertia, torque distribution,
 and road-load feedback. Internal axle reactions are excluded from engine load.
 TC chooses a common cut of the incoming torque; axle reaction stays internal.

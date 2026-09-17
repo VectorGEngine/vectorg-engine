@@ -1,6 +1,6 @@
 use crate::math::Real;
 
-/// Axle clutch locking strengths and the fraction of AWD torque sent rearward.
+/// Axle clutch locking strengths and the fraction of AWD torque sent forward.
 /// All values are normalized to 0..=1. A lock of one is a rigid axle constraint.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VehicleDifferentialConfig {
@@ -12,8 +12,8 @@ pub struct VehicleDifferentialConfig {
     pub rear_accel_lock: Real,
     /// Rear locking under engine braking, coasting, or disconnected drive.
     pub rear_decel_lock: Real,
-    /// Rear torque fraction when both axles are driven; ignored for FWD/RWD.
-    pub center_rear_bias: Real,
+    /// Front torque fraction when both axles are driven; ignored for FWD/RWD.
+    pub center_balance: Real,
 }
 
 impl Default for VehicleDifferentialConfig {
@@ -23,7 +23,7 @@ impl Default for VehicleDifferentialConfig {
             front_decel_lock: 0.0,
             rear_accel_lock: 0.0,
             rear_decel_lock: 0.0,
-            center_rear_bias: 0.5,
+            center_balance: 0.5,
         }
     }
 }
@@ -36,7 +36,7 @@ impl VehicleDifferentialConfig {
             self.front_decel_lock,
             self.rear_accel_lock,
             self.rear_decel_lock,
-            self.center_rear_bias,
+            self.center_balance,
         ]
         .iter()
         .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
