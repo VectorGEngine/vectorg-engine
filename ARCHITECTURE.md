@@ -123,8 +123,27 @@ constraint remains exact even if the bounded contact solve reaches its cap.
 AWD center balance is the front share of incoming torque, not a center speed lock.
 The same weights define shaft speed, equivalent inertia, torque distribution,
 and road-load feedback. Internal axle reactions are excluded from engine load.
+
+The AWD center lock couples the front and rear mean wheel speeds with the same
+clutch law and capacity formula as an axle, one setting under power and braking.
+A center impulse is shared equally by each axle's wheels. `p=0` adds nothing (the
+solve is bit-identical to an open center) and `p=1` projects the rotational
+response onto front mean == rear mean exactly, like a rigid shaft; with rigid
+axles too, all four wheels share one angular speed. A rigid group snaps to rest
+and resolves its brake holding as one unit. The engine sees the projected shaft
+inertia. Below full lock, center balance sets the split whenever the center
+slips; at full lock grip decides it. The handbrake scales the center lock by
+`1 - handbrake` and moves the rear share of torque to the front by the same
+amount, disconnecting the rear drive like a rally hydraulic handbrake.
+
 TC chooses a common cut of the incoming torque; axle reaction stays internal.
-ABS/TC previews use the coupled rotational response and allow the unavoidable
-corner scrub of a locked or slipping clutch. Individual tire slip still drives
-the existing friction, grip recovery and skid calculations. Airborne wheels
-participate in axle/brake rotation but provide no road grip or assist sensing.
+Its decision is layered wheel -> axle -> center: parts that turn freely are
+limited by the weakest, while a holding clutch or rigid link is decided by its
+least-limited part, since a saturated tire's own preview freezes its partner.
+A clutch holds while its impulse is below capacity. Scrub that a slipping axle
+or center clutch forces on a wheel is credited by the clutch's share of that
+wheel's driving torque, capped by the rolling-speed difference it closes.
+ABS/TC previews use the coupled rotational response. Individual tire slip still
+drives the existing friction, grip recovery and skid calculations. Airborne
+wheels participate in axle/brake rotation but provide no road grip or assist
+sensing.

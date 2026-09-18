@@ -635,6 +635,7 @@ fn full_tc_launch_speed(hz: u32, lock: f32, steering: f32, awd: bool) -> f32 {
         rear_accel_lock: lock,
         rear_decel_lock: lock,
         center_balance: 0.5,
+        center_lock: 0.0,
     };
     let mut scene = Scene::with_config(hz, 4, 0.0, 0.0, config);
     for wheel in scene.vehicle.wheels_mut() {
@@ -682,6 +683,268 @@ fn full_tc_launches_at_full_steering_lock_for_every_differential_lock() {
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CenterCase {
+    hz: u32,
+    slope: f32,
+    center: f32,
+    balance: f32,
+    axle_lock: f32,
+    tc: f32,
+    abs: f32,
+    rear_grip: f32,
+}
+
+impl Default for CenterCase {
+    fn default() -> Self {
+        Self {
+            hz: 60,
+            slope: 0.0,
+            center: 0.0,
+            balance: 0.5,
+            axle_lock: 0.3,
+            tc: 0.0,
+            abs: 0.0,
+            rear_grip: 1.0,
+        }
+    }
+}
+
+fn awd_scene(case: CenterCase) -> Scene {
+    let mut config = VehicleControllerConfig::default();
+    config.engine.idle_rpm = 1000.0;
+    config.engine.max_rpm = 7000.0;
+    config.engine.rev_limit_rpm = 7000.0;
+    config.engine.torque_curve = vec![(1000.0, 400.0), (7000.0, 350.0)];
+    config.transmission.automatic = false;
+    config.transmission.auto_clutch = true;
+    config.transmission.auto_reverse = false;
+    config.transmission.forward_ratios = vec![3.5];
+    config.transmission.final_drive_ratio = 4.0;
+    config.dynamics.traction_control_strength = case.tc;
+    config.dynamics.abs_strength = case.abs;
+    config.dynamics.esc_strength = 0.0;
+    config.differential = VehicleDifferentialConfig {
+        front_accel_lock: case.axle_lock,
+        front_decel_lock: case.axle_lock,
+        rear_accel_lock: case.axle_lock,
+        rear_decel_lock: case.axle_lock,
+        center_balance: case.balance,
+        center_lock: case.center,
+    };
+    let mut scene = Scene::with_config(case.hz, 4, case.slope, 0.0, config);
+    for wheel in scene.vehicle.wheels_mut() {
+        let front = wheel.role.axle == WheelAxle::Front;
+        wheel.role = WheelRole::new(wheel.role.axle, true, front);
+        wheel.anti_lock_brake = case.abs;
+        if !front {
+            wheel.friction_slip *= case.rear_grip;
+        }
+    }
+    scene
+}
+
+fn planar_speed(scene: &Scene) -> f32 {
+    scene
+        .tangent(*scene.bodies[scene.vehicle.chassis].linvel())
+        .norm()
+}
+
+fn awd_launch_speed(case: CenterCase, steering: f32, seconds: u32) -> f32 {
+    let mut scene = awd_scene(case);
+    for _ in 0..case.hz {
+        scene.tick();
+    }
+    scene.vehicle.set_gear(1);
+    scene.tick();
+    scene.vehicle.set_input(VehicleInput {
+        throttle: 1.0,
+        steering,
+        ..Default::default()
+    });
+    for _ in 0..case.hz * seconds {
+        scene.tick();
+    }
+    planar_speed(&scene)
+}
+
+fn awd_accelerate_to(scene: &mut Scene, hz: u32, speed: f32) {
+    for _ in 0..hz {
+        scene.tick();
+    }
+    scene.vehicle.set_gear(1);
+    scene.vehicle.set_input(VehicleInput {
+        throttle: 1.0,
+        ..Default::default()
+    });
+    while planar_speed(scene) < speed {
+        scene.tick();
+    }
+}
+
+#[test]
+fn center_lock_lets_the_gripping_axle_pull_when_the_other_spins() {
+    for hz in [30, 60, 120] {
+        for tc in [0.0, 1.0] {
+            let mut previous = 0.0;
+            for center in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let speed = awd_launch_speed(
+                    CenterCase {
+                        hz,
+                        center,
+                        tc,
+                        rear_grip: 0.05,
+                        ..Default::default()
+                    },
+                    0.0,
+                    2,
+                );
+                assert!(
+                    speed >= previous * 0.98,
+                    "{hz} Hz tc={tc} center={center}: {speed} after {previous}"
+                );
+                if center >= 0.5 {
+                    // An open center lets the spinning rear starve the front.
+                    assert!(speed > 5.0, "{hz} Hz tc={tc} center={center}: {speed}");
+                }
+                previous = speed;
+            }
+        }
+    }
+}
+
+#[test]
+fn center_lock_launches_with_full_tc_at_full_steering_lock() {
+    // Front and rear cannot roll at one speed through a tight turn. The shaft
+    // forces that scrub, so TC must not treat it as wheelspin at any lock.
+    for hz in [30, 60, 120] {
+        for balance in [0.3, 0.5, 0.7] {
+            let case = CenterCase {
+                hz,
+                balance,
+                tc: 1.0,
+                ..Default::default()
+            };
+            let open = awd_launch_speed(case, 1.0, 3);
+            for center in [0.25, 0.5, 0.75, 1.0] {
+                let speed = awd_launch_speed(CenterCase { center, ..case }, 1.0, 3);
+                assert!(
+                    speed > open * 0.9,
+                    "{hz} Hz balance={balance} center={center}: {speed} vs open {open}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn center_lock_handbrake_disconnects_rear_drive() {
+    for hz in [30, 60, 120] {
+        let mut previous_force = f32::MAX;
+        for center in [0.0, 0.5, 1.0] {
+            let mut scene = awd_scene(CenterCase {
+                hz,
+                center,
+                ..Default::default()
+            });
+            awd_accelerate_to(&mut scene, hz, 10.0);
+            scene.vehicle.set_input(VehicleInput {
+                throttle: 0.5,
+                handbrake: 1.0,
+                steering: 0.5,
+                ..Default::default()
+            });
+            let mut rear_force: f32 = 0.0;
+            for _ in 0..hz / 2 {
+                scene.tick();
+                let w = scene.vehicle.wheels();
+                assert!(w[2].delta_rotation == 0.0 && w[3].delta_rotation == 0.0);
+                assert!(w[0].delta_rotation != 0.0 && w[1].delta_rotation != 0.0);
+                rear_force = rear_force.max(w[2].engine_force.abs() + w[3].engine_force.abs());
+            }
+            assert!(rear_force < previous_force, "{hz} Hz center={center}");
+            if center == 1.0 {
+                assert_eq!(rear_force, 0.0);
+            }
+            previous_force = rear_force;
+        }
+    }
+}
+
+#[test]
+fn center_lock_holds_a_parked_car_on_a_hill() {
+    for hz in [30, 60, 120] {
+        for center in [0.5, 1.0] {
+            for slope in [-15.0, 15.0] {
+                let mut scene = awd_scene(CenterCase {
+                    hz,
+                    center,
+                    slope,
+                    ..Default::default()
+                });
+                scene.vehicle.set_input(VehicleInput {
+                    brake: 1.0,
+                    clutch: 1.0,
+                    ..Default::default()
+                });
+                for _ in 0..hz * 2 {
+                    scene.tick();
+                }
+                let start = scene.position();
+                for _ in 0..hz * 3 {
+                    scene.tick();
+                    assert!(scene
+                        .vehicle
+                        .wheels()
+                        .iter()
+                        .all(|w| w.delta_rotation == 0.0));
+                }
+                let drift = (scene.position() - start).norm();
+                assert!(
+                    drift < 1e-3,
+                    "{hz} Hz center={center} slope={slope}: {drift}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn center_lock_does_not_lengthen_abs_braking() {
+    for hz in [30, 60, 120] {
+        for steering in [0.0, 0.3] {
+            let distance = |center| {
+                let mut scene = awd_scene(CenterCase {
+                    hz,
+                    center,
+                    abs: 1.0,
+                    ..Default::default()
+                });
+                awd_accelerate_to(&mut scene, hz, 12.0);
+                let start = scene.position();
+                scene.vehicle.set_input(VehicleInput {
+                    brake: 1.0,
+                    clutch: 1.0,
+                    steering,
+                    ..Default::default()
+                });
+                while planar_speed(&scene) > 0.2 {
+                    scene.tick();
+                }
+                (scene.position() - start).norm()
+            };
+            let open = distance(0.0);
+            for center in [0.5, 1.0] {
+                let locked = distance(center);
+                assert!(
+                    locked < open * 1.02,
+                    "{hz} Hz steering={steering} center={center}: {locked} vs open {open}"
+                );
             }
         }
     }

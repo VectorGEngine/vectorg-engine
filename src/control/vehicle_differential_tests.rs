@@ -8,6 +8,7 @@ fn locks(controller: &mut DynamicRayCastVehicleController, value: Real) {
         rear_accel_lock: value,
         rear_decel_lock: value,
         center_balance: 0.5,
+        center_lock: 0.0,
     };
 }
 
@@ -230,5 +231,94 @@ fn differential_response_is_independent_of_wheel_insertion_order() {
                 assert!((left.forward_impulse - right.forward_impulse).abs() < 0.01);
             }
         }
+    }
+}
+
+#[test]
+fn differential_center_couples_axle_means_with_lost_contacts_and_unequal_radii() {
+    for hz in [30, 60, 120] {
+        for center in [0.5, 1.0] {
+            for airborne in [[].as_slice(), &[0, 1], &[2, 3]] {
+                for rear_radius in [0.35, 0.45] {
+                    let (mut c, mut bodies, colliders) = four_wheel_test_vehicle(10.0, 1.0);
+                    c.powertrain.config.differential.center_lock = center;
+                    for w in &mut c.wheels {
+                        w.role.driven = true;
+                    }
+                    for i in [2, 3] {
+                        c.wheels[i].radius = rear_radius;
+                    }
+                    for &i in airborne {
+                        c.wheels[i].raycast_info.ground_object = None;
+                    }
+                    for step in 0..30 {
+                        set_test_drive(&mut c, if step < 20 { 1500.0 } else { -200.0 });
+                        c.update_friction(&mut bodies, &colliders, 1.0 / hz as Real);
+                        let w: Vec<Real> = c.wheels.iter().map(|w| w.angular_velocity).collect();
+                        assert!(w.iter().all(|v| v.is_finite()), "{w:?}");
+                        if center == 1.0 {
+                            // A rigid center is a constraint, not a stiff clutch.
+                            let mismatch = ((w[0] + w[1]) - (w[2] + w[3])).abs() * 0.5;
+                            assert!(mismatch < 1e-3, "{hz} Hz: mean mismatch {mismatch}");
+                        }
+                        for (i, wheel) in c.wheels.iter().enumerate() {
+                            let limit = c.contact_solver.contacts[i].base.grip_impulse
+                                * c.contact_solver.actuations[i].grip;
+                            assert!(
+                                wheel.forward_impulse.hypot(wheel.side_impulse) <= limit + 0.001
+                            );
+                        }
+                    }
+                    assert!(c.contact_solver.residual <= CONTACT_SOLVER_TOLERANCE);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn differential_rigid_center_and_axles_turn_every_wheel_together() {
+    for hz in [30, 60, 120] {
+        let (mut c, mut bodies, colliders) = four_wheel_test_vehicle(10.0, 0.0);
+        locks(&mut c, 1.0);
+        c.powertrain.config.differential.center_lock = 1.0;
+        for w in &mut c.wheels {
+            w.role.driven = true;
+        }
+        c.wheels[0].friction_slip = 0.05;
+        for step in 0..30 {
+            set_test_drive(&mut c, if step < 20 { 1500.0 } else { -200.0 });
+            c.update_friction(&mut bodies, &colliders, 1.0 / hz as Real);
+            let w: Vec<Real> = c.wheels.iter().map(|w| w.angular_velocity).collect();
+            assert!(w.iter().all(|&v| v == w[0]), "{hz} Hz: {w:?}");
+        }
+    }
+}
+
+#[test]
+fn differential_open_center_adds_no_coupling_and_handbrake_releases_a_locked_one() {
+    let (mut c, mut bodies, colliders) = four_wheel_test_vehicle(10.0, 0.0);
+    for w in &mut c.wheels {
+        w.role.driven = true;
+    }
+    set_test_drive(&mut c, 500.0);
+    c.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+    assert!(c.contact_solver.center.is_none());
+
+    c.powertrain.config.differential.center_lock = 1.0;
+    c.powertrain.config.differential.center_balance = 0.3;
+    for (handbrake, lock, front) in [(0.0, 1.0, 0.3), (0.5, 0.5, 0.65), (1.0, 0.0, 1.0)] {
+        c.set_input(VehicleInput {
+            handbrake,
+            ..VehicleInput::default()
+        });
+        assert_eq!(c.center_lock(), lock);
+        // The disconnected rear share moves to the front.
+        let weights = c.drive_weights();
+        assert!(
+            (weights[0] + weights[1] - front).abs() < 1e-6,
+            "{weights:?}"
+        );
+        assert!((weights.iter().sum::<Real>() - 1.0).abs() < 1e-6);
     }
 }

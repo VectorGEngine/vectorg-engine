@@ -1,7 +1,9 @@
 use crate::math::Real;
 
-/// Axle clutch locking strengths and the fraction of AWD torque sent forward.
-/// All values are normalized to 0..=1. A lock of one is a rigid axle constraint.
+/// Axle and center clutch locking strengths and the fraction of AWD torque sent
+/// forward. All values are normalized to 0..=1. A lock of one is a rigid
+/// constraint: equal wheel speeds on an axle, or equal front and rear mean
+/// wheel speeds for the center.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VehicleDifferentialConfig {
     /// Front locking under positive drivetrain power.
@@ -14,6 +16,10 @@ pub struct VehicleDifferentialConfig {
     pub rear_decel_lock: Real,
     /// Front torque fraction when both axles are driven; ignored for FWD/RWD.
     pub center_balance: Real,
+    /// Center locking between the driven axles' mean wheel speeds, the same
+    /// under power and braking; ignored for FWD/RWD. One is a rigid shaft, and
+    /// the handbrake releases it progressively to disconnect the rear drive.
+    pub center_lock: Real,
 }
 
 impl Default for VehicleDifferentialConfig {
@@ -24,6 +30,7 @@ impl Default for VehicleDifferentialConfig {
             rear_accel_lock: 0.0,
             rear_decel_lock: 0.0,
             center_balance: 0.5,
+            center_lock: 0.0,
         }
     }
 }
@@ -37,6 +44,7 @@ impl VehicleDifferentialConfig {
             self.rear_accel_lock,
             self.rear_decel_lock,
             self.center_balance,
+            self.center_lock,
         ]
         .iter()
         .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
@@ -101,6 +109,11 @@ mod tests {
         for value in [Real::NAN, Real::INFINITY, -0.1, 1.1] {
             assert!(!VehicleDifferentialConfig {
                 rear_accel_lock: value,
+                ..Default::default()
+            }
+            .is_valid());
+            assert!(!VehicleDifferentialConfig {
+                center_lock: value,
                 ..Default::default()
             }
             .is_valid());
