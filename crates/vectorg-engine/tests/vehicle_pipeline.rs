@@ -146,7 +146,7 @@ impl Scene {
 }
 
 #[test]
-fn autoclutch_launch_balances_rpm_and_then_couples_through_the_vehicle_pipeline() {
+fn autoclutch_launch_overshoots_releases_and_couples_below_trigger_in_the_vehicle_pipeline() {
     for hz in [30, 60, 120] {
         for (idle, max, inertia, peak) in
             [(1000.0, 8000.0, 0.2, 600.0), (4500.0, 15000.0, 0.06, 700.0)]
@@ -164,7 +164,7 @@ fn autoclutch_launch_balances_rpm_and_then_couples_through_the_vehicle_pipeline(
                 config.transmission.automatic = false;
                 config.transmission.auto_clutch = true;
                 config.transmission.auto_reverse = false;
-                config.transmission.clutch_response = 12.0;
+                config.transmission.clutch_response = if idle > 4000.0 { 22.0 } else { 12.0 };
                 config.transmission.shift_cooldown = 0.0;
                 config.transmission.forward_ratios = vec![3.5];
                 config.transmission.reverse_ratio = -3.5;
@@ -188,9 +188,10 @@ fn autoclutch_launch_balances_rpm_and_then_couples_through_the_vehicle_pipeline(
                     throttle,
                     ..Default::default()
                 });
-                let target = idle * 1.05 + (max * 0.5 - idle * 1.05) * ((throttle - 0.1) / 0.9);
+                let target = idle * 1.05 + (max * 0.6 - idle * 1.05) * ((throttle - 0.1) / 0.9);
                 let mut reached = false;
-                let mut held_ticks = 0;
+                let mut released = false;
+                let mut peak_rpm = idle;
                 let mut coupled = false;
                 for step in 0..hz * 8 {
                     scene.tick();
@@ -199,35 +200,39 @@ fn autoclutch_launch_balances_rpm_and_then_couples_through_the_vehicle_pipeline(
                         / (std::f32::consts::TAU * 0.35)
                         * 14.0;
                     let road_rpm = road_rpm * 60.0;
-                    let wheel_rpm =
-                        state.driven_wheel_speed / (std::f32::consts::TAU * 0.35) * 14.0 * 60.0;
+                    let shaft_rpm = state.driven_wheel_speed.abs() / (std::f32::consts::TAU * 0.35)
+                        * 14.0
+                        * 60.0;
                     assert!(
                         state.engine_running,
                         "{hz} Hz idle {idle} slope {slope} step {step}"
                     );
-                    // Once spinning wheels overtake the target, engine speed
-                    // must follow their mechanical reaction rather than being
-                    // artificially held at the launch setpoint.
-                    if road_rpm < target * 0.9 && wheel_rpm < target * 0.95 {
-                        reached |= state.engine_rpm >= target * 0.95;
-                        if reached {
-                            assert!(state.engine_rpm > target * 0.9 && state.engine_rpm < target * 1.05,
-                                "{hz} Hz idle {idle} direction {direction} slope {slope}: RPM {} target {target} road {road_rpm}", state.engine_rpm);
-                            held_ticks += 1;
-                        }
+                    if !released {
+                        peak_rpm = peak_rpm.max(state.engine_rpm);
                     }
-                    if road_rpm > target * 1.1
-                        && (state.engine_rpm - road_rpm).abs() < target * 0.08
+                    reached |= state.engine_rpm > target;
+                    if reached && road_rpm < target * 0.1 {
+                        assert!(state.engine_rpm > target * 0.8,
+                            "RPM collapsed before moving: {hz} Hz idle={idle} road={road_rpm} engine={}",
+                            state.engine_rpm);
+                    }
+                    released |=
+                        reached && state.engine_rpm < target * 0.9 && road_rpm < target * 0.9;
+                    if released
+                        && shaft_rpm > idle
+                        && shaft_rpm < target
+                        && (state.engine_rpm - shaft_rpm).abs() < target * 0.08
                     {
                         coupled = true;
                     }
                 }
-                eprintln!("launch {hz}Hz idle={idle} dir={direction} slope={slope} throttle={throttle}: held={held_ticks} coupled={coupled} speed={}", scene.vehicle.state().vehicle_speed);
+                eprintln!("launch {hz}Hz idle={idle} dir={direction} slope={slope} throttle={throttle}: peak={peak_rpm} released={released} coupled={coupled} speed={}", scene.vehicle.state().vehicle_speed);
+                assert!(reached && released, "launch must overshoot then release");
+                assert!(peak_rpm < max * 0.97, "launch must not reach the limiter");
                 assert!(
-                    reached && held_ticks > 0,
-                    "launch must regulate before coupling"
+                    coupled,
+                    "launch must synchronize below the original trigger"
                 );
-                assert!(coupled, "launch must finish coupling");
                 assert!(scene.vehicle.state().vehicle_speed * direction as f32 > 5.0);
             }
         }

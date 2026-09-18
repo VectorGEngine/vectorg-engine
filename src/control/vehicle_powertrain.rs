@@ -22,13 +22,15 @@ const AUTO_BLIP_THROTTLE: Real = 1.0;
 const AUTO_BLIP_MIN_RPM_GAP: Real = 100.0;
 const AUTO_BLIP_OVERSHOOT_FACTOR: Real = 0.1;
 const AUTO_CLUTCH_LAUNCH_RPM_RATIO: Real = 1.05;
-const AUTO_CLUTCH_FULL_THROTTLE_RPM_RATIO: Real = 0.5;
+const AUTO_CLUTCH_FULL_THROTTLE_RPM_RATIO: Real = 0.6;
 const AUTO_CLUTCH_ANTISTALL_ENTER_RPM_RATIO: Real = 0.9;
 const AUTO_CLUTCH_ANTISTALL_EXIT_RPM_RATIO: Real = 0.98;
 const AUTO_CLUTCH_ANTISTALL_RELEASE_RESPONSE_MULTIPLIER: Real = 2.0;
-// Engine-speed regulation in inverse seconds; mechanical synchronization still
-// uses the configured clutch_response.
-const AUTO_CLUTCH_RPM_RESPONSE: Real = 5.0;
+// Launch pedal movement scales each car's existing clutch response.
+const AUTO_CLUTCH_LAUNCH_RESPONSE_MULTIPLIER: Real = 0.75;
+// Shapes speed progress in the existing release controller: 1 = linear,
+// 1.5 = intermediate, 2 = slower initially and faster later.
+const AUTO_CLUTCH_LAUNCH_RELEASE_EXPONENT: Real = 2.0;
 const AUTO_CLUTCH_MIN_DRIVE_TORQUE_FRACTION: Real = 0.2;
 const AUTO_CLUTCH_LOCK_RPM_TOLERANCE: Real = 5.0;
 const AUTO_CLUTCH_LOCK_SLIP_RPM_RATIO: Real = 0.02;
@@ -489,6 +491,7 @@ enum AutomaticClutchPhase {
     #[default]
     Open,
     Launch,
+    Engaging,
     AntiStall,
     Locked,
 }
@@ -540,6 +543,9 @@ pub(crate) struct VehiclePowertrain {
     engine_start_requested: bool,
     engine_start_elapsed: Real,
     idle_integral_torque: Real,
+    launch_committed: bool,
+    launch_reference_rpm: Real,
+    launch_rpm_rate: Real,
     automatic_clutch_engagement: Real,
     automatic_clutch_phase: AutomaticClutchPhase,
 }
@@ -578,6 +584,9 @@ impl VehiclePowertrain {
             engine_start_requested: false,
             engine_start_elapsed: 0.0,
             idle_integral_torque: 0.0,
+            launch_committed: false,
+            launch_reference_rpm: 0.0,
+            launch_rpm_rate: 0.0,
             automatic_clutch_engagement: 0.0,
             automatic_clutch_phase: AutomaticClutchPhase::Open,
         }
@@ -620,6 +629,9 @@ impl VehiclePowertrain {
         self.engine_start_requested = false;
         self.engine_start_elapsed = 0.0;
         self.idle_integral_torque = 0.0;
+        self.launch_committed = false;
+        self.launch_reference_rpm = 0.0;
+        self.launch_rpm_rate = 0.0;
         self.automatic_clutch_engagement = 0.0;
         self.automatic_clutch_phase = AutomaticClutchPhase::Open;
     }
@@ -885,6 +897,13 @@ impl VehiclePowertrain {
         let angular_acceleration =
             (engine_source_torque - clutch_torque) / self.config.engine.inertia;
         let rpm_acceleration = angular_acceleration * (60.0 / TAU);
+        self.launch_rpm_rate = if self.state.engine_running && dt > Real::EPSILON {
+            ((self.state.engine_rpm + rpm_acceleration * dt).clamp(0.0, limit)
+                - self.state.engine_rpm)
+                / dt
+        } else {
+            0.0
+        };
         let next_rpm = self.state.engine_rpm + rpm_acceleration * dt;
 
         let bump_cranking =
@@ -1075,7 +1094,10 @@ impl VehiclePowertrain {
         let synchronization_rate = if dt <= Real::EPSILON || response <= Real::EPSILON {
             0.0
         } else if self.uses_automatic_clutch()
-            && self.automatic_clutch_phase == AutomaticClutchPhase::Launch
+            && matches!(
+                self.automatic_clutch_phase,
+                AutomaticClutchPhase::Launch | AutomaticClutchPhase::Engaging
+            )
         {
             // Managed slip already regulates friction capacity. A second soft
             // synchronization rate can undersupply that torque and flare a
@@ -1137,12 +1159,18 @@ impl VehiclePowertrain {
         drivetrain_engine_torque: Real,
     ) -> Real {
         if self.state.engine_starting {
+            self.launch_committed = false;
+            self.launch_reference_rpm = 0.0;
+            self.launch_rpm_rate = 0.0;
             self.automatic_clutch_engagement = 0.0;
             self.automatic_clutch_phase = AutomaticClutchPhase::Open;
             return 0.0;
         }
 
         if ratio == 0.0 {
+            self.launch_committed = false;
+            self.launch_reference_rpm = 0.0;
+            self.launch_rpm_rate = 0.0;
             self.automatic_clutch_engagement = 0.0;
             self.automatic_clutch_phase = AutomaticClutchPhase::Open;
             return 0.0;
@@ -1156,6 +1184,15 @@ impl VehiclePowertrain {
         let ground_wheel_rpm = (vehicle_speed / (TAU * driven_wheel_radius.max(0.01))) * 60.0;
         let ground_drivetrain_rpm =
             ground_wheel_rpm * ratio * self.config.transmission.final_drive_ratio;
+        // A stopped, lifted pedal ends the attempt. Anti-stall interruptions
+        // under power retain the latch so they cannot restart the RPM build-up.
+        if !self.state.engine_running
+            || drive_throttle <= TRANSMISSION_PEDAL_RELEASE
+                && ground_drivetrain_rpm < self.config.engine.idle_rpm
+        {
+            self.launch_committed = false;
+            self.launch_reference_rpm = 0.0;
+        }
         let target_rpm = self.automatic_clutch_target_rpm();
         self.automatic_clutch_phase = self.next_automatic_clutch_phase(
             signed_drivetrain_rpm,
@@ -1165,15 +1202,21 @@ impl VehiclePowertrain {
             service_brake,
         );
 
+        if self.automatic_clutch_phase == AutomaticClutchPhase::Engaging && !self.launch_committed {
+            self.launch_committed = true;
+            self.launch_reference_rpm = target_rpm;
+        }
         let target = match self.automatic_clutch_phase {
             AutomaticClutchPhase::Open => 0.0,
             AutomaticClutchPhase::Launch => {
-                self.automatic_clutch_launch_engagement(target_rpm, drivetrain_engine_torque)
+                self.automatic_clutch_launch_engagement(drivetrain_engine_torque)
             }
             AutomaticClutchPhase::AntiStall if drive_throttle > TRANSMISSION_PEDAL_ENGAGE => {
-                self.automatic_clutch_launch_engagement(target_rpm, drivetrain_engine_torque)
+                self.automatic_clutch_launch_engagement(drivetrain_engine_torque)
             }
             AutomaticClutchPhase::AntiStall => 0.0,
+            AutomaticClutchPhase::Engaging => self
+                .automatic_clutch_engaging_target(ground_drivetrain_rpm, drivetrain_engine_torque),
             AutomaticClutchPhase::Locked => 1.0,
         };
         let response = if self.automatic_clutch_phase == AutomaticClutchPhase::AntiStall
@@ -1181,6 +1224,11 @@ impl VehiclePowertrain {
         {
             self.config.transmission.clutch_response
                 * AUTO_CLUTCH_ANTISTALL_RELEASE_RESPONSE_MULTIPLIER
+        } else if matches!(
+            self.automatic_clutch_phase,
+            AutomaticClutchPhase::Launch | AutomaticClutchPhase::Engaging
+        ) {
+            self.config.transmission.clutch_response * AUTO_CLUTCH_LAUNCH_RESPONSE_MULTIPLIER
         } else {
             self.config.transmission.clutch_response
         };
@@ -1189,15 +1237,9 @@ impl VehiclePowertrain {
         } else {
             1.0 - (-response * dt).exp()
         };
-        if self.automatic_clutch_phase == AutomaticClutchPhase::Launch {
-            // This is a torque-capacity command, not a timed pedal release.
-            // Filtering it again delays load correction and causes RPM flares.
-            self.automatic_clutch_engagement = target;
-        } else {
-            self.automatic_clutch_engagement += (target - self.automatic_clutch_engagement) * blend;
-            if target == 1.0 && self.automatic_clutch_engagement > 1.0 - Real::EPSILON {
-                self.automatic_clutch_engagement = 1.0;
-            }
+        self.automatic_clutch_engagement += (target - self.automatic_clutch_engagement) * blend;
+        if target == 1.0 && self.automatic_clutch_engagement > 0.9999 {
+            self.automatic_clutch_engagement = 1.0;
         }
         self.automatic_clutch_engagement =
             self.automatic_clutch_engagement
@@ -1210,7 +1252,8 @@ impl VehiclePowertrain {
         if matches!(
             self.automatic_clutch_phase,
             AutomaticClutchPhase::Open | AutomaticClutchPhase::AntiStall
-        ) && self.automatic_clutch_engagement <= AUTO_CLUTCH_DISENGAGED_EPSILON
+        ) && target == 0.0
+            && self.automatic_clutch_engagement <= AUTO_CLUTCH_DISENGAGED_EPSILON
         {
             self.automatic_clutch_engagement = 0.0;
         }
@@ -1255,18 +1298,30 @@ impl VehiclePowertrain {
             return AutomaticClutchPhase::AntiStall;
         }
         let rolling = ground_drivetrain_rpm >= rolling_rpm - AUTO_CLUTCH_LOCK_RPM_TOLERANCE;
-        let caught_up = ground_drivetrain_rpm >= target_rpm - AUTO_CLUTCH_LOCK_RPM_TOLERANCE
-            && (self.state.engine_rpm - signed_drivetrain_rpm).abs()
-                <= target_rpm * AUTO_CLUTCH_LOCK_SLIP_RPM_RATIO;
-        // A throttle increase or moving shift must not restart launch control.
-        // Only an ongoing launch waits for the higher target and small slip.
         if self.automatic_clutch_phase == AutomaticClutchPhase::Locked
-            || rolling
-                && (self.automatic_clutch_phase != AutomaticClutchPhase::Launch
-                    || drive_throttle <= TRANSMISSION_PEDAL_ENGAGE
-                    || caught_up)
+            || rolling && drive_throttle <= TRANSMISSION_PEDAL_RELEASE
         {
             return AutomaticClutchPhase::Locked;
+        }
+        if self.launch_committed {
+            // Body speed must have progressed far enough for the descending
+            // release reference. Spinning wheels alone cannot finish a launch.
+            if ground_drivetrain_rpm
+                >= self.automatic_clutch_release_rpm(ground_drivetrain_rpm)
+                    - AUTO_CLUTCH_LOCK_RPM_TOLERANCE
+                && signed_drivetrain_rpm >= rolling_rpm
+                && self.state.engine_rpm - signed_drivetrain_rpm
+                    <= rolling_rpm * AUTO_CLUTCH_LOCK_SLIP_RPM_RATIO
+            {
+                return AutomaticClutchPhase::Locked;
+            }
+            return AutomaticClutchPhase::Engaging;
+        }
+        if rolling && self.automatic_clutch_phase != AutomaticClutchPhase::Launch {
+            return AutomaticClutchPhase::Locked;
+        }
+        if drive_throttle > TRANSMISSION_PEDAL_ENGAGE && self.state.engine_rpm >= target_rpm {
+            return AutomaticClutchPhase::Engaging;
         }
         if drive_throttle > TRANSMISSION_PEDAL_ENGAGE {
             return AutomaticClutchPhase::Launch;
@@ -1286,8 +1341,13 @@ impl VehiclePowertrain {
             .min(self.config.engine.max_rpm)
             * 0.97;
         let idle = (self.config.engine.idle_rpm * AUTO_CLUTCH_LAUNCH_RPM_RATIO).min(ceiling);
-        let full =
-            (self.config.engine.max_rpm * AUTO_CLUTCH_FULL_THROTTLE_RPM_RATIO).clamp(idle, ceiling);
+        let full = (self
+            .config
+            .engine
+            .rev_limit_rpm
+            .min(self.config.engine.max_rpm)
+            * AUTO_CLUTCH_FULL_THROTTLE_RPM_RATIO)
+            .clamp(idle, ceiling);
         // effective_pedals resolves reverse controls without idle demand or the
         // automatic downshift blip, neither of which requests a launch.
         let throttle = ((self.effective_pedals().0 - TRANSMISSION_PEDAL_ENGAGE)
@@ -1296,21 +1356,42 @@ impl VehiclePowertrain {
         idle + (full - idle) * throttle
     }
 
-    fn automatic_clutch_launch_engagement(
+    fn automatic_clutch_launch_engagement(&self, drivetrain_engine_torque: Real) -> Real {
+        // A light bite transfers torque while allowing the crank to accelerate.
+        (drivetrain_engine_torque.max(0.0) * AUTO_CLUTCH_MIN_DRIVE_TORQUE_FRACTION
+            / (self.peak_torque * CLUTCH_CAPACITY_MULTIPLIER).max(Real::EPSILON))
+        .clamp(0.0, 1.0)
+    }
+
+    fn automatic_clutch_release_rpm(&self, ground_drivetrain_rpm: Real) -> Real {
+        let idle = self.config.engine.idle_rpm * AUTO_CLUTCH_LAUNCH_RPM_RATIO;
+        let launch = self.launch_reference_rpm.max(idle);
+        // Equivalent to forward speed / speed at the launch RPM in this gear.
+        // At rest retain the launch RPM; lower it only as the body accelerates.
+        let progress = (ground_drivetrain_rpm / launch).clamp(0.0, 1.0);
+        let release = progress.powf(AUTO_CLUTCH_LAUNCH_RELEASE_EXPONENT);
+        launch + (idle - launch) * release
+    }
+
+    fn automatic_clutch_engaging_target(
         &self,
-        target_rpm: Real,
+        ground_drivetrain_rpm: Real,
         drivetrain_engine_torque: Real,
     ) -> Real {
-        let torque = drivetrain_engine_torque.max(0.0);
-        let acceleration =
-            (target_rpm - self.state.engine_rpm) * TAU / 60.0 * AUTO_CLUTCH_RPM_RESPONSE;
-        let requested = torque - self.config.engine.inertia * acceleration;
-        // Reserve some drive torque while the crank accelerates. This is a
-        // capacity limit only: the shared solver retains torque direction,
-        // both inertias, external wheel loads and traction-control feedback.
-        let capacity = requested.max(torque * AUTO_CLUTCH_MIN_DRIVE_TORQUE_FRACTION);
-        (capacity / (self.peak_torque * CLUTCH_CAPACITY_MULTIPLIER).max(Real::EPSILON))
-            .clamp(0.0, 1.0)
+        let response =
+            self.config.transmission.clutch_response * AUTO_CLUTCH_LAUNCH_RESPONSE_MULTIPLIER;
+        if response <= Real::EPSILON {
+            return 1.0;
+        }
+        // Start with the torque needed to balance combustion, so zero speed
+        // never means zero drive. Body-speed progress adds load progressively;
+        // finite pedal response and RPM-rate feedback allow and damp overshoot.
+        let reserve =
+            self.state.engine_rpm - self.automatic_clutch_release_rpm(ground_drivetrain_rpm);
+        let correction = (response * reserve + self.launch_rpm_rate) * TAU / 60.0;
+        ((drivetrain_engine_torque + self.config.engine.inertia * correction)
+            / (self.peak_torque * CLUTCH_CAPACITY_MULTIPLIER).max(Real::EPSILON))
+        .clamp(0.0, 1.0)
     }
 
     fn automatic_clutch_stall_limit(
@@ -1417,7 +1498,11 @@ impl VehiclePowertrain {
             return;
         }
 
+        let shifting_from_drive = self.state.current_gear != 0;
         self.state.current_gear = self.shift_target;
+        if shifting_from_drive {
+            self.finish_launch_for_rolling_shift(wheel_radius);
+        }
         // Pedals swap only while reverse is engaged; neutral always drives on throttle.
         if self.state.current_gear >= 0 {
             self.state.reverse_direction = false;
@@ -1468,6 +1553,7 @@ impl VehiclePowertrain {
             ShiftPhase::Idle => {}
             ShiftPhase::Disengaging if self.shift_phase_timer <= Real::EPSILON => {
                 self.state.current_gear = self.shift_to;
+                self.finish_launch_for_rolling_shift(wheel_radius);
                 self.state.reverse_direction = false;
                 self.shift_phase = ShiftPhase::Blipping;
                 self.shift_phase_timer = self.config.transmission.auto_blip_duration;
@@ -1510,6 +1596,19 @@ impl VehiclePowertrain {
                 self.shift_target_allows_blip = false;
             }
             _ => {}
+        }
+    }
+
+    fn finish_launch_for_rolling_shift(&mut self, wheel_radius: Real) {
+        let road_rpm = self.state.vehicle_speed * 60.0 / (TAU * wheel_radius.max(0.01))
+            * self.current_ratio()
+            * self.config.transmission.final_drive_ratio;
+        if road_rpm >= self.config.engine.idle_rpm * AUTO_CLUTCH_LAUNCH_RPM_RATIO {
+            // A moving gear change uses normal clutch response, even when the
+            // driver shifts before the launch release has finished.
+            self.launch_committed = false;
+            self.launch_reference_rpm = 0.0;
+            self.automatic_clutch_phase = AutomaticClutchPhase::Locked;
         }
     }
 
@@ -2616,7 +2715,7 @@ mod tests {
         assert!(minimum_rpm > idle_rpm * 0.9);
         assert!(
             (powertrain.state.engine_rpm / powertrain.automatic_clutch_target_rpm() - 1.0).abs()
-                < 0.1
+                < 0.05
         );
     }
 
@@ -2736,39 +2835,44 @@ mod tests {
         let powertrain = launch_powertrain(1500.0);
 
         let target_rpm = powertrain.automatic_clutch_target_rpm();
-        assert!((target_rpm - 3750.0).abs() < 0.01);
+        assert!((target_rpm - 4440.0).abs() < 0.01);
         assert!(target_rpm > powertrain.config.engine.idle_rpm);
         assert!(AUTO_CLUTCH_ANTISTALL_ENTER_RPM_RATIO < AUTO_CLUTCH_ANTISTALL_EXIT_RPM_RATIO);
         assert!(AUTO_CLUTCH_ANTISTALL_EXIT_RPM_RATIO < AUTO_CLUTCH_LAUNCH_RPM_RATIO);
     }
 
     #[test]
-    fn launch_clutch_engagement_responds_to_rpm_error() {
-        let mut powertrain = launch_powertrain(1500.0);
-        let target_rpm = powertrain.automatic_clutch_target_rpm();
-        let drivetrain_engine_torque = powertrain.torque_at(target_rpm);
-
-        powertrain.state.engine_rpm = target_rpm - 500.0;
-        let below_target =
-            powertrain.automatic_clutch_launch_engagement(target_rpm, drivetrain_engine_torque);
-        powertrain.state.engine_rpm = target_rpm;
-        let at_target =
-            powertrain.automatic_clutch_launch_engagement(target_rpm, drivetrain_engine_torque);
-        powertrain.state.engine_rpm = target_rpm + 500.0;
-        let above_target =
-            powertrain.automatic_clutch_launch_engagement(target_rpm, drivetrain_engine_torque);
-
-        assert!(below_target < at_target);
-        assert!(at_target > 0.0 && at_target < 1.0);
-        assert!(above_target > at_target);
+    fn launch_release_is_finite_and_eases_when_the_engine_bogs() {
+        for response in [4.0, 12.0, 22.0] {
+            let mut p = launch_powertrain(1500.0);
+            p.config.transmission.clutch_response = response;
+            p.state.engine_rpm = p.automatic_clutch_target_rpm();
+            let torque = p.torque_at(p.state.engine_rpm);
+            let start = p.automatic_clutch_engagement;
+            p.launch_reference_rpm = p.state.engine_rpm;
+            let desired = p.automatic_clutch_engaging_target(0.0, torque);
+            let engagement = p.clutch_engagement(1.0 / 60.0, 1.0, 0.0, 0.0, 0.35, 1.0, 0.0, torque);
+            assert_eq!(p.automatic_clutch_phase, AutomaticClutchPhase::Engaging);
+            assert!(engagement > start && engagement < desired);
+            let expected = start + (desired - start) * (1.0 - (-response * 0.75 / 60.0).exp());
+            assert!((engagement - expected).abs() < 1.0e-5);
+            p.state.engine_rpm = p.launch_reference_rpm;
+            p.launch_rpm_rate = 0.0;
+            let steady = p.automatic_clutch_engaging_target(0.0, torque);
+            p.launch_rpm_rate = -12000.0;
+            assert!(p.automatic_clutch_engaging_target(0.0, torque) < steady);
+        }
     }
 
     #[test]
-    fn launch_target_scales_with_max_rpm_and_driver_demand_only() {
-        for (idle, max, full) in [(1000.0, 8000.0, 4000.0), (4500.0, 15000.0, 7500.0)] {
+    fn launch_trigger_scales_with_rev_limit_and_driver_demand_only() {
+        for (idle, max, limit, full) in [
+            (1000.0, 8000.0, 7900.0, 4740.0),
+            (4500.0, 15000.0, 15000.0, 9000.0),
+        ] {
             let mut powertrain = launch_powertrain(idle);
             powertrain.config.engine.max_rpm = max;
-            powertrain.config.engine.rev_limit_rpm = max;
+            powertrain.config.engine.rev_limit_rpm = limit;
             for (throttle, expected) in [
                 (0.1, idle * 1.05),
                 (0.55, (idle * 1.05 + full) * 0.5),
@@ -2795,48 +2899,64 @@ mod tests {
     }
 
     #[test]
-    fn launch_torque_regulation_tracks_changing_pedal_without_rpm_flare() {
+    fn launch_retains_drive_torque_and_rpm_until_the_body_accelerates() {
         for hz in [30, 60, 120] {
-            for (idle, max, inertia, peak) in
-                [(1000.0, 8000.0, 0.2, 600.0), (4500.0, 15000.0, 0.06, 700.0)]
-            {
+            for (idle, max, inertia, peak, response) in [
+                (1000.0, 8000.0, 0.2, 600.0, 12.0),
+                (4500.0, 15000.0, 0.06, 700.0, 22.0),
+            ] {
                 let mut config = VehicleControllerConfig::default();
                 config.engine.idle_rpm = idle;
                 config.engine.max_rpm = max;
                 config.engine.rev_limit_rpm = max;
                 config.engine.inertia = inertia;
                 config.engine.torque_curve = vec![(idle, peak)];
+                config.transmission.clutch_response = response;
                 config.transmission.automatic = false;
                 config.transmission.auto_clutch = true;
-                let mut powertrain = VehiclePowertrain::new(config);
-                powertrain.state.current_gear = 1;
-                powertrain.shift_target = 1;
-                for throttle in [1.0, 0.4, 0.8] {
-                    powertrain.set_input(VehicleInput {
+                let mut p = VehiclePowertrain::new(config);
+                p.state.current_gear = 1;
+                p.shift_target = 1;
+                p.set_input(VehicleInput {
+                    throttle: 1.0,
+                    ..Default::default()
+                });
+                let trigger = p.automatic_clutch_target_rpm();
+                let mut maximum = idle;
+                for _ in 0..hz * 2 {
+                    let output = p.update(1.0 / hz as Real, 0.0, 0.0, 0.35);
+                    maximum = maximum.max(p.state.engine_rpm);
+                    assert!(p.state.engine_running);
+                    assert!(p.state.engine_rpm > idle * 0.9);
+                    assert!(output.drive_torque > 0.0);
+                    if p.launch_committed {
+                        assert_eq!(p.automatic_clutch_phase, AutomaticClutchPhase::Engaging);
+                    }
+                }
+                assert!(maximum > trigger * 1.01, "{hz} Hz: {maximum}/{trigger}");
+                assert!(maximum < max * 0.97, "{hz} Hz: {maximum}/{max}");
+                assert!(p.state.engine_rpm > trigger * 0.85);
+                let capacity =
+                    p.automatic_clutch_engagement * p.peak_torque * CLUTCH_CAPACITY_MULTIPLIER;
+                assert!(
+                    capacity > p.torque_at(p.state.engine_rpm) * 0.8,
+                    "stationary launch must still transfer substantial torque"
+                );
+                for throttle in [0.4, 0.8, 1.0] {
+                    p.set_input(VehicleInput {
                         throttle,
                         ..Default::default()
                     });
-                    let target = powertrain.automatic_clutch_target_rpm();
-                    let start = powertrain.state.engine_rpm;
-                    for step in 0..hz * 3 {
-                        let output = powertrain.update(1.0 / hz as Real, 0.0, 0.0, 0.35);
-                        let rpm = powertrain.state.engine_rpm;
-                        assert!(powertrain.state.engine_running);
-                        assert!(output.drive_torque > 0.0);
+                    for _ in 0..hz {
+                        p.update(1.0 / hz as Real, 0.0, 0.0, 0.35);
+                        assert!(p.launch_committed);
+                        assert_ne!(p.automatic_clutch_phase, AutomaticClutchPhase::Launch);
+                        assert!(p.state.engine_running);
                         assert!(
-                            rpm <= start.max(target) + 0.01,
-                            "{hz} Hz flare {rpm}, target {target}"
+                            p.state.engine_rpm > trigger * 0.7,
+                            "{hz}Hz throttle={throttle}: {} / {trigger}",
+                            p.state.engine_rpm
                         );
-                        assert!(
-                            rpm >= start.min(target) - 0.01,
-                            "{hz} Hz drop {rpm}, target {target}"
-                        );
-                        if step > hz * 2 {
-                            assert!(
-                                (rpm - target).abs() < target * 0.005,
-                                "{hz} Hz idle {idle}: {rpm}/{target}"
-                            );
-                        }
                     }
                 }
             }
@@ -2873,6 +2993,47 @@ mod tests {
                     assert!((a.drive_torque - b.drive_torque).abs() < 0.01);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn shifting_during_launch_restores_normal_clutch_response() {
+        for blip in [false, true] {
+            let mut p = manual_auto_clutch_powertrain();
+            p.config.transmission.shift_cooldown = 0.0;
+            p.state.current_gear = if blip { 2 } else { 1 };
+            p.shift_target = p.state.current_gear;
+            p.launch_committed = true;
+            p.launch_reference_rpm = 4000.0;
+            p.automatic_clutch_phase = AutomaticClutchPhase::Engaging;
+            p.automatic_clutch_engagement = 0.4;
+            p.state.engine_rpm = 1800.0;
+            p.state.vehicle_speed = wheel_speed_for_gear_crank_rpm(&p, 2, 2000.0, 0.35);
+            if blip {
+                p.shift_to = 1;
+                p.shift_phase = ShiftPhase::Disengaging;
+                p.shift_phase_timer = 0.0;
+                p.update_shift_sequence(1.0 / 60.0, p.state.vehicle_speed, 0.35);
+                p.shift_phase = ShiftPhase::Idle;
+            } else {
+                p.shift_target = 2;
+                p.update_transmission(p.state.vehicle_speed, p.state.vehicle_speed, 0.35);
+            }
+            assert!(!p.launch_committed);
+            assert_eq!(p.automatic_clutch_phase, AutomaticClutchPhase::Locked);
+            let engagement = p.clutch_engagement(
+                1.0 / 60.0,
+                p.current_ratio(),
+                p.state.vehicle_speed,
+                p.state.engine_rpm,
+                0.35,
+                1.0,
+                0.0,
+                p.peak_torque,
+            );
+            let expected =
+                0.4 + 0.6 * (1.0 - (-p.config.transmission.clutch_response / 60.0).exp());
+            assert!((engagement - expected).abs() < 1.0e-5);
         }
     }
 
@@ -2957,45 +3118,116 @@ mod tests {
     }
 
     #[test]
-    fn driven_wheel_spin_cannot_finish_launch_before_ground_speed_reaches_target_rpm() {
-        let idle_rpm = 2000.0;
-        let wheel_radius = 0.35;
-        let mut powertrain = launch_powertrain(idle_rpm);
-        let target_rpm = powertrain.automatic_clutch_target_rpm();
-        powertrain.state.engine_rpm = target_rpm;
-        let spinning_wheel_speed =
-            wheel_speed_for_crank_rpm(&powertrain, target_rpm * 2.0, wheel_radius);
+    fn launch_finishes_on_shaft_synchronization_below_the_trigger() {
+        let mut p = launch_powertrain(1500.0);
+        p.state.engine_rpm = p.automatic_clutch_target_rpm();
+        p.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+        assert!(p.launch_committed);
+        let sync_rpm = p.launch_reference_rpm * 0.9;
+        p.state.engine_rpm = sync_rpm;
+        p.launch_rpm_rate = 0.0;
+        let speed = wheel_speed_for_crank_rpm(&p, sync_rpm, 0.35);
+        p.update(1.0 / 60.0, speed, 0.0, 0.35);
+        assert_eq!(p.automatic_clutch_phase, AutomaticClutchPhase::Engaging);
+        p.state.engine_rpm = sync_rpm;
+        p.update(1.0 / 60.0, speed, speed, 0.35);
+        assert_eq!(p.automatic_clutch_phase, AutomaticClutchPhase::Locked);
+        assert!(p.state.engine_rpm < p.automatic_clutch_target_rpm());
+        assert!(p.automatic_clutch_engagement < 1.0);
+    }
 
-        powertrain.update(1.0 / 60.0, 0.0, spinning_wheel_speed, wheel_radius);
-        assert_eq!(
-            powertrain.automatic_clutch_phase,
-            AutomaticClutchPhase::Launch
+    #[test]
+    fn launch_release_follows_body_speed_and_ignores_wheelspin() {
+        let mut p = launch_powertrain(1500.0);
+        p.launch_committed = true;
+        p.launch_reference_rpm = p.automatic_clutch_target_rpm();
+        p.automatic_clutch_phase = AutomaticClutchPhase::Engaging;
+        p.state.engine_rpm = p.launch_reference_rpm;
+        p.launch_rpm_rate = 0.0;
+        let torque = p.torque_at(p.state.engine_rpm);
+        let mut previous_reference = p.launch_reference_rpm;
+        let mut previous_drop = 0.0;
+        for progress in [0.25, 0.5, 0.75, 1.0] {
+            let reference = p.automatic_clutch_release_rpm(p.launch_reference_rpm * progress);
+            let drop = previous_reference - reference;
+            assert!(
+                drop >= previous_drop - 0.001,
+                "equal speed increments must not slow the release progression"
+            );
+            previous_reference = reference;
+            previous_drop = drop;
+        }
+        assert!(
+            (previous_reference - p.config.engine.idle_rpm * AUTO_CLUTCH_LAUNCH_RPM_RATIO).abs()
+                < 0.001
         );
+        let mut previous_rpm = p.launch_reference_rpm + 1.0;
+        let mut previous_engagement = 0.0;
+        for progress in [0.0, 0.1, 0.25, 0.5] {
+            let road_rpm = p.launch_reference_rpm * progress;
+            let rpm = p.automatic_clutch_release_rpm(road_rpm);
+            let engagement = p.automatic_clutch_engaging_target(road_rpm, torque);
+            assert!(rpm < previous_rpm);
+            assert!(engagement >= previous_engagement);
+            previous_rpm = rpm;
+            previous_engagement = engagement;
+        }
+        assert_eq!(
+            p.next_automatic_clutch_phase(
+                p.state.engine_rpm,
+                0.0,
+                p.launch_reference_rpm,
+                1.0,
+                0.0
+            ),
+            AutomaticClutchPhase::Engaging
+        );
+        assert_eq!(
+            p.next_automatic_clutch_phase(
+                p.state.engine_rpm * 1.5,
+                0.0,
+                p.launch_reference_rpm,
+                1.0,
+                0.0
+            ),
+            AutomaticClutchPhase::Engaging
+        );
+        p.update(0.0, 0.0, 0.0, 0.35);
+        assert!(p.launch_rpm_rate.is_finite());
+        assert!(p.state.engine_rpm.is_finite());
+    }
 
-        let target_ground_speed = wheel_speed_for_crank_rpm(&powertrain, target_rpm, wheel_radius);
-        powertrain.update(
-            1.0 / 60.0,
-            target_ground_speed,
-            spinning_wheel_speed,
-            wheel_radius,
-        );
-        assert_eq!(
-            powertrain.automatic_clutch_phase,
-            AutomaticClutchPhase::Launch
-        );
-        // Ground speed alone cannot command full engagement with large slip.
-        powertrain.state.engine_rpm = target_rpm;
-        powertrain.update(
-            1.0 / 60.0,
-            target_ground_speed,
-            target_ground_speed,
-            wheel_radius,
-        );
-        assert_eq!(
-            powertrain.automatic_clutch_phase,
-            AutomaticClutchPhase::Locked
-        );
-        assert!(powertrain.automatic_clutch_engagement < 1.0);
+    #[test]
+    fn launch_accepts_shaft_speed_crossing_between_ticks() {
+        let mut p = launch_powertrain(1500.0);
+        p.launch_committed = true;
+        p.launch_reference_rpm = p.automatic_clutch_target_rpm();
+        p.automatic_clutch_phase = AutomaticClutchPhase::Engaging;
+        p.state.engine_rpm = 3000.0;
+        let speed = wheel_speed_for_crank_rpm(&p, 3200.0, 0.35);
+        p.update(1.0 / 30.0, speed, speed, 0.35);
+        assert_eq!(p.automatic_clutch_phase, AutomaticClutchPhase::Locked);
+    }
+
+    #[test]
+    fn launch_latch_clears_on_lift_at_stop_neutral_and_reset() {
+        for cancel in 0..3 {
+            let mut p = launch_powertrain(1500.0);
+            p.state.engine_rpm = p.automatic_clutch_target_rpm();
+            p.update(1.0 / 60.0, 0.0, 0.0, 0.35);
+            assert!(p.launch_committed);
+            match cancel {
+                0 => {
+                    p.set_input(VehicleInput::default());
+                    p.clutch_engagement(1.0 / 60.0, 1.0, 0.0, 0.0, 0.35, 0.0, 0.0, 0.0);
+                }
+                1 => {
+                    p.clutch_engagement(1.0 / 60.0, 0.0, 0.0, 0.0, 0.35, 1.0, 0.0, 0.0);
+                }
+                _ => p.reset(),
+            }
+            assert!(!p.launch_committed);
+        }
     }
 
     fn simulate_automatic_launch(
@@ -3047,7 +3279,12 @@ mod tests {
             final_clutch_engagement = powertrain.automatic_clutch_engagement;
             let rpm = powertrain.state().engine_rpm;
             target_reached |= rpm >= target_rpm * 0.95;
-            if target_reached && powertrain.automatic_clutch_phase == AutomaticClutchPhase::Launch {
+            if target_reached
+                && matches!(
+                    powertrain.automatic_clutch_phase,
+                    AutomaticClutchPhase::Launch | AutomaticClutchPhase::Engaging
+                )
+            {
                 minimum_launch_rpm = minimum_launch_rpm.min(rpm);
                 maximum_launch_rpm = maximum_launch_rpm.max(rpm);
             }
@@ -3067,26 +3304,16 @@ mod tests {
     #[test]
     fn automatic_launch_handles_high_idle_reverse_and_partial_throttle() {
         let cases = [
-            (2000.0, 1.0, 1.0, 1.0, 0.8, 1.2),
-            (1500.0, -1.0, 1.0, 1.0, 0.8, 1.2),
-            (
-                1500.0,
-                1.0,
-                0.35,
-                0.5,
-                STALL_RPM_RATIO / AUTO_CLUTCH_LAUNCH_RPM_RATIO,
-                1.25,
-            ),
+            (2000.0, 1.0, 1.0, 1.0, 1.2),
+            (1500.0, -1.0, 1.0, 1.0, 1.2),
+            (1500.0, 1.0, 0.35, 0.5, 1.25),
         ];
 
-        for (idle_rpm, direction, throttle, minimum_speed, minimum_rpm, maximum_rpm) in cases {
+        for (idle_rpm, direction, throttle, minimum_speed, maximum_rpm) in cases {
             let result = simulate_automatic_launch(1.0 / 60.0, idle_rpm, direction, throttle);
             assert!(result.engine_running);
             assert!(result.target_rpm > idle_rpm * AUTO_CLUTCH_LAUNCH_RPM_RATIO);
-            assert!(
-                result.minimum_launch_rpm > result.target_rpm * minimum_rpm,
-                "{result:?}"
-            );
+            assert!(result.minimum_launch_rpm > idle_rpm * 0.9, "{result:?}");
             assert!(
                 result.maximum_launch_rpm < result.target_rpm * maximum_rpm,
                 "{result:?}"
@@ -3606,10 +3833,7 @@ mod tests {
                 let target = if opening {
                     0.0
                 } else {
-                    powertrain.automatic_clutch_launch_engagement(
-                        powertrain.automatic_clutch_target_rpm(),
-                        torque,
-                    )
+                    powertrain.automatic_clutch_launch_engagement(torque)
                 };
                 assert!(opening || target > 0.0);
                 let engagement = powertrain.clutch_engagement(
@@ -3885,7 +4109,7 @@ mod tests {
         assert!(minimum_rpm > idle_rpm * 0.9);
         assert!(
             (powertrain.state.engine_rpm / powertrain.automatic_clutch_target_rpm() - 1.0).abs()
-                < 0.1
+                < 0.05
         );
     }
 
