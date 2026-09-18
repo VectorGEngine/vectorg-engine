@@ -19,6 +19,20 @@ struct Scene {
 
 impl Scene {
     fn new(hz: u32, iterations: usize, slope: f32, heading: f32) -> Self {
+        let mut config = VehicleControllerConfig::default();
+        config.transmission.automatic = false;
+        config.transmission.auto_reverse = false;
+        config.dynamics.esc_strength = 0.0;
+        Self::with_config(hz, iterations, slope, heading, config)
+    }
+
+    fn with_config(
+        hz: u32,
+        iterations: usize,
+        slope: f32,
+        heading: f32,
+        config: VehicleControllerConfig,
+    ) -> Self {
         let tilt = Rotation::new(Vector::x() * slope.to_radians());
         let rotation = tilt * Rotation::new(Vector::y() * heading.to_radians());
         let normal = tilt * Vector::y();
@@ -41,10 +55,6 @@ impl Scene {
             &mut bodies,
         );
         bodies[chassis].recompute_mass_properties_from_colliders(&colliders);
-        let mut config = VehicleControllerConfig::default();
-        config.transmission.automatic = false;
-        config.transmission.auto_reverse = false;
-        config.dynamics.esc_strength = 0.0;
         let mut vehicle = DynamicRayCastVehicleController::new(chassis, config);
         vehicle.index_forward_axis = 2;
         vehicle.set_input(VehicleInput {
@@ -132,6 +142,154 @@ impl Scene {
     }
     fn tangent(&self, v: Vector<f32>) -> Vector<f32> {
         v - self.normal * v.dot(&self.normal)
+    }
+}
+
+#[test]
+fn autoclutch_launch_balances_rpm_and_then_couples_through_the_vehicle_pipeline() {
+    for hz in [30, 60, 120] {
+        for (idle, max, inertia, peak) in
+            [(1000.0, 8000.0, 0.2, 600.0), (4500.0, 15000.0, 0.06, 700.0)]
+        {
+            for (direction, slope, throttle) in
+                [(1, 0.0, 1.0), (-1, 0.0, 0.5), (1, -8.0, 1.0), (1, 8.0, 1.0)]
+            {
+                let mut config = VehicleControllerConfig::default();
+                config.engine.idle_rpm = idle;
+                config.engine.max_rpm = max;
+                config.engine.rev_limit_rpm = max;
+                config.engine.inertia = inertia;
+                config.engine.friction_torque = Some(70.0);
+                config.engine.torque_curve = vec![(idle, peak), (max, peak * 0.8)];
+                config.transmission.automatic = false;
+                config.transmission.auto_clutch = true;
+                config.transmission.auto_reverse = false;
+                config.transmission.clutch_response = 12.0;
+                config.transmission.shift_cooldown = 0.0;
+                config.transmission.forward_ratios = vec![3.5];
+                config.transmission.reverse_ratio = -3.5;
+                config.transmission.final_drive_ratio = 4.0;
+                config.dynamics.esc_strength = 0.0;
+                let mut scene = Scene::with_config(hz, 4, slope, 0.0, config);
+                // Isolate the driveline from wheelies in this simple box-body
+                // fixture, which has neither an F1 chassis nor its downforce.
+                scene.bodies[scene.vehicle.chassis].lock_rotations(true, true);
+                for wheel in scene.vehicle.wheels_mut() {
+                    // Enough grip to exercise clutch regulation independently
+                    // of wheelspin; TC/low-grip cases are covered separately.
+                    wheel.friction_slip = 4.0;
+                }
+                for _ in 0..hz {
+                    scene.tick();
+                }
+                scene.vehicle.set_gear(direction);
+                scene.tick();
+                scene.vehicle.set_input(VehicleInput {
+                    throttle,
+                    ..Default::default()
+                });
+                let target = idle * 1.05 + (max * 0.5 - idle * 1.05) * ((throttle - 0.1) / 0.9);
+                let mut reached = false;
+                let mut held_ticks = 0;
+                let mut coupled = false;
+                for step in 0..hz * 8 {
+                    scene.tick();
+                    let state = scene.vehicle.state();
+                    let road_rpm = state.vehicle_speed * direction as f32
+                        / (std::f32::consts::TAU * 0.35)
+                        * 14.0;
+                    let road_rpm = road_rpm * 60.0;
+                    let wheel_rpm =
+                        state.driven_wheel_speed / (std::f32::consts::TAU * 0.35) * 14.0 * 60.0;
+                    assert!(
+                        state.engine_running,
+                        "{hz} Hz idle {idle} slope {slope} step {step}"
+                    );
+                    // Once spinning wheels overtake the target, engine speed
+                    // must follow their mechanical reaction rather than being
+                    // artificially held at the launch setpoint.
+                    if road_rpm < target * 0.9 && wheel_rpm < target * 0.95 {
+                        reached |= state.engine_rpm >= target * 0.95;
+                        if reached {
+                            assert!(state.engine_rpm > target * 0.9 && state.engine_rpm < target * 1.05,
+                                "{hz} Hz idle {idle} direction {direction} slope {slope}: RPM {} target {target} road {road_rpm}", state.engine_rpm);
+                            held_ticks += 1;
+                        }
+                    }
+                    if road_rpm > target * 1.1
+                        && (state.engine_rpm - road_rpm).abs() < target * 0.08
+                    {
+                        coupled = true;
+                    }
+                }
+                eprintln!("launch {hz}Hz idle={idle} dir={direction} slope={slope} throttle={throttle}: held={held_ticks} coupled={coupled} speed={}", scene.vehicle.state().vehicle_speed);
+                assert!(
+                    reached && held_ticks > 0,
+                    "launch must regulate before coupling"
+                );
+                assert!(coupled, "launch must finish coupling");
+                assert!(scene.vehicle.state().vehicle_speed * direction as f32 > 5.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn autoclutch_low_grip_launch_and_braking_preserve_traction_control() {
+    for hz in [30, 60, 120] {
+        for tc in [0.0, 1.0] {
+            let mut config = VehicleControllerConfig::default();
+            config.engine.idle_rpm = 4500.0;
+            config.engine.max_rpm = 15000.0;
+            config.engine.rev_limit_rpm = 15000.0;
+            config.engine.inertia = 0.06;
+            config.engine.friction_torque = Some(70.0);
+            config.engine.torque_curve = vec![(4500.0, 650.0), (15000.0, 550.0)];
+            config.transmission.automatic = false;
+            config.transmission.auto_clutch = true;
+            config.transmission.auto_reverse = false;
+            config.transmission.forward_ratios = vec![3.5];
+            config.transmission.final_drive_ratio = 4.0;
+            config.dynamics.traction_control_strength = tc;
+            config.dynamics.esc_strength = 0.0;
+            let mut scene = Scene::with_config(hz, 4, 0.0, 0.0, config);
+            scene.bodies[scene.vehicle.chassis].lock_rotations(true, true);
+            for wheel in scene.vehicle.wheels_mut() {
+                wheel.friction_slip = 0.6;
+                wheel.traction_control = tc;
+            }
+            for _ in 0..hz {
+                scene.tick();
+            }
+            scene.vehicle.set_gear(1);
+            scene.tick();
+            scene.vehicle.set_input(VehicleInput {
+                throttle: 1.0,
+                ..Default::default()
+            });
+            let mut peak_tc: f32 = 0.0;
+            for _ in 0..hz * 5 {
+                scene.tick();
+                let state = scene.vehicle.state();
+                assert!(state.engine_running && state.engine_rpm <= 15000.0);
+                peak_tc = peak_tc.max(state.traction_control_activity);
+            }
+            assert!(
+                scene.vehicle.state().vehicle_speed > 2.0,
+                "{hz} Hz TC {tc}: car must move"
+            );
+            assert_eq!(peak_tc > 0.0, tc > 0.0);
+            scene.vehicle.set_input(VehicleInput {
+                brake: 1.0,
+                ..Default::default()
+            });
+            for _ in 0..hz * 5 {
+                scene.tick();
+                assert!(scene.vehicle.state().engine_running);
+            }
+            assert!(scene.vehicle.state().vehicle_speed.abs() < 0.1);
+            assert!((scene.vehicle.state().engine_rpm - 4500.0).abs() < 45.0);
+        }
     }
 }
 
