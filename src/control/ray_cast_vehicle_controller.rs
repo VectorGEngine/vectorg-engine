@@ -2445,26 +2445,58 @@ impl VehicleContactSolver {
         }
     }
 
+    // A clutch below its capacity holds its wheels together. The solver's clutch
+    // residual is a surface speed, so compare the wheels' speed difference as
+    // |d_omega| * radius; an angular comparison rejects converged near-rigid
+    // clutches at high lock.
+    fn clutch_holding(&self, axle: &AxleClutch) -> bool {
+        let radius = self.contacts[axle.a]
+            .base
+            .radius
+            .max(self.contacts[axle.b].base.radius);
+        axle.lock == 1.0
+            || (axle.impulse.abs() < axle.limit * 0.9999
+                && (self.omega(axle.a) - self.omega(axle.b)).abs() * radius
+                    <= CONTACT_SOLVER_TOLERANCE)
+    }
+
     // A rigid axle cannot roll independently at two different road speeds. Use
     // the load-weighted rolling speed of the axle for longitudinal assistance;
     // actual per-tire slip still controls friction and skid reporting.
-    fn assist_reference(&self, i: usize, speed: Real) -> Real {
+    //
+    // TC passes its drive direction. A coupled pair spins only once its
+    // least-slipping wheel does, so TC's target is the fastest road speed in the
+    // pair; scrub the coupling forces onto the other wheel is not wheelspin.
+    fn assist_reference(&self, i: usize, speed: Real, drive_direction: Option<Real>) -> Real {
         for axle in &self.axles {
-            let sticking = axle.lock == 1.0
-                || (axle.impulse.abs() < axle.limit * 0.9999
-                    && (self.omega(axle.a) - self.omega(axle.b)).abs() < CONTACT_SOLVER_TOLERANCE);
+            let sticking = if drive_direction.is_some() {
+                self.clutch_holding(axle)
+            } else {
+                axle.lock == 1.0
+                    || (axle.impulse.abs() < axle.limit * 0.9999
+                        && (self.omega(axle.a) - self.omega(axle.b)).abs()
+                            < CONTACT_SOLVER_TOLERANCE)
+            };
             if axle.a == i || axle.b == i {
                 let mut numerator = 0.0;
                 let mut denominator = 0.0;
+                let mut fastest: Option<Real> = None;
                 for j in [axle.a, axle.b] {
                     let c = self.contacts[j].base;
                     let own = multiply(c.response, self.impulses[j]);
                     let road = self.speed_without_self(j)[0] + own[0];
                     numerator += c.grip_impulse * c.radius * road;
                     denominator += c.grip_impulse * c.radius * c.radius;
+                    if let Some(direction) = drive_direction.filter(|_| c.grip_impulse > 0.0) {
+                        let omega = road / c.radius * direction;
+                        fastest = Some(fastest.map_or(omega, |f: Real| f.max(omega)));
+                    }
                 }
                 if denominator > 0.0 {
-                    let rolling = numerator / denominator * self.contacts[i].base.radius;
+                    let rolling = match (drive_direction, fastest) {
+                        (Some(direction), Some(omega)) => omega * direction,
+                        _ => numerator / denominator,
+                    } * self.contacts[i].base.radius;
                     if sticking {
                         return rolling;
                     }
@@ -2502,8 +2534,17 @@ impl VehicleContactSolver {
         speed
     }
 
+    fn traction_reference_for(&self, i: usize, speed: Real, direction: Real) -> Real {
+        let reference = self.assist_reference(i, speed, Some(direction));
+        if (reference - speed) * direction > 0.0 {
+            reference
+        } else {
+            speed
+        }
+    }
+
     fn assist_reference_for(&self, i: usize, speed: Real, direction: Real) -> Real {
-        let reference = self.assist_reference(i, speed);
+        let reference = self.assist_reference(i, speed, None);
         if (reference - speed) * direction > 0.0 {
             reference
         } else {
@@ -2533,7 +2574,7 @@ impl VehicleContactSolver {
             traction_control_torque_fraction(prepared.tc, |drive| {
                 let result = solve(drive, brake).0;
                 (result.omega * prepared.base.radius
-                    - self.assist_reference_for(i, result.speed[0], prepared.drive_direction))
+                    - self.traction_reference_for(i, result.speed[0], prepared.drive_direction))
                     * prepared.drive_direction
             })
         };
@@ -2558,14 +2599,31 @@ impl VehicleContactSolver {
 
     fn select_actuations(&mut self) {
         self.next_actuations.clear();
-        let mut drive: Real = 1.0;
         for i in 0..self.contacts.len() {
             let actuation = self.select_actuation(i);
-            drive = drive.min(actuation.drive);
             self.next_actuations.push(actuation);
         }
         // There is one engine torque source. Individual tire targets choose the
         // limiting cut, without turning an open differential into torque vectoring.
+        // Wheels held together turn as one, so extra torque reaches whichever
+        // tire still has grip. A saturated tire's own preview freezes its
+        // partner's force; the pair's least-limited TC wheel decides for it.
+        let mut drive: Real = 1.0;
+        for i in 0..self.contacts.len() {
+            let mut limit = self.next_actuations[i].drive;
+            if self.contacts[i].tc > 0.0 {
+                let partner = self
+                    .axles
+                    .iter()
+                    .find(|axle| (axle.a == i || axle.b == i) && self.clutch_holding(axle))
+                    .map(|axle| if axle.a == i { axle.b } else { axle.a })
+                    .filter(|&j| self.contacts[j].tc > 0.0);
+                if let Some(j) = partner {
+                    limit = limit.max(self.next_actuations[j].drive);
+                }
+            }
+            drive = drive.min(limit);
+        }
         for i in 0..self.contacts.len() {
             let mut actuation = self.next_actuations[i];
             actuation.drive = drive;

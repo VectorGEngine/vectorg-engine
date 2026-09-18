@@ -615,3 +615,74 @@ fn powertrain_accelerates_and_service_brakes_stop_across_substep_counts() {
             .all(|w| w.delta_rotation == 0.0));
     }
 }
+
+fn full_tc_launch_speed(hz: u32, lock: f32, steering: f32, awd: bool) -> f32 {
+    let mut config = VehicleControllerConfig::default();
+    config.engine.idle_rpm = 1000.0;
+    config.engine.max_rpm = 7000.0;
+    config.engine.rev_limit_rpm = 7000.0;
+    config.engine.torque_curve = vec![(1000.0, 400.0), (7000.0, 350.0)];
+    config.transmission.automatic = false;
+    config.transmission.auto_clutch = true;
+    config.transmission.auto_reverse = false;
+    config.transmission.forward_ratios = vec![3.5];
+    config.transmission.final_drive_ratio = 4.0;
+    config.dynamics.traction_control_strength = 1.0;
+    config.dynamics.esc_strength = 0.0;
+    config.differential = VehicleDifferentialConfig {
+        front_accel_lock: lock,
+        front_decel_lock: lock,
+        rear_accel_lock: lock,
+        rear_decel_lock: lock,
+        center_balance: 0.5,
+    };
+    let mut scene = Scene::with_config(hz, 4, 0.0, 0.0, config);
+    for wheel in scene.vehicle.wheels_mut() {
+        let front = wheel.role.axle == WheelAxle::Front;
+        wheel.role = WheelRole::new(wheel.role.axle, awd || front, front);
+    }
+    for _ in 0..hz {
+        scene.tick();
+    }
+    scene.vehicle.set_gear(1);
+    scene.tick();
+    scene.vehicle.set_input(VehicleInput {
+        throttle: 1.0,
+        steering,
+        ..Default::default()
+    });
+    for _ in 0..hz * 3 {
+        scene.tick();
+    }
+    scene
+        .tangent(*scene.bodies[scene.vehicle.chassis].linvel())
+        .norm()
+}
+
+#[test]
+fn full_tc_launches_at_full_steering_lock_for_every_differential_lock() {
+    // A coupled axle cannot roll through a tight turn. Scrub forced onto the
+    // inner wheel is not wheelspin, so no lock may stall a full-TC launch.
+    // Straight-line launches must not depend on the lock.
+    for hz in [30, 60, 120] {
+        for awd in [false, true] {
+            for steering in [1.0, 0.0] {
+                let open = full_tc_launch_speed(hz, 0.0, steering, awd);
+                for lock in [0.25, 0.5, 0.75, 0.9, 0.99, 0.999, 1.0] {
+                    let speed = full_tc_launch_speed(hz, lock, steering, awd);
+                    if steering == 0.0 {
+                        assert!(
+                            (speed - open).abs() < 0.01,
+                            "{hz} Hz awd={awd} lock={lock}: straight {speed} != open {open}"
+                        );
+                    } else {
+                        assert!(
+                            speed > open * 0.85,
+                            "{hz} Hz awd={awd} lock={lock}: full-lock launch {speed} vs open {open}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
