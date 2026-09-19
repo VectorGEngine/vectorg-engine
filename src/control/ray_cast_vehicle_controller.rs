@@ -488,7 +488,7 @@ impl Default for WheelContactState {
             ground_object: None,
             forward_dir: Vector::zeros(),
             forward_speed: 0.0,
-            friction: TireFriction::new(0.0, 0.0),
+            friction: TireFriction::new(0.0, 0.0, 1.0, 1.0),
             kinetic_grip: 1.0,
             peak_friction_limit: 0.0,
         }
@@ -738,7 +738,7 @@ impl DynamicRayCastVehicleController {
         // Create default tire types
         tire_types.insert(
             "default".to_string(),
-            TireType::new("default", TireFriction::new(1.0, 0.85)),
+            TireType::new("default", TireFriction::new(1.0, 0.85, 1.0, 1.0)),
         );
 
         Self {
@@ -864,10 +864,20 @@ impl DynamicRayCastVehicleController {
     }
 
     /// Adds a new tire type to the controller
-    pub fn add_tire_type(&mut self, tire_type: &str, peak: Real, sliding: Real) {
+    pub fn add_tire_type(
+        &mut self,
+        tire_type: &str,
+        peak: Real,
+        sliding: Real,
+        longitudinal: Real,
+        lateral: Real,
+    ) {
         self.tire_types.insert(
             tire_type.to_string(),
-            TireType::new(tire_type, TireFriction::new(peak, sliding)),
+            TireType::new(
+                tire_type,
+                TireFriction::new(peak, sliding, longitudinal, lateral),
+            ),
         );
     }
 
@@ -1012,9 +1022,14 @@ impl DynamicRayCastVehicleController {
         surface_name: &str,
         peak: Real,
         sliding: Real,
+        longitudinal: Real,
+        lateral: Real,
     ) {
         if let Some(tire_type) = self.tire_types.get_mut(tire_type_name) {
-            tire_type.add_surface(surface_name, TireFriction::new(peak, sliding));
+            tire_type.add_surface(
+                surface_name,
+                TireFriction::new(peak, sliding, longitudinal, lateral),
+            );
         }
     }
 
@@ -2023,7 +2038,9 @@ impl DynamicRayCastVehicleController {
             let tire = self.tire_types.get(&wheel.tire_type);
             let friction = tire
                 .map(|t| t.get_friction(&wheel.ground_type))
-                .unwrap_or_else(|| TireFriction::new(wheel.friction_slip, wheel.friction_slip));
+                .unwrap_or_else(|| {
+                    TireFriction::new(wheel.friction_slip, wheel.friction_slip, 1.0, 1.0)
+                });
             wheel.ground_friction = friction.peak;
             let kinetic_grip = friction.multiplier(
                 wheel.angular_velocity * wheel.radius - wheel.contact_forward_speed,
@@ -2149,6 +2166,7 @@ impl DynamicRayCastVehicleController {
                     radius,
                     inertia,
                     grip_impulse: contact.peak_friction_limit,
+                    shape: [contact.friction.longitudinal, contact.friction.lateral],
                     brake_budget: requested_brake_impulse * radius,
                 },
                 drive_delta: raw_drive_angular_impulse / inertia,
@@ -2743,8 +2761,8 @@ impl VehicleContactSolver {
                     let c = self.contacts[j].base;
                     let own = multiply(c.response, self.impulses[j]);
                     let road = self.speed_without_self(j)[0] + own[0];
-                    numerator += c.grip_impulse * c.radius * road;
-                    denominator += c.grip_impulse * c.radius * c.radius;
+                    numerator += c.grip_impulse * c.shape[0] * c.radius * road;
+                    denominator += c.grip_impulse * c.shape[0] * c.radius * c.radius;
                     if let Some(direction) = drive_direction.filter(|_| c.grip_impulse > 0.0) {
                         let omega = road / c.radius * direction;
                         fastest = Some(fastest.map_or(omega, |f: Real| f.max(omega)));
@@ -2770,16 +2788,20 @@ impl VehicleContactSolver {
                         let c = self.contacts[i].base;
                         let grip = c.grip_impulse * self.actuations[i].grip;
                         let longitudinal = axle.impulse.abs() / c.radius;
-                        // At sustained lateral slip the friction disk must also
-                        // supply the clutch's longitudinal reaction. Its force
-                        // direction implies this unavoidable longitudinal slip.
+                        // At sustained lateral slip the friction envelope must
+                        // also supply the clutch's longitudinal reaction. Its
+                        // force direction implies this unavoidable longitudinal
+                        // slip; the lateral force left on the envelope is
+                        // fy / fx * sqrt(fx^2 - longitudinal^2).
                         let side = self.speed_without_self(i)[1]
                             + multiply(c.response, self.impulses[i])[1];
-                        let steady = if longitudinal < grip {
+                        let [fx, fy] = [grip * c.shape[0], grip * c.shape[1]];
+                        let steady = if longitudinal < fx {
                             side.abs() * longitudinal
-                                / (grip * grip - longitudinal * longitudinal)
+                                / (fx * fx - longitudinal * longitudinal)
                                     .sqrt()
                                     .max(Real::EPSILON)
+                                * (fx / fy)
                         } else {
                             geometric.abs()
                         };
@@ -3277,7 +3299,7 @@ impl VehicleContactSolver {
             // A changed envelope must remain feasible throughout its solve.
             for i in 0..count {
                 let limit = self.contacts[i].base.grip_impulse * self.actuations[i].grip;
-                let length = self.impulses[i][0].hypot(self.impulses[i][1]);
+                let length = envelope_norm(self.impulses[i], self.contacts[i].base.shape);
                 if length > limit {
                     self.impulses[i]
                         .iter_mut()
@@ -3349,6 +3371,8 @@ struct CoupledContact {
     pub inertia: Real,
     /// Impulse budget including suspension load, timestep and current grip envelope.
     pub grip_impulse: Real,
+    /// Longitudinal and lateral envelope axes as multipliers of grip_impulse.
+    pub shape: [Real; 2],
     pub brake_budget: Real,
 }
 
@@ -3417,13 +3441,59 @@ fn friction_disk(a: [[Real; 2]; 2], rhs: [Real; 2], limit: Real) -> [Real; 2] {
     shifted_solve(a, rhs, upper)
 }
 
+/// The friction disk generalized to an ellipse with axes limit * shape. The
+/// same shifted solve keeps the resulting slip opposite the impulse, so a
+/// locked wheel is not redirected by steering; only the boundary test changes.
+/// Equal axes take the circular solve unchanged.
+fn friction_ellipse(a: [[Real; 2]; 2], rhs: [Real; 2], limit: Real, shape: [Real; 2]) -> [Real; 2] {
+    if shape[0] == shape[1] {
+        return friction_disk(a, rhs, limit * shape[0]);
+    }
+    if limit <= 0.0 || rhs == [0.0; 2] {
+        return [0.0; 2];
+    }
+    let axes = [limit * shape[0], limit * shape[1]];
+    let norm = |j: [Real; 2]| (j[0] / axes[0]).hypot(j[1] / axes[1]);
+    let free = shifted_solve(a, rhs, 0.0);
+    if norm(free) <= 1.0 {
+        return free;
+    }
+    if a[0][1] == 0.0 && a[1][0] == 0.0 && a[0][0] == a[1][1] {
+        let scale = 1.0 / norm(rhs);
+        return [rhs[0] * scale, rhs[1] * scale];
+    }
+    let mut lower = 0.0;
+    // Inside the disk inscribed by the smaller axis, hence inside the ellipse.
+    let mut upper = rhs[0].hypot(rhs[1]) / axes[0].min(axes[1]);
+    for _ in 0..32 {
+        let shift = (lower + upper) * 0.5;
+        if shift == lower || shift == upper {
+            break;
+        }
+        if norm(shifted_solve(a, rhs, shift)) > 1.0 {
+            lower = shift;
+        } else {
+            upper = shift;
+        }
+    }
+    shifted_solve(a, rhs, upper)
+}
+
+/// Impulse length relative to the envelope axes; one on the boundary.
+fn envelope_norm(impulse: [Real; 2], shape: [Real; 2]) -> Real {
+    (impulse[0] / shape[0]).hypot(impulse[1] / shape[1])
+}
+
 impl CoupledContact {
     fn skid_info(self, solution: CoupledContactSolution) -> Real {
         if self.grip_impulse <= 0.0 {
             return 0.0;
         }
         let required = solution.requested_tangent;
-        let demand = required[0].hypot(required[1] * SKID_LATERAL_DEMAND_WEIGHT);
+        let demand = envelope_norm(
+            [required[0], required[1] * SKID_LATERAL_DEMAND_WEIGHT],
+            self.shape,
+        );
         if demand == 0.0 {
             1.0
         } else {
@@ -3461,14 +3531,14 @@ impl CoupledContact {
             response[0][0] += self.radius * self.radius / self.inertia;
             let rhs = [self.omega * self.radius - self.speed[0], -self.speed[1]];
             return self.finish(
-                friction_disk(response, rhs, self.grip_impulse),
+                friction_ellipse(response, rhs, self.grip_impulse, self.shape),
                 0.0,
                 response,
                 rhs,
             );
         }
         let brake = if self.inertia * self.omega.abs()
-            > self.brake_budget + self.radius * self.grip_impulse
+            > self.brake_budget + self.radius * (self.grip_impulse * self.shape[0])
         {
             // Even the full tire and brake impulses cannot stop this wheel.
             // Its active brake bound is known without a held-contact preview.
@@ -3476,10 +3546,11 @@ impl CoupledContact {
         } else {
             // With the wheel held, its brake impulse is an unknown inside the
             // box. Solve chassis contact, then check the holding requirement.
-            let held = friction_disk(
+            let held = friction_ellipse(
                 self.response,
                 [-self.speed[0], -self.speed[1]],
                 self.grip_impulse,
+                self.shape,
             );
             let holding_brake = held[0] * self.radius - self.inertia * self.omega;
             if holding_brake.abs() <= self.brake_budget {
@@ -3501,10 +3572,11 @@ impl CoupledContact {
         let driven_omega = self.omega + brake / self.inertia;
         let mut response = self.response;
         response[0][0] += self.radius * self.radius / self.inertia;
-        let tangent = friction_disk(
+        let tangent = friction_ellipse(
             response,
             [driven_omega * self.radius - self.speed[0], -self.speed[1]],
             self.grip_impulse,
+            self.shape,
         );
         self.finish(
             tangent,
@@ -3515,27 +3587,50 @@ impl CoupledContact {
     }
 }
 
-/// Peak and fully sliding friction coefficients for one tire/surface pair.
+/// Peak and fully sliding friction coefficients for one tire/surface pair,
+/// with the longitudinal and lateral axes of its friction ellipse.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TireFriction {
     /// Friction coefficient used by ordinary rolling contact.
     pub peak: Real,
     /// Friction coefficient at full sliding.
     pub sliding: Real,
+    /// Drive and brake grip multiplier of the friction envelope.
+    pub longitudinal: Real,
+    /// Cornering grip multiplier of the friction envelope.
+    pub lateral: Real,
 }
 
 impl TireFriction {
-    /// Creates finite coefficients satisfying `0 <= sliding <= peak`.
-    /// Panics if either coefficient is invalid.
-    pub fn new(peak: Real, sliding: Real) -> Self {
+    /// Creates finite coefficients satisfying `0 <= sliding <= peak`, with
+    /// positive envelope axes within a factor of two of each other.
+    /// Panics if any value is invalid.
+    pub fn new(peak: Real, sliding: Real, longitudinal: Real, lateral: Real) -> Self {
         assert!(
             peak.is_finite()
                 && sliding.is_finite()
                 && peak >= 0.0
                 && sliding >= 0.0
                 && sliding <= peak
+                && Self::valid_shape(longitudinal, lateral)
         );
-        Self { peak, sliding }
+        Self {
+            peak,
+            sliding,
+            longitudinal,
+            lateral,
+        }
+    }
+
+    /// Whether envelope axes are positive and within a factor of two of each
+    /// other, the range verified for the elliptical contact solve.
+    pub fn valid_shape(longitudinal: Real, lateral: Real) -> bool {
+        longitudinal.is_finite()
+            && lateral.is_finite()
+            && longitudinal > 0.0
+            && lateral > 0.0
+            && lateral <= 2.0 * longitudinal
+            && longitudinal <= 2.0 * lateral
     }
 
     fn sliding_ratio(self) -> Real {
@@ -3575,7 +3670,7 @@ fn recovered_contact_grip(
         }
         .solve()
         .tangent;
-        let required = demand[0].hypot(demand[1]);
+        let required = envelope_norm(demand, contact.shape);
         let unheld_capacity = contact.grip_impulse * kinetic_grip;
         let ratio = if unheld_capacity <= 0.0 {
             0.0
@@ -3683,13 +3778,16 @@ mod tests {
             radius: 0.35,
             inertia: 1.5,
             grip_impulse: 50.0,
+            shape: [1.0, 1.0],
             brake_budget: 100.0,
         }
     }
 
     fn check_solution(contact: CoupledContact, solution: CoupledContactSolution) {
         let impulse = solution.tangent[0].hypot(solution.tangent[1]);
-        assert!(impulse <= contact.grip_impulse + 0.0001);
+        // Envelope-relative length; the impulse length for circular contacts.
+        let envelope = envelope_norm(solution.tangent, contact.shape);
+        assert!(envelope <= contact.grip_impulse + 0.0001);
         assert!(solution.brake.abs() <= contact.brake_budget + 0.0001);
         assert!(solution.omega.is_finite() && solution.speed.iter().all(|v| v.is_finite()));
         let slip = [
@@ -3704,7 +3802,7 @@ mod tests {
             (solution.tangent[0] * slip[1] - solution.tangent[1] * slip[0]).abs() <= 0.0001 * scale,
             "friction not opposite resulting slip: {contact:?}, {solution:?}"
         );
-        if impulse < contact.grip_impulse - 0.001 {
+        if envelope < contact.grip_impulse - 0.001 {
             assert!(slip[0].hypot(slip[1]) < 0.001);
         }
         assert!(solution.brake * solution.omega <= 0.001);
@@ -3743,6 +3841,130 @@ mod tests {
                             check_solution(contact, contact.solve());
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn elliptical_contact_obeys_friction_brake_and_energy_constraints() {
+        let shapes = [
+            [1.1, 0.8],
+            [1.05, 0.85],
+            [0.8, 1.1],
+            [1.0, 0.5],
+            [2.0, 1.0],
+            [1.0, 0.999],
+        ];
+        for shape in shapes {
+            for speed in [-40.0, -2.0, 0.0, 2.0, 40.0] {
+                for side_speed in [-20.0, 0.0, 20.0] {
+                    for omega in [-200.0, 0.0, 200.0] {
+                        for grip in [0.0, 0.1, 50.0, 100_000.0] {
+                            for brake in [0.0, 1.0, 100.0, 10_000.0] {
+                                let contact = CoupledContact {
+                                    speed: [speed, side_speed],
+                                    omega,
+                                    grip_impulse: grip,
+                                    shape,
+                                    brake_budget: brake,
+                                    ..example_contact()
+                                };
+                                check_solution(contact, contact.solve());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Coupled, anisotropic responses across the whole valid shape range.
+        let mut rng = oorandom::Rand32::new(7);
+        let mut range = |low: Real, high: Real| low + (high - low) * rng.rand_float() as Real;
+        for _ in 0..20_000 {
+            let xx = range(1.0e-4, 0.05);
+            let yy = range(1.0e-4, 0.05);
+            let xy = range(-0.95, 0.95) * (xx * yy).sqrt();
+            let longitudinal = range(0.5, 2.0);
+            let lateral = range((longitudinal * 0.5).max(0.5), (longitudinal * 2.0).min(2.0));
+            let contact = CoupledContact {
+                speed: [range(-60.0, 60.0), range(-30.0, 30.0)],
+                response: [[xx, xy], [xy, yy]],
+                omega: range(-250.0, 250.0),
+                radius: range(0.25, 0.45),
+                inertia: range(0.5, 3.0),
+                grip_impulse: range(0.0, 150.0),
+                shape: [longitudinal, lateral],
+                brake_budget: range(0.0, 400.0),
+            };
+            check_solution(contact, contact.solve());
+        }
+    }
+
+    #[test]
+    fn friction_envelope_scales_each_axis_and_equal_axes_scale_the_disk() {
+        let grip = 50.0;
+        for shape in [[1.1, 0.8], [1.05, 0.85], [0.8, 1.1], [1.0, 1.0]] {
+            // A held (locked) wheel sliding straight uses the longitudinal axis.
+            let locked = CoupledContact {
+                speed: [40.0, 0.0],
+                response: [[0.004, 0.0], [0.0, 0.004]],
+                omega: 0.0,
+                grip_impulse: grip,
+                shape,
+                brake_budget: 100_000.0,
+                ..example_contact()
+            }
+            .solve();
+            assert!((locked.tangent[0] + grip * shape[0]).abs() < 1e-3);
+            assert_eq!(locked.tangent[1], 0.0);
+            // A rolling wheel sliding sideways uses the lateral axis.
+            let sideways = CoupledContact {
+                speed: [0.0, 20.0],
+                response: [[0.004, 0.0], [0.0, 0.004]],
+                omega: 0.0,
+                grip_impulse: grip,
+                shape,
+                brake_budget: 0.0,
+                ..example_contact()
+            }
+            .solve();
+            assert!((sideways.tangent[1] + grip * shape[1]).abs() < 1e-3);
+        }
+        // Equal axes are the circular envelope with a scaled budget, exactly.
+        for g in [0.5, 0.9, 1.0, 1.3] {
+            let scaled = CoupledContact {
+                shape: [g, g],
+                ..example_contact()
+            }
+            .solve();
+            let circle = CoupledContact {
+                grip_impulse: example_contact().grip_impulse * g,
+                ..example_contact()
+            }
+            .solve();
+            assert_eq!(scaled.tangent, circle.tangent);
+            assert_eq!(scaled.omega, circle.omega);
+        }
+    }
+
+    #[test]
+    fn friction_envelope_is_continuous_at_equal_axes() {
+        let circle = example_contact().solve();
+        for epsilon in [1.0e-2, 1.0e-3, 1.0e-4] {
+            for shape in [[1.0, 1.0 - epsilon], [1.0 + epsilon, 1.0]] {
+                let result = CoupledContact {
+                    shape,
+                    ..example_contact()
+                }
+                .solve();
+                for axis in 0..2 {
+                    assert!(
+                        (result.tangent[axis] - circle.tangent[axis]).abs()
+                            <= example_contact().grip_impulse * epsilon * 2.0,
+                        "{shape:?}: {:?} vs {:?}",
+                        result.tangent,
+                        circle.tangent
+                    );
                 }
             }
         }
@@ -4109,6 +4331,7 @@ mod tests {
             radius: 0.35,
             inertia: 1.5,
             grip_impulse: 50.0,
+            shape: [1.0, 1.0],
             brake_budget: 0.0,
         }
     }
@@ -4116,7 +4339,7 @@ mod tests {
     #[test]
     fn surface_pairs_preserve_original_combined_speed_transition() {
         for ratio in [0.0, 0.5, 0.85, 1.0] {
-            let tire = TireFriction::new(1.2, 1.2 * ratio);
+            let tire = TireFriction::new(1.2, 1.2 * ratio, 1.0, 1.0);
             for (speed, blend) in [
                 (0.0, 0.0),
                 (3.0, 0.0),
@@ -4146,7 +4369,7 @@ mod tests {
                     ..tire_test_contact()
                 };
                 let expected = c.solve();
-                let kinetic = TireFriction::new(1.0, 0.85).multiplier(0.0, side);
+                let kinetic = TireFriction::new(1.0, 0.85, 1.0, 1.0).multiplier(0.0, side);
                 let (actual, grip) = solve_with_grip_recovery(c, kinetic, 1.0, 0.85, 1.0 / 60.0);
                 assert_eq!(grip, 1.0);
                 assert_eq!(actual.tangent, expected.tangent);
@@ -4187,7 +4410,7 @@ mod tests {
     #[test]
     fn surface_changes_and_zero_sliding_grip_are_finite_and_not_double_scaled() {
         for (peak, sliding) in [(1.2, 1.02), (0.55, 0.55), (1.0, 0.0), (0.0, 0.0)] {
-            let friction = TireFriction::new(peak, sliding);
+            let friction = TireFriction::new(peak, sliding, 1.0, 1.0);
             let c = CoupledContact {
                 speed: [40.0, 20.0],
                 omega: 0.0,
@@ -4441,7 +4664,7 @@ mod tests {
                             for i in 0..solver.contacts.len() {
                                 let limits = solver.contact(i, solver.actuations[i]);
                                 assert!(
-                                    solver.impulses[i][0].hypot(solver.impulses[i][1])
+                                    envelope_norm(solver.impulses[i], limits.shape)
                                         <= limits.grip_impulse + 1e-4
                                 );
                                 assert!(solver.brakes[i].abs() <= limits.brake_budget + 1e-4);
@@ -4803,42 +5026,50 @@ mod tests {
 
     #[test]
     fn locked_wheel_steering_does_not_redirect_combined_friction() {
-        for hz in [30, 60, 120] {
-            for anti_roll in [0.0, 0.3, 1.0] {
-                for direction in [-1.0, 1.0] {
-                    let mut baseline: Option<(Real, Real)> = None;
-                    for steering in [0.0 as Real, -0.4, 0.4] {
-                        let dt = 1.0 / hz as Real;
-                        let (mut controller, mut bodies, colliders) =
-                            four_wheel_test_vehicle(40.0 * direction, 0.0);
-                        for wheel in &mut controller.wheels {
-                            wheel.anti_roll = anti_roll;
-                            wheel.raycast_info.contact_point_ws.y = -0.3;
-                            wheel.angular_velocity = 0.0;
-                            wheel.anti_lock_brake = 0.0;
-                            wheel.brake = 1.0;
-                            wheel.max_brake_force = 180_000.0;
-                            wheel.friction_slip = 1.0;
-                            if wheel.role.steered {
-                                wheel.steering = steering;
-                                wheel.wheel_axle_ws =
-                                    Vector::new(steering.cos(), 0.0, -steering.sin());
+        for (longitudinal, lateral) in [(1.0, 1.0), (1.1, 0.8), (1.05, 0.85), (0.8, 1.1)] {
+            for hz in [30, 60, 120] {
+                for anti_roll in [0.0, 0.3, 1.0] {
+                    for direction in [-1.0, 1.0] {
+                        let mut baseline: Option<(Real, Real)> = None;
+                        for steering in [0.0 as Real, -0.4, 0.4] {
+                            let dt = 1.0 / hz as Real;
+                            let (mut controller, mut bodies, colliders) =
+                                four_wheel_test_vehicle(40.0 * direction, 0.0);
+                            controller
+                                .tire_types
+                                .get_mut("default")
+                                .unwrap()
+                                .default_friction =
+                                TireFriction::new(1.0, 0.85, longitudinal, lateral);
+                            for wheel in &mut controller.wheels {
+                                wheel.anti_roll = anti_roll;
+                                wheel.raycast_info.contact_point_ws.y = -0.3;
+                                wheel.angular_velocity = 0.0;
+                                wheel.anti_lock_brake = 0.0;
+                                wheel.brake = 1.0;
+                                wheel.max_brake_force = 180_000.0;
+                                wheel.friction_slip = 1.0;
+                                if wheel.role.steered {
+                                    wheel.steering = steering;
+                                    wheel.wheel_axle_ws =
+                                        Vector::new(steering.cos(), 0.0, -steering.sin());
+                                }
                             }
-                        }
-                        for _ in 0..hz / 2 {
-                            controller.current_vehicle_speed =
-                                bodies[controller.chassis].linvel().z;
-                            controller.update_friction(&mut bodies, &colliders, dt);
-                            assert!(controller.wheels.iter().all(|wheel| wheel.lock));
-                        }
-                        let body = &bodies[controller.chassis];
-                        if let Some((yaw, sideways)) = baseline {
-                            assert!((body.angvel().y - yaw).abs() < 0.0001
+                            for _ in 0..hz / 2 {
+                                controller.current_vehicle_speed =
+                                    bodies[controller.chassis].linvel().z;
+                                controller.update_friction(&mut bodies, &colliders, dt);
+                                assert!(controller.wheels.iter().all(|wheel| wheel.lock));
+                            }
+                            let body = &bodies[controller.chassis];
+                            if let Some((yaw, sideways)) = baseline {
+                                assert!((body.angvel().y - yaw).abs() < 0.0001
                             && (body.linvel().x - sideways).abs() < 0.0001,
-                            "{hz} Hz anti_roll {anti_roll} direction {direction} steering {steering}: yaw {} vs {yaw}, sideways {} vs {sideways}",
+                            "{longitudinal}/{lateral} {hz} Hz anti_roll {anti_roll} direction {direction} steering {steering}: yaw {} vs {yaw}, sideways {} vs {sideways}",
                             body.angvel().y, body.linvel().x);
-                        } else {
-                            baseline = Some((body.angvel().y, body.linvel().x));
+                            } else {
+                                baseline = Some((body.angvel().y, body.linvel().x));
+                            }
                         }
                     }
                 }
@@ -4882,6 +5113,7 @@ mod tests {
             radius: 1.0,
             inertia: 1.0,
             grip_impulse: 2.5,
+            shape: [1.0, 1.0],
             brake_budget: 0.0,
         };
         // Wheel inertia gives a forward request of three; the lateral request
@@ -4928,6 +5160,7 @@ mod tests {
                     radius: 0.35,
                     inertia: 1.2,
                     grip_impulse: 3000.0 / hz as Real,
+                    shape: [1.0, 1.0],
                     brake_budget: 1500.0 / hz as Real,
                 };
                 let result = contact.solve();
@@ -4957,6 +5190,7 @@ mod tests {
                 radius: 0.35,
                 inertia: 1.2,
                 grip_impulse: 50.0,
+                shape: [1.0, 1.0],
                 brake_budget: 0.0,
             };
             let result = contact.solve();
@@ -4993,6 +5227,7 @@ mod tests {
                     * dt
                     * wheel.friction_slip
                     * 0.85,
+                shape: [1.0, 1.0],
                 brake_budget: wheel.max_brake_force * brake * dt * wheel.radius,
             };
             controller.update_friction(&mut bodies, &colliders, dt);
@@ -5263,7 +5498,8 @@ mod tests {
                                     .tire_types
                                     .get_mut("default")
                                     .unwrap()
-                                    .default_friction = TireFriction::new(grip, grip * 0.85);
+                                    .default_friction =
+                                    TireFriction::new(grip, grip * 0.85, 1.0, 1.0);
                                 controller.current_vehicle_speed =
                                     bodies[controller.chassis].linvel().z;
                                 controller.update_friction(&mut bodies, &colliders, dt);
@@ -5305,7 +5541,7 @@ mod tests {
                         .tire_types
                         .get_mut("default")
                         .unwrap()
-                        .default_friction = TireFriction::new(0.05, 0.05);
+                        .default_friction = TireFriction::new(0.05, 0.05, 1.0, 1.0);
                     controller.current_vehicle_speed = 40.0 * direction;
                     for wheel in &mut controller.wheels {
                         wheel.anti_lock_brake = strength;

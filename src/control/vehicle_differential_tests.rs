@@ -87,9 +87,10 @@ fn differential_full_lock_survives_brakes_assists_and_lost_contacts() {
                         assert_eq!(c.wheels[2].angular_velocity, c.wheels[3].angular_velocity);
                         for (i, w) in c.wheels.iter().enumerate() {
                             assert!(w.angular_velocity.is_finite());
-                            let limit = c.contact_solver.contacts[i].base.grip_impulse
-                                * c.contact_solver.actuations[i].grip;
-                            assert!(w.forward_impulse.hypot(w.side_impulse) <= limit + 0.001);
+                            let base = c.contact_solver.contacts[i].base;
+                            let limit = base.grip_impulse * c.contact_solver.actuations[i].grip;
+                            let impulse = [w.forward_impulse, w.side_impulse];
+                            assert!(envelope_norm(impulse, base.shape) <= limit + 0.001);
                         }
                     }
                 }
@@ -262,11 +263,10 @@ fn differential_center_couples_axle_means_with_lost_contacts_and_unequal_radii()
                             assert!(mismatch < 1e-3, "{hz} Hz: mean mismatch {mismatch}");
                         }
                         for (i, wheel) in c.wheels.iter().enumerate() {
-                            let limit = c.contact_solver.contacts[i].base.grip_impulse
-                                * c.contact_solver.actuations[i].grip;
-                            assert!(
-                                wheel.forward_impulse.hypot(wheel.side_impulse) <= limit + 0.001
-                            );
+                            let base = c.contact_solver.contacts[i].base;
+                            let limit = base.grip_impulse * c.contact_solver.actuations[i].grip;
+                            let impulse = [wheel.forward_impulse, wheel.side_impulse];
+                            assert!(envelope_norm(impulse, base.shape) <= limit + 0.001);
                         }
                     }
                     assert!(c.contact_solver.residual <= CONTACT_SOLVER_TOLERANCE);
