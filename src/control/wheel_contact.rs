@@ -13,6 +13,12 @@ mod triangle;
 pub(super) const MIN_SUPPORT_COS: Real = 0.1;
 const CONTACT_EPS: Real = 1.0e-4;
 
+/// Tread crown radius as a multiple of tread width. Published passenger-tyre
+/// specs put the crown arc at 2.0-3.5x the tread width; 2.7 is mid-range. The
+/// contact walks across the tread as the wheel leans, reaching the shoulder
+/// near 11 degrees, instead of snapping there for any non-zero lean.
+const CROWN_RADIUS_PER_WIDTH: Real = 2.7;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct WheelSupport {
     pub collider: ColliderHandle,
@@ -31,7 +37,30 @@ pub(super) struct WheelSweep {
     pub max_length: Real,
 }
 
+/// How far the contact sits from the tread centreline, toward the low shoulder.
+/// `axial` is the sine of the wheel's lean against the surface. The offset stays
+/// in the contact plane so the reported point cannot walk outside the tread once
+/// it is dropped onto the surface. Shared by every flat-surface contact path so
+/// box, halfspace and triangle faces agree.
+pub(super) fn tread_slide(
+    width: Real,
+    axle: &Vector<Real>,
+    normal: &Vector<Real>,
+    axial: Real,
+) -> Vector<Real> {
+    let half = width * 0.5;
+    let along = (CROWN_RADIUS_PER_WIDTH * width * axial).clamp(-half, half);
+    match (axle - normal * axial).try_normalize(CONTACT_EPS) {
+        Some(in_plane) => in_plane * along,
+        None => Vector::zeros(),
+    }
+}
+
 impl WheelSweep {
+    fn tread_slide(&self, normal: &Vector<Real>, axial: Real) -> Vector<Real> {
+        tread_slide(self.width, &self.axle, normal, axial)
+    }
+
     fn planar_support(
         &self,
         shape: &dyn Shape,
@@ -54,19 +83,12 @@ impl WheelSweep {
             }
             let length = length.clamp(self.min_length, self.max_length);
             let center = self.mount + self.direction * length;
-            let offset = -radial
-                .try_normalize(CONTACT_EPS)
-                .unwrap_or_else(Vector::zeros)
-                * self.radius
-                - self.axle
-                    * (if axial.abs() > 1.0e-3 {
-                        axial.signum()
-                    } else {
-                        0.0
-                    })
-                    * self.width
-                    * 0.5;
-            let support = center + offset;
+            // Walk the contact across the tread with lean rather than snapping
+            // it to the leaning cylinder's rim edge, which would step the full
+            // half-width sideways for any non-zero camber. `radius_normal` above
+            // still uses the edge, so support length and lateral reach are
+            // unchanged.
+            let support = center - self.tread_slide(&normal, axial);
             let point = support - normal * normal.dot(&(support - plane));
             // The finite face must actually contain the tire support. Otherwise
             // its edge/corner is handled by the convex shape cast below.
@@ -195,21 +217,14 @@ impl WheelSweep {
                             return;
                         }
                         let center = self.mount + self.direction * length;
-                        // Choose the middle of a flat contact patch where possible. GJK can
-                        // return either cylinder shoulder for the same flat road.
+                        // Always report the point straight under the wheel centre.
+                        // GJK can return either cylinder shoulder for the same
+                        // flat road, and a cambered tire would otherwise report a
+                        // point that moves sideways with camber.
                         let axial = normal.dot(&self.axle);
                         let radial = normal - self.axle * axial;
-                        if let Some(radial) =
-                            radial.try_normalize(CONTACT_EPS).filter(|_| !is_triangle)
-                        {
-                            let shoulder = if axial.abs() > 1.0e-3 {
-                                axial.signum()
-                            } else {
-                                0.0
-                            };
-                            let support = center
-                                - radial * self.radius
-                                - self.axle * (shoulder * self.width * 0.5);
+                        if radial.try_normalize(CONTACT_EPS).is_some() && !is_triangle {
+                            let support = center - self.tread_slide(&normal, axial);
                             let on_plane = support - normal * normal.dot(&(support - point));
                             let projection = shape.project_point(pose, &on_plane, false);
                             if (projection.point - on_plane).norm_squared()

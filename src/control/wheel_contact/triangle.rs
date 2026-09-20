@@ -171,18 +171,17 @@ pub(super) fn cast(
     let enter = enter.min(exit);
 
     if closing >= super::MIN_SUPPORT_COS {
-        let shoulder = if axial.abs() > 1.0e-3 {
-            axial.signum()
-        } else {
-            0.0
-        };
+        // Walk the contact across the tread with lean, matching the box and
+        // halfspace paths. Snapping to the rim edge here stepped the contact a
+        // full half-width sideways for any lean on a triangle mesh, which is
+        // every real track surface.
         let support = Point::from(
             direction * enter
                 - radial
                     .try_normalize(CONTACT_EPS)
                     .unwrap_or_else(Vector::zeros)
                     * cylinder.radius
-                - axle * (shoulder * cylinder.half_height),
+                - super::tread_slide(cylinder.half_height * 2.0, &axle, &normal, axial),
         );
         let point = support - normal * normal.dot(&(support - patch.vertices[0]));
         if patch.contains(&point) {
