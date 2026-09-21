@@ -113,7 +113,8 @@ pub struct WheelTuning {
     ///
     /// Increase this value if the suspension appears to overshoot.
     pub suspension_damping: Real,
-    /// The maximum distance the suspension can travel before and after its resting length.
+    /// The maximum compression travel from the rest length. The suspension never
+    /// extends past its rest length.
     pub max_suspension_travel: Real,
     /// Parameter controlling how much traction the tire has.
     ///
@@ -150,9 +151,11 @@ struct WheelDesc {
     pub direction_cs: Vector<Real>,
     /// The wheel’s axle axis, relative to the chassis.
     pub axle_cs: Vector<Real>,
-    /// The rest length of the wheel’s suspension spring.
+    /// The rest length of the wheel’s suspension spring, where it applies no force.
+    /// This is also full droop: the airborne length and the longest supported contact.
     pub suspension_rest_length: Real,
-    /// The maximum distance the suspension can travel before and after its resting length.
+    /// The maximum compression travel from the rest length. The suspension never
+    /// extends past its rest length.
     pub max_suspension_travel: Real,
     /// The wheel’s radius.
     pub radius: Real,
@@ -206,9 +209,11 @@ pub struct Wheel {
     pub direction_cs: Vector<Real>,
     /// The wheel’s axle axis, relative to the chassis.
     pub axle_cs: Vector<Real>,
-    /// The rest length of the wheel’s suspension spring.
+    /// The rest length of the wheel’s suspension spring, where it applies no force.
+    /// This is also full droop: the airborne length and the longest supported contact.
     pub suspension_rest_length: Real,
-    /// The maximum distance the suspension can travel before and after its resting length.
+    /// The maximum compression travel from the rest length. The suspension never
+    /// extends past its rest length.
     pub max_suspension_travel: Real,
     /// The wheel’s radius.
     pub radius: Real,
@@ -1223,7 +1228,10 @@ impl DynamicRayCastVehicleController {
     ) {
         let wheel = &mut self.wheels[wheel_id];
         let min_length = (wheel.suspension_rest_length - wheel.max_suspension_travel).max(0.0);
-        let max_length = wheel.suspension_rest_length + wheel.max_suspension_travel;
+        // The spring is unloaded at rest length, so that is full droop. Ground
+        // beyond it cannot be supported, and ending the sweep there keeps the
+        // length continuous when contact is lost or regained.
+        let max_length = wheel.suspension_rest_length;
         let source = wheel.raycast_info.hard_point_ws;
         wheel.debug = WheelDebug {
             ray_end: source + wheel.wheel_direction_ws * max_length,
@@ -1267,7 +1275,7 @@ impl DynamicRayCastVehicleController {
             wheel.suspension_relative_velocity = hit.normal.dot(&velocity) / incidence;
         }
         if !wheel.raycast_info.is_in_contact {
-            // No contact, put wheel info as in rest position
+            // No contact: the unloaded wheel hangs at full droop.
             wheel.raycast_info.suspension_length = wheel.suspension_rest_length;
             wheel.suspension_relative_velocity = 0.0;
             wheel.raycast_info.contact_normal_ws = -wheel.wheel_direction_ws;
@@ -7196,13 +7204,13 @@ mod tests {
                             mount,
                             direction,
                             axle,
-                            0.5,
+                            0.8,
                             radius,
                             0.2,
                             &WheelTuning::default(),
                             WheelRole::new(WheelAxle::Front, false, true),
                         );
-                        wheel.max_suspension_travel = 0.3;
+                        wheel.max_suspension_travel = 0.6;
                         wheel.steering = steering;
                         wheel.set_steering_axis_cs(kingpin).unwrap();
                         wheel.set_center_offset_cs(offset).unwrap();
@@ -7341,6 +7349,75 @@ mod tests {
             assert_eq!(wheel.raycast_info.ground_object, None);
             assert!((wheel.raycast_info.suspension_length - 0.3).abs() < 1.0e-6);
             assert!(wheel.center.coords.iter().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn suspension_droop_ends_at_rest_length_without_a_length_jump() {
+        use crate::geometry::ColliderBuilder;
+        let rest = 0.4;
+        let radius = 0.3;
+        let step = 0.01;
+        let mut bodies = RigidBodySet::new();
+        let chassis = bodies.insert(RigidBodyBuilder::dynamic());
+        let mut colliders = ColliderSet::new();
+        colliders.insert(ColliderBuilder::halfspace(na::Unit::new_normalize(
+            Vector::y(),
+        )));
+        let mut queries = QueryPipeline::new();
+        queries.update(&colliders);
+        let mut controller =
+            DynamicRayCastVehicleController::new(chassis, VehicleControllerConfig::default());
+        let wheel = controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            rest,
+            radius,
+            0.2,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Front, false, false),
+        );
+        wheel.max_suspension_travel = 0.3;
+        let mut previous: Option<Real> = None;
+        // Lift the chassis from mid-travel until the road is well past full droop,
+        // as on a jump take-off; landing retraces the same lengths.
+        for i in 0..=60 {
+            let road_length = 0.2 + i as Real * step;
+            bodies[chassis].set_translation(Vector::y() * (road_length + radius), true);
+            controller.update_wheel_transforms_ws(&bodies[chassis], 0);
+            controller.suspension_cast(
+                &bodies,
+                &colliders,
+                &queries,
+                QueryFilter::default(),
+                &bodies[chassis],
+                0,
+            );
+            let wheel = &controller.wheels[0];
+            let length = wheel.raycast_info.suspension_length;
+            assert!(
+                (wheel.debug.ray_end.y - (bodies[chassis].translation().y - rest)).abs() < 1.0e-5,
+                "the query must end at full droop"
+            );
+            assert!(
+                length <= rest + 1.0e-4,
+                "road={road_length} length={length}"
+            );
+            if road_length < rest - 1.0e-3 {
+                assert!(wheel.raycast_info.is_in_contact);
+                assert!((length - road_length).abs() < 1.0e-4);
+            } else if road_length > rest + 1.0e-3 {
+                assert!(!wheel.raycast_info.is_in_contact, "road={road_length}");
+                assert_eq!(length, rest);
+            }
+            if let Some(previous) = previous {
+                assert!(
+                    (length - previous).abs() <= step + 1.0e-4,
+                    "road={road_length} length jumped from {previous} to {length}"
+                );
+            }
+            previous = Some(length);
         }
     }
 

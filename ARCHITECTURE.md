@@ -69,8 +69,11 @@ camber adjusts the axle at the tire center. Driving, replay, force feedback,
 and capability calculations share these frames.
 
 The suspension query sweeps a cylinder (authored radius and full axle width)
-from maximum compression to full droop. It visits only shapes/triangles whose
-bounds overlap that travel volume, then selects the earliest supporting hit.
+from maximum compression to full droop. Full droop is the rest length: the
+spring is unloaded there and an airborne wheel returns to it, so travel only
+compresses from rest and contact starts and ends at the same length. The query
+visits only shapes/triangles whose bounds overlap that travel volume, then
+selects the earliest supporting hit.
 Mesh and compound parts are considered separately so a rejected steep contact
 cannot hide supporting ground in the same collider. Contact normals must oppose
 travel with cosine at least 0.1; initial overlaps request penetration geometry.
