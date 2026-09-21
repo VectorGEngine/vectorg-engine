@@ -43,6 +43,12 @@ const RECOVERY_THRESHOLD: Real = 0.94;
 const RECOVERY_BASE_RATE: Real = 0.15;
 const RECOVERY_RATE: Real = 0.3;
 
+fn longitudinal_slip_amount(speed: Real) -> Real {
+    let amount = ((speed - SLIDING_START_SPEED) / (SLIDING_FULL_SPEED - SLIDING_START_SPEED))
+        .clamp(0.0, 1.0);
+    amount * amount * (3.0 - 2.0 * amount)
+}
+
 fn counter_steer_assist_speed_activation(forward_speed: Real) -> Real {
     let normalized = ((forward_speed - COUNTER_STEER_ASSIST_MIN_SPEED)
         / (COUNTER_STEER_ASSIST_FULL_SPEED - COUNTER_STEER_ASSIST_MIN_SPEED))
@@ -399,6 +405,46 @@ impl Wheel {
     /// for this wheel.
     pub fn raycast_info(&self) -> &RayCastInfo {
         &self.raycast_info
+    }
+
+    /// Normalized braking slip for this tire. Zero means the tire is rolling or
+    /// not being braked; one means its longitudinal underspeed has reached the
+    /// tire model's fully sliding speed.
+    pub fn brake_slip(&self) -> Real {
+        if !self.raycast_info.is_in_contact || self.brake <= 0.0 {
+            return 0.0;
+        }
+        let surface_speed = self.angular_velocity * self.radius;
+        let direction = if self.contact_forward_speed.abs() > ASSIST_SURFACE_SPEED_TOLERANCE {
+            self.contact_forward_speed.signum()
+        } else {
+            surface_speed.signum()
+        };
+        longitudinal_slip_amount(
+            ((self.contact_forward_speed - surface_speed) * direction).max(0.0),
+        )
+    }
+
+    /// Normalized powered slip for this tire. Zero means the tire is rolling or
+    /// not driven under throttle; one means its longitudinal overspeed has
+    /// reached the tire model's fully sliding speed.
+    pub fn power_slip(&self) -> Real {
+        if !self.raycast_info.is_in_contact
+            || !self.role.driven
+            || !self.drivetrain_connected
+            || self.drive_throttle <= 0.0
+        {
+            return 0.0;
+        }
+        let surface_speed = self.angular_velocity * self.radius;
+        let direction = if self.contact_forward_speed.abs() > ASSIST_SURFACE_SPEED_TOLERANCE {
+            self.contact_forward_speed.signum()
+        } else {
+            surface_speed.signum()
+        };
+        longitudinal_slip_amount(
+            ((surface_speed - self.contact_forward_speed) * direction).max(0.0),
+        )
     }
 
     /// The world-space center of the wheel.
@@ -7435,6 +7481,44 @@ mod tests {
 
         assert_eq!(reference, WHEEL_EFFECTIVE_INERTIA);
         assert!((doubled - reference * 4.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn tire_slip_feedback_distinguishes_braking_and_power_in_both_directions() {
+        for direction in [-1.0, 1.0] {
+            let mut wheel = test_wheel();
+            wheel.contact_forward_speed = direction * 12.0;
+            wheel.angular_velocity = direction * 4.0 / wheel.radius;
+            wheel.brake = 1.0;
+            assert_eq!(wheel.brake_slip(), 1.0);
+            assert_eq!(wheel.power_slip(), 0.0);
+
+            wheel.brake = 0.0;
+            wheel.angular_velocity = direction * 20.0 / wheel.radius;
+            assert_eq!(wheel.brake_slip(), 0.0);
+            assert_eq!(wheel.power_slip(), 1.0);
+        }
+    }
+
+    #[test]
+    fn tire_slip_feedback_uses_sliding_range_and_requires_active_grounded_tires() {
+        let mut wheel = test_wheel();
+        wheel.contact_forward_speed = 10.0;
+        wheel.brake = 1.0;
+        wheel.angular_velocity = 4.0 / wheel.radius;
+        assert!((wheel.brake_slip() - 0.5).abs() < 1.0e-6);
+
+        wheel.brake = 0.0;
+        assert_eq!(wheel.brake_slip(), 0.0);
+        wheel.angular_velocity = 16.0 / wheel.radius;
+        assert!((wheel.power_slip() - 0.5).abs() < 1.0e-6);
+
+        wheel.drivetrain_connected = false;
+        assert_eq!(wheel.power_slip(), 0.0);
+        wheel.drivetrain_connected = true;
+        wheel.raycast_info.is_in_contact = false;
+        assert_eq!(wheel.brake_slip(), 0.0);
+        assert_eq!(wheel.power_slip(), 0.0);
     }
 
     #[test]
