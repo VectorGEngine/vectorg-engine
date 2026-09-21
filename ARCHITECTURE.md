@@ -140,6 +140,9 @@ TC chooses a common cut of the incoming torque; axle reaction stays internal.
 Its decision is layered wheel -> axle -> center: parts that turn freely are
 limited by the weakest, while a holding clutch or rigid link is decided by its
 least-limited part, since a saturated tire's own preview freezes its partner.
+The player-facing TC strength is scaled to 90% before selecting the permitted
+wheel-surface speed gap. The player-facing ABS strength uses the same 90% scale
+before selecting permitted wheel underspeed.
 A clutch holds while its impulse is below capacity. Scrub that a slipping axle
 or center clutch forces on a wheel is credited by the clutch's share of that
 wheel's driving torque, capped by the rolling-speed difference it closes.
