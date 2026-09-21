@@ -38,7 +38,10 @@ Drive torque and grip/assist history are immutable during a tick's previews.
 ABS/TC and grip-recovery predictions are rechecked against the other contacts'
 latest impulses; a bounded outer solve updates their limits. A contact velocity
 residual controls convergence (including the wheel's angular response), not raw
-impulse differences. If an iteration cap is reached, the solver retains its
+impulse differences. Each pass also stops when that residual improves by less
+than 10% over an 8-iteration window: saturated tires that oppose each other (toe,
+or camber under chassis pitch) otherwise creep toward the 128-iteration cap
+without changing the committed response. At either stop, the solver retains its
 feasible accumulated result for the accepted limits and records the remaining
 residual in its scratch diagnostics. Wheel state and feedback commit once;
 solver iterations never integrate torque or recovery time repeatedly.

@@ -322,3 +322,46 @@ fn differential_open_center_adds_no_coupling_and_handbrake_releases_a_locked_one
         assert!((weights.iter().sum::<Real>() - 1.0).abs() < 1e-6);
     }
 }
+
+#[test]
+fn differential_stalled_contact_solves_stop_early_and_stay_feasible() {
+    // Opposing toe, unequal side grip and a limited-slip rear axle make saturated
+    // tires fight. The coupled residual then only creeps down between windows.
+    let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(56.0, 1.0);
+    locks(&mut controller, 0.55);
+    set_test_drive(&mut controller, 300.0);
+    for wheel in &mut controller.wheels {
+        let side = wheel.chassis_connection_point_cs.x.signum();
+        let toe = if wheel.role.axle == WheelAxle::Front {
+            0.0005
+        } else {
+            0.0015
+        } * side;
+        wheel.wheel_axle_ws = Vector::new(toe.cos(), 0.0, -toe.sin());
+        wheel.friction_slip = 1.0 + 0.02 * side;
+        wheel.raycast_info.contact_point_ws.y = -0.3;
+    }
+    let mut stalled = 0;
+    for _ in 0..240 {
+        controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
+        controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+        let solver = &controller.contact_solver;
+        stalled += solver.stalled_passes;
+        for (i, prepared) in solver.contacts.iter().enumerate() {
+            let base = prepared.base;
+            let limit = base.grip_impulse * solver.actuations[i].grip;
+            assert!(envelope_norm(solver.impulses[i], base.shape) <= limit + 0.001);
+            assert!(
+                solver.brakes[i].abs() <= base.brake_budget * solver.actuations[i].brake + 0.001
+            );
+        }
+        assert!(bodies[controller.chassis]
+            .linvel()
+            .iter()
+            .all(|v| v.is_finite()));
+    }
+    assert!(
+        stalled > 0,
+        "the stalled scenario must exercise the early stop"
+    );
+}

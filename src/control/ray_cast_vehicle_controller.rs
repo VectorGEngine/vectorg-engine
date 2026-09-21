@@ -2656,6 +2656,7 @@ struct VehicleContactSolver {
     next_actuations: Vec<ContactActuation>,
     ground_impulses: Vec<(RigidBodyHandle, Vector<Real>, Vector<Real>)>,
     iterations: usize,
+    stalled_passes: usize,
     residual: Real,
     assist_residual: Real,
 }
@@ -2664,6 +2665,22 @@ const CONTACT_SOLVER_MAX_ITERATIONS: usize = 128;
 const CONTACT_SOLVER_MAX_ASSIST_ITERATIONS: usize = 8;
 // Velocity residual, substantially smaller than the assists' 0.01 m/s allowance.
 const CONTACT_SOLVER_TOLERANCE: Real = 0.0001;
+// Progress is checked once per window. Saturated tires that oppose each other
+// (toe, or camber under chassis pitch) leave a residual that only creeps down;
+// further passes cost time without changing the committed contact response.
+const CONTACT_SOLVER_STALL_WINDOW: usize = 8;
+const CONTACT_SOLVER_STALL_RATIO: Real = 0.9;
+
+// True when the residual fell by less than 1 - CONTACT_SOLVER_STALL_RATIO since
+// the previous window check. The first check only records the reference.
+fn contact_solver_stalled(iteration: usize, residual: Real, reference: &mut Real) -> bool {
+    if iteration % CONTACT_SOLVER_STALL_WINDOW != 0 {
+        return false;
+    }
+    let stalled = iteration > 0 && residual > *reference * CONTACT_SOLVER_STALL_RATIO;
+    *reference = residual;
+    stalled
+}
 
 impl VehicleContactSolver {
     fn prepare_rotation(&mut self) {
@@ -3279,7 +3296,8 @@ impl VehicleContactSolver {
             self.iterations += 1;
             return;
         }
-        for _ in 0..CONTACT_SOLVER_MAX_ITERATIONS {
+        let mut stall_reference = Real::MAX;
+        for iteration in 0..CONTACT_SOLVER_MAX_ITERATIONS {
             self.iterations += 1;
             self.residual = 0.0;
             for i in 0..self.contacts.len() {
@@ -3362,6 +3380,11 @@ impl VehicleContactSolver {
             // All errors refer to one common state, including each wheel's own
             // accumulated impulse and the corrections from every other wheel.
             if self.residual <= CONTACT_SOLVER_TOLERANCE {
+                break;
+            }
+            // Keep the feasible accumulated iterate, as at the iteration cap.
+            if contact_solver_stalled(iteration, self.residual, &mut stall_reference) {
+                self.stalled_passes += 1;
                 break;
             }
 
@@ -3457,6 +3480,7 @@ impl VehicleContactSolver {
         self.dt = dt;
         self.prepare_rotation();
         self.iterations = 0;
+        self.stalled_passes = 0;
         self.residual = 0.0;
         self.assist_residual = 0.0;
         if count == 0 {
@@ -4980,6 +5004,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn contact_solver_stall_check_compares_whole_windows() {
+        let window = CONTACT_SOLVER_STALL_WINDOW;
+        let mut reference = Real::MAX;
+        assert!(!contact_solver_stalled(0, 1.0, &mut reference));
+        for iteration in 1..window {
+            assert!(!contact_solver_stalled(iteration, 1.0, &mut reference));
+        }
+        // 20% progress over a window continues; 5% over the next one stops.
+        assert!(!contact_solver_stalled(window, 0.8, &mut reference));
+        assert!(contact_solver_stalled(2 * window, 0.76, &mut reference));
     }
 
     #[test]
