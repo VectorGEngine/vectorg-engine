@@ -401,7 +401,7 @@ pub struct VehicleState {
     pub turbo_release_sequence: u32,
     /// Number of wheels currently contacting the ground.
     pub wheels_in_contact: usize,
-    /// Fraction of wheels currently receiving ABS intervention.
+    /// Fraction of wheels whose ABS valves are acting during the shared hydraulic cycle.
     pub abs_activity: Real,
     /// Normalized electronic stability-control intervention.
     pub esc_activity: Real,
