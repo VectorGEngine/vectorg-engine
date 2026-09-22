@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use super::vehicle_differential::{acceleration_mode, clutch_impulse_limit};
 use super::vehicle_powertrain::{
-    VehicleControllerConfig, VehicleEngineState, VehicleInput, VehiclePowertrain,
-    VehicleShiftOutcome, VehicleState, WheelAxle, WheelRole,
+    VehicleControllerConfig, VehicleDynamicsConfig, VehicleEngineState, VehicleInput,
+    VehiclePowertrain, VehicleShiftOutcome, VehicleState, WheelAxle, WheelRole,
 };
 use super::wheel_contact::WheelSweep;
 
@@ -41,11 +41,47 @@ const ABS_HYDRAULIC_RELEASE_STEP: Real = 1.0;
 const ABS_HYDRAULIC_REAPPLY_STEP: Real = 0.2;
 const ABS_HYDRAULIC_TARGET_TOLERANCE: Real = 0.05;
 
+// Nominal tire pressure in bar. A wheel at this pressure carrying its static
+// share of the chassis is the grip reference: its multiplier is exactly one.
+const TIRE_PRESSURE_REFERENCE: Real = 2.0;
+// Spread of the pressure match curve in log-pressure units. Smaller values make
+// pressure matter more and narrow the usable band around the matched pressure.
+const TIRE_PRESSURE_SIGMA: Real = 1.4;
+// A wheel barely touching the ground has no meaningful matched pressure, so its
+// load ratio is floored before the curve is evaluated.
+const TIRE_PRESSURE_MIN_LOAD_RATIO: Real = 0.15;
+
 const SLIDING_START_SPEED: Real = 4.0;
 const SLIDING_FULL_SPEED: Real = 8.0;
 const RECOVERY_THRESHOLD: Real = 0.94;
 const RECOVERY_BASE_RATE: Real = 0.15;
 const RECOVERY_RATE: Real = 0.3;
+
+/// Grip multiplier for a tire running `pressure` bar while carrying `load` newtons,
+/// against the `static_load` it carries at rest.
+///
+/// A tire holds its ideal contact patch when pressure rises in step with load, so
+/// the matched pressure is the reference scaled by the load ratio. Grip falls off
+/// either side of that match: an underinflated tire rolls onto its shoulders, an
+/// overinflated one crowns onto its centre. The curve is normalized so that the
+/// reference pressure returns exactly one at every load, which keeps the tire
+/// tables the sole ceiling and confines this term to pressure tuning alone.
+fn tire_pressure_grip(pressure: Real, load: Real, static_load: Real) -> Real {
+    if !pressure.is_finite() || pressure <= 0.0 || !static_load.is_finite() || static_load <= 0.0 {
+        return 1.0;
+    }
+    let load_ratio = if load.is_finite() && load > 0.0 {
+        (load / static_load).max(TIRE_PRESSURE_MIN_LOAD_RATIO)
+    } else {
+        TIRE_PRESSURE_MIN_LOAD_RATIO
+    };
+    let deviation = (pressure / TIRE_PRESSURE_REFERENCE).ln();
+    let matched = load_ratio.ln();
+    let exponent = deviation * (2.0 * matched - deviation)
+        / (2.0 * TIRE_PRESSURE_SIGMA * TIRE_PRESSURE_SIGMA);
+    let grip = exponent.exp();
+    if grip.is_finite() { grip } else { 1.0 }
+}
 
 fn longitudinal_slip_amount(speed: Real) -> Real {
     let amount = ((speed - SLIDING_START_SPEED) / (SLIDING_FULL_SPEED - SLIDING_START_SPEED))
@@ -301,6 +337,9 @@ pub struct Wheel {
     pub suspension_compression_rate: Real,
     /// The type of tire for friction calculations
     pub tire_type: String,
+    /// Tire inflation pressure in bar, scaling grip by how well it matches the
+    /// load this wheel is carrying. The reference pressure is grip-neutral.
+    pub pressure: Real,
     /// The wheel's role in the vehicle drivetrain.
     pub role: WheelRole,
 }
@@ -362,6 +401,7 @@ impl Wheel {
             forward_impulse: 0.0,
             lock: false,
             tire_type: info.tire_type,
+            pressure: TIRE_PRESSURE_REFERENCE,
             suspension_compression_rate: 0.0,
             ground_friction: 1.0,
             ground_type: String::new(),
@@ -1004,6 +1044,36 @@ impl DynamicRayCastVehicleController {
             if self.tire_types.contains_key(tire_type_name) {
                 wheel.tire_type = tire_type_name.to_string();
             }
+        }
+    }
+
+    /// The i-th wheel's inflation pressure, in bar.
+    pub fn wheel_pressure(&self, wheel_index: usize) -> Option<Real> {
+        self.wheels.get(wheel_index).map(|wheel| wheel.pressure)
+    }
+
+    /// The braking, stability, aerodynamic and damping parameters in force.
+    pub fn dynamics(&self) -> &VehicleDynamicsConfig {
+        &self.powertrain.config.dynamics
+    }
+
+    /// Replaces those parameters on a running vehicle.
+    ///
+    /// Fitting different tires changes how much the car drags as well as how much
+    /// it grips, and a car in the pits cannot be rebuilt without losing the wheel,
+    /// clutch and assist state it is carrying.
+    pub fn set_dynamics(&mut self, dynamics: VehicleDynamicsConfig) {
+        self.powertrain.config.dynamics = dynamics;
+    }
+
+    /// Sets the i-th wheel's inflation pressure, in bar. Non-finite and
+    /// non-positive values are ignored, leaving the previous pressure in place.
+    pub fn set_wheel_pressure(&mut self, wheel_index: usize, pressure: Real) {
+        if !pressure.is_finite() || pressure <= 0.0 {
+            return;
+        }
+        if let Some(wheel) = self.wheels.get_mut(wheel_index) {
+            wheel.pressure = pressure;
         }
     }
 
@@ -2100,12 +2170,22 @@ impl DynamicRayCastVehicleController {
         self.axle.resize(num_wheels, Default::default());
         let mut contacts = vec![WheelContactState::default(); num_wheels];
 
-        let (esc_intervention, esc_side_axis, chassis_forward) = {
+        let (esc_intervention, esc_side_axis, chassis_forward, static_wheel_load) = {
             let chassis = &bodies[self.chassis];
             let intervention = self.esc_intervention(chassis);
             let rotation = chassis.position().rotation;
             let chassis_forward = rotation * Vector::ith(self.index_forward_axis, 1.0);
-            (intervention, self.side_axis(), chassis_forward)
+            // The load each wheel carries at rest, used as the reference the tire
+            // pressure curve matches against. Weight distribution is deliberately
+            // ignored: an axle carrying more than its even share simply sits above
+            // its reference load and wants more pressure, which is the real effect.
+            let static_wheel_load = chassis.mass() * 9.81 / num_wheels as Real;
+            (
+                intervention,
+                self.side_axis(),
+                chassis_forward,
+                static_wheel_load,
+            )
         };
         self.powertrain.state_mut().esc_activity = esc_intervention.activity;
 
@@ -2167,8 +2247,10 @@ impl DynamicRayCastVehicleController {
                 .wheel_suspension_force
                 .min(wheel.max_suspension_force)
                 .max(0.0);
+            let pressure_grip =
+                tire_pressure_grip(wheel.pressure, suspension_force, static_wheel_load);
             let peak_friction_limit =
-                suspension_force * dt * wheel.ground_friction * wheel.friction_slip;
+                suspension_force * dt * wheel.ground_friction * wheel.friction_slip * pressure_grip;
             contacts[wheel_id] = WheelContactState {
                 is_grounded: true,
                 ground_object: Some(ground_object),
@@ -3967,6 +4049,156 @@ fn solve_with_grip_recovery(
 mod tests {
     use super::*;
     use crate::dynamics::RigidBodyBuilder;
+
+    const TIRE_PRESSURE_MIN: Real = 1.0;
+    const TIRE_PRESSURE_MAX: Real = 3.8;
+
+    #[test]
+    fn reference_tire_pressure_is_grip_neutral_at_every_load() {
+        let static_load = 2600.0;
+        let mut load_ratio = 0.05;
+        while load_ratio <= 4.0 {
+            let grip = tire_pressure_grip(
+                TIRE_PRESSURE_REFERENCE,
+                static_load * load_ratio,
+                static_load,
+            );
+            assert_eq!(
+                grip, 1.0,
+                "reference pressure must not alter grip at load ratio {load_ratio}"
+            );
+            load_ratio += 0.0001;
+        }
+    }
+
+    #[test]
+    fn tire_pressure_grip_peaks_where_pressure_matches_load() {
+        let static_load = 2600.0;
+        for load_ratio in [0.5, 1.0, 1.5] {
+            let load = static_load * load_ratio;
+            let matched = TIRE_PRESSURE_REFERENCE * load_ratio;
+            let best = tire_pressure_grip(matched, load, static_load);
+            for offset in [-0.6, -0.25, 0.25, 0.6] {
+                let other = tire_pressure_grip(matched + offset, load, static_load);
+                assert!(
+                    best > other,
+                    "matched pressure {matched} must beat {} at load ratio {load_ratio}",
+                    matched + offset
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn higher_pressure_wins_under_load_and_loses_when_light() {
+        let static_load = 2600.0;
+        let low = tire_pressure_grip(3.0, static_load * 2.0, static_load);
+        let high = tire_pressure_grip(3.0, static_load * 0.4, static_load);
+        assert!(low > 1.0, "high pressure must gain grip under heavy load");
+        assert!(high < 1.0, "high pressure must lose grip on a light wheel");
+
+        let soft_loaded = tire_pressure_grip(1.2, static_load * 2.0, static_load);
+        let soft_light = tire_pressure_grip(1.2, static_load * 0.4, static_load);
+        assert!(soft_loaded < 1.0, "low pressure must lose grip under load");
+        assert!(soft_light > 1.0, "low pressure must gain grip when light");
+    }
+
+    #[test]
+    fn tire_grip_force_never_falls_as_load_rises() {
+        let static_load = 2600.0;
+        let mut pressure = TIRE_PRESSURE_MIN;
+        while pressure <= TIRE_PRESSURE_MAX {
+            let mut load_ratio = 0.02;
+            let mut previous = -1.0;
+            while load_ratio <= 3.0 {
+                let load = static_load * load_ratio;
+                let force = load * tire_pressure_grip(pressure, load, static_load);
+                assert!(
+                    force >= previous - 1.0e-6,
+                    "grip force dropped as load rose at {pressure} bar, ratio {load_ratio}"
+                );
+                previous = force;
+                load_ratio += 0.005;
+            }
+            pressure += 0.01;
+        }
+    }
+
+    #[test]
+    fn tire_pressure_grip_stays_finite_across_the_whole_range() {
+        let static_load = 2600.0;
+        let mut pressure = TIRE_PRESSURE_MIN;
+        while pressure <= TIRE_PRESSURE_MAX {
+            for load_ratio in [0.0, 0.001, 0.15, 0.6, 1.0, 2.0, 3.0] {
+                let grip = tire_pressure_grip(pressure, static_load * load_ratio, static_load);
+                assert!(
+                    grip.is_finite() && grip > 0.0,
+                    "grip must stay finite and positive at {pressure} bar, ratio {load_ratio}"
+                );
+            }
+            pressure += 0.001;
+        }
+    }
+
+    #[test]
+    fn airborne_and_invalid_inputs_leave_grip_untouched() {
+        assert_eq!(tire_pressure_grip(2.0, 0.0, 2600.0), 1.0);
+        assert_eq!(tire_pressure_grip(Real::NAN, 2600.0, 2600.0), 1.0);
+        assert_eq!(tire_pressure_grip(0.0, 2600.0, 2600.0), 1.0);
+        assert_eq!(tire_pressure_grip(2.0, 2600.0, 0.0), 1.0);
+        // A wheel barely touching the ground is floored, not extrapolated.
+        let floored = tire_pressure_grip(1.0, 2600.0 * 1.0e-9, 2600.0);
+        let at_floor = tire_pressure_grip(1.0, 2600.0 * TIRE_PRESSURE_MIN_LOAD_RATIO, 2600.0);
+        assert_eq!(floored, at_floor);
+    }
+
+    #[test]
+    fn dynamics_can_be_replaced_on_a_running_vehicle() {
+        // A pit stop refits tires that drag differently, and the car cannot be
+        // rebuilt mid-race without losing the state it is carrying.
+        let mut controller = DynamicRayCastVehicleController::new(
+            RigidBodyHandle::invalid(),
+            VehicleControllerConfig::default(),
+        );
+        let original = controller.dynamics().rolling_resistance;
+        let mut swapped = controller.dynamics().clone();
+        swapped.rolling_resistance = original * 1.5;
+        swapped.drag_coefficient = 0.42;
+        controller.set_dynamics(swapped);
+        assert_eq!(controller.dynamics().rolling_resistance, original * 1.5);
+        assert_eq!(controller.dynamics().drag_coefficient, 0.42);
+        // Untouched fields survive the swap rather than reverting to defaults.
+        assert_eq!(
+            controller.dynamics().brake_bias,
+            VehicleControllerConfig::default().dynamics.brake_bias
+        );
+    }
+
+    #[test]
+    fn wheel_pressure_setter_rejects_invalid_values() {
+        let mut controller = DynamicRayCastVehicleController::new(
+            RigidBodyHandle::invalid(),
+            VehicleControllerConfig::default(),
+        );
+        controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            0.3,
+            0.33,
+            0.2,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Front, true, true),
+        );
+        assert_eq!(controller.wheel_pressure(0), Some(TIRE_PRESSURE_REFERENCE));
+        controller.set_wheel_pressure(0, 3.4);
+        assert_eq!(controller.wheel_pressure(0), Some(3.4));
+        controller.set_wheel_pressure(0, Real::NAN);
+        controller.set_wheel_pressure(0, 0.0);
+        controller.set_wheel_pressure(0, -1.0);
+        assert_eq!(controller.wheel_pressure(0), Some(3.4));
+        assert_eq!(controller.wheel_pressure(1), None);
+    }
 
     #[test]
     fn downforce_drag_uses_active_load_and_opposes_motion() {
