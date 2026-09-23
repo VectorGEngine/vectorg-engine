@@ -49,7 +49,8 @@ fn offsets(kind: &str, camber_deg: f32) -> Vec<f32> {
             QueryFilter::default().exclude_rigid_body(v.chassis));
         p.step(&(-Vector::y()*9.81), &par, &mut il, &mut bp, &mut np, &mut bodies,
             &mut colliders, &mut ij, &mut mj, &mut cc, Some(&mut q), &(), &());
-        v.finish_vehicle_update(&mut bodies);
+        v.finish_vehicle_update(&mut bodies, &colliders, &q,
+            QueryFilter::default().exclude_rigid_body(v.chassis));
     }
     v.wheels().iter().map(|w| (w.raycast_info().contact_point_ws.x - w.center().x)*1000.0).collect()
 }

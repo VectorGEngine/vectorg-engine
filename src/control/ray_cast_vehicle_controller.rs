@@ -1,5 +1,5 @@
 use crate::dynamics::{RigidBody, RigidBodyHandle, RigidBodySet};
-use crate::geometry::{ColliderHandle, ColliderSet};
+use crate::geometry::{ColliderHandle, ColliderSet, Ray};
 use crate::math::{Point, Real, Rotation, Vector, DIM};
 use crate::pipeline::{QueryFilter, QueryPipeline};
 use crate::utils::SimdDot;
@@ -23,6 +23,11 @@ const COUNTER_STEER_ASSIST_RELEASE_RESPONSE: Real = 15.0;
 const COUNTER_STEER_ASSIST_YAW_DAMPING: Real = 0.08;
 const COUNTER_STEER_ASSIST_INPUT_DEADZONE: Real = 0.01;
 const WHEEL_REFERENCE_RADIUS: Real = 0.35;
+/// The tread probe reaches this multiple of the wheel radius below the wheel
+/// centre. The physics wheel is rigid and its sweep stops the instant it touches,
+/// so a renderer that wants to squash a tire gradually needs to know the distance
+/// to the road before the wheel arrives at it.
+const TREAD_PROBE_RADIUS_FACTOR: Real = 2.0;
 const WHEEL_EFFECTIVE_INERTIA: Real = 1.5;
 const WHEEL_STOP_EPSILON: Real = 1.0e-4;
 // Numerical allowance for a rolling constraint, in meters per second.
@@ -340,6 +345,14 @@ pub struct Wheel {
     /// Tire inflation pressure in bar, scaling grip by how well it matches the
     /// load this wheel is carrying. The reference pressure is grip-neutral.
     pub pressure: Real,
+    /// Distance from the wheel centre to the road along the suspension, found by a
+    /// probe that reaches past the wheel itself. With nothing in range it is the
+    /// probe's full reach rather than an absence, so the value is always a real
+    /// distance a renderer can place a plane at: out there it is further from the
+    /// wheel than the wheel is round, so it cannot touch the tire. Physics never
+    /// reads this; it exists so a renderer can deform the tire.
+    tread_distance: Real,
+    tread_normal: Vector<Real>,
     /// The wheel's role in the vehicle drivetrain.
     pub role: WheelRole,
 }
@@ -402,6 +415,8 @@ impl Wheel {
             lock: false,
             tire_type: info.tire_type,
             pressure: TIRE_PRESSURE_REFERENCE,
+            tread_distance: 0.0,
+            tread_normal: Vector::y(),
             suspension_compression_rate: 0.0,
             ground_friction: 1.0,
             ground_type: String::new(),
@@ -1047,6 +1062,24 @@ impl DynamicRayCastVehicleController {
         }
     }
 
+    /// Distance from the i-th wheel's centre to the road, along its suspension.
+    ///
+    /// Found by a probe that reaches past the wheel, so it is known before the
+    /// wheel arrives. With no road within reach this is the probe's full reach, not
+    /// an absence: a renderer then puts its contact plane further down than the
+    /// wheel is round, which is exactly where an untouched tire wants it. `None`
+    /// only for a wheel that does not exist. Physics does not use this; a renderer
+    /// deforming the tire does.
+    pub fn wheel_tread_distance(&self, wheel_index: usize) -> Option<Real> {
+        self.wheels.get(wheel_index).map(|w| w.tread_distance)
+    }
+
+    /// The outward surface normal the tread probe found, or the wheel's own up
+    /// direction when it found nothing.
+    pub fn wheel_tread_normal(&self, wheel_index: usize) -> Option<Vector<Real>> {
+        self.wheels.get(wheel_index).map(|w| w.tread_normal)
+    }
+
     /// The i-th wheel's inflation pressure, in bar.
     pub fn wheel_pressure(&self, wheel_index: usize) -> Option<Real> {
         self.wheels.get(wheel_index).map(|wheel| wheel.pressure)
@@ -1354,6 +1387,45 @@ impl DynamicRayCastVehicleController {
         // Raycasting just solved this tick's travel; do not expose the previous length.
         wheel.center = wheel.raycast_info.hard_point_ws
             + wheel.wheel_direction_ws * wheel.raycast_info.suspension_length;
+
+        // The suspension sweep stops the moment the rigid wheel touches, so it can
+        // never report a road the wheel has not reached. This probe can, which is
+        // what lets a renderer squash the tire in step with how far it is pressed.
+        // Always a finite, non-negative reach, because it is also what gets reported
+        // when the probe finds nothing, and a distance is no use to a renderer if it
+        // can come back as NaN.
+        let reach = {
+            let candidate = wheel.radius * TREAD_PROBE_RADIUS_FACTOR;
+            if candidate.is_finite() { candidate.max(0.0) } else { 0.0 }
+        };
+        let ray = Ray::new(wheel.center, wheel.wheel_direction_ws);
+        let hit = if reach > 0.0 {
+            queries.cast_ray_and_get_normal(bodies, colliders, &ray, reach, true, filter)
+        } else {
+            None
+        };
+        match hit {
+            Some((_, intersection)) => {
+                wheel.tread_distance = intersection.time_of_impact;
+                // Point out of the surface, whichever face the probe entered.
+                let facing = intersection.normal.dot(&wheel.wheel_direction_ws);
+                wheel.tread_normal = if facing > 0.0 {
+                    -intersection.normal
+                } else {
+                    intersection.normal
+                };
+            }
+            None => {
+                // Nothing in range reads as the far end of the probe rather than as
+                // an absence. That is past the wheel's own radius, so a renderer
+                // placing its plane there leaves the tire alone, and it can do so
+                // without a special case for empty air. Reporting nothing instead
+                // forced every reader to invent a distance, and interpolating across
+                // the gap on playback snapped the plane in from wherever it landed.
+                wheel.tread_distance = reach;
+                wheel.tread_normal = -wheel.wheel_direction_ws;
+            }
+        }
     }
 
     fn driven_axles(&self) -> [Vec<usize>; 2] {
@@ -1900,7 +1972,7 @@ impl DynamicRayCastVehicleController {
         queries: &QueryPipeline,
         filter: QueryFilter,
     ) {
-        self.finish_vehicle_update(bodies);
+        self.restore_chassis_gravity(bodies);
         if dt <= 0.0 {
             return;
         }
@@ -1988,7 +2060,34 @@ impl DynamicRayCastVehicleController {
     }
 
     /// Completes the vehicle tick after stepping the world.
-    pub fn finish_vehicle_update(&mut self, bodies: &mut RigidBodySet) {
+    /// Closes the step: restores chassis gravity, then re-measures every wheel.
+    ///
+    /// The suspension was cast at the start of the step, from the pose the chassis had
+    /// then, and the solver has since moved it. Anything reading a wheel now - a
+    /// renderer placing the tire, telemetry recording it - would otherwise hold a
+    /// length belonging to a pose the car has already left, and on a landing that
+    /// draws the tire well inside the road until the motion settles.
+    ///
+    /// The second measurement applies no force and touches no velocity, so the
+    /// simulation is unchanged: nothing moves between here and the next step's cast,
+    /// which therefore reaches the same answer.
+    pub fn finish_vehicle_update(
+        &mut self,
+        bodies: &mut RigidBodySet,
+        colliders: &ColliderSet,
+        queries: &QueryPipeline,
+        filter: QueryFilter,
+    ) {
+        self.restore_chassis_gravity(bodies);
+        let chassis = &bodies[self.chassis];
+        for wheel_id in 0..self.wheels.len() {
+            self.update_wheel_transform(chassis, wheel_id);
+            self.suspension_cast(bodies, colliders, queries, filter, chassis, wheel_id);
+        }
+    }
+
+    /// Hands the chassis back to the world's own gravity after a step it drove itself.
+    fn restore_chassis_gravity(&mut self, bodies: &mut RigidBodySet) {
         let Some(scale) = self.pending_gravity_scale.take() else {
             return;
         };
@@ -4150,6 +4249,148 @@ mod tests {
         let floored = tire_pressure_grip(1.0, 2600.0 * 1.0e-9, 2600.0);
         let at_floor = tire_pressure_grip(1.0, 2600.0 * TIRE_PRESSURE_MIN_LOAD_RATIO, 2600.0);
         assert_eq!(floored, at_floor);
+    }
+
+    /// One wheel hanging at a chosen height over flat ground, with the probe's own
+    /// reach the only thing limiting what it can see.
+    fn tread_probe_case(
+        ground_depth: Real,
+        radius: Real,
+    ) -> (DynamicRayCastVehicleController, Option<Real>) {
+        use crate::geometry::ColliderBuilder;
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let chassis = bodies.insert(RigidBodyBuilder::fixed().translation(Vector::zeros()));
+        let mut controller =
+            DynamicRayCastVehicleController::new(chassis, VehicleControllerConfig::default());
+        controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            0.3,
+            radius,
+            0.2,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Front, false, false),
+        );
+        colliders.insert(
+            ColliderBuilder::cuboid(10.0, 0.05, 10.0)
+                .translation(Vector::new(0.0, ground_depth - 0.05, 0.0)),
+        );
+        let mut queries = QueryPipeline::new();
+        queries.update(&colliders);
+        controller.update_vehicle(
+            1.0 / 60.0,
+            &Vector::zeros(),
+            &mut bodies,
+            &colliders,
+            &queries,
+            QueryFilter::default(),
+        );
+        let distance = controller.wheel_tread_distance(0);
+        (controller, distance)
+    }
+
+    #[test]
+    fn the_tread_probe_measures_the_road_before_the_wheel_reaches_it() {
+        // The rigid wheel's own sweep stops on touch, so it can only ever report the
+        // radius. The probe has to see further for a tire to squash gradually.
+        let radius = 0.2;
+        // Approaching the road but not yet on it: the wheel hangs at its rest length
+        // and the probe closes on the surface. This is the window a renderer needs,
+        // because a tire mesh larger than the rigid wheel is already touching here.
+        let mut previous = Real::MAX;
+        for depth in [-0.60, -0.57, -0.54, -0.51] {
+            let measured = tread_probe_case(depth, radius)
+                .1
+                .expect("ground within reach must be measured");
+            assert!(
+                measured < previous,
+                "probe distance must fall as the road rises: depth {depth} gave {measured}"
+            );
+            assert!(
+                measured <= radius * TREAD_PROBE_RADIUS_FACTOR + 1.0e-4,
+                "probe cannot see past its reach: {measured}"
+            );
+            previous = measured;
+        }
+        // Once the wheel is on the road its own sweep holds it exactly a radius
+        // clear, so the probe reads the radius however much further the road rises.
+        for depth in [-0.45, -0.40, -0.35] {
+            let measured = tread_probe_case(depth, radius)
+                .1
+                .expect("ground under the wheel must be measured");
+            assert!(
+                (measured - radius).abs() < 1.0e-4,
+                "a grounded wheel sits a radius clear: depth {depth} gave {measured}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tread_probe_reports_its_full_reach_past_the_road() {
+        // An empty probe reports how far it looked, not an absence. A renderer can
+        // put its contact plane at that distance unconditionally: it is twice the
+        // radius away, so it sits below the tire and leaves it undeformed, which is
+        // what an airborne wheel should look like. Reporting nothing instead left
+        // every reader to invent a distance, and the one it invented put the plane
+        // through the middle of the tire.
+        let radius = 0.2;
+        let reach = radius * TREAD_PROBE_RADIUS_FACTOR;
+        for depth in [-20.0, -5.0, -1.5] {
+            let (controller, distance) = tread_probe_case(depth, radius);
+            let measured = distance.expect("every wheel reports a distance");
+            assert!(
+                (measured - reach).abs() < 1.0e-6,
+                "empty air must read as the full reach: depth {depth} gave {measured}"
+            );
+            // Further from the wheel than the wheel is round, so nothing can squash.
+            assert!(measured > radius, "the empty reading must clear the tire");
+            // The fallback normal is the wheel's own up direction, never a stale surface.
+            let normal = controller.wheel_tread_normal(0).expect("a wheel has a normal");
+            assert!((normal - Vector::y()).norm() < 1.0e-6, "normal={normal:?}");
+        }
+    }
+
+    #[test]
+    fn the_tread_probe_distance_is_continuous_as_the_road_comes_into_reach() {
+        // The gap between "nothing there" and a measurement was where playback
+        // snapped: interpolating across it jumped the plane in from wherever the
+        // neighbouring frame put it. Reporting the reach closes the gap, so the
+        // distance only ever walks smoothly down from it.
+        let radius = 0.2;
+        let reach = radius * TREAD_PROBE_RADIUS_FACTOR;
+        let mut previous = reach;
+        // Rest length 0.3 puts the centre 0.3 below the mount, so these depths walk
+        // the road up from out of reach to under the wheel.
+        for depth in [-1.0, -0.72, -0.70, -0.65, -0.60, -0.55, -0.50] {
+            let measured = tread_probe_case(depth, radius)
+                .1
+                .expect("every wheel reports a distance");
+            assert!(measured <= previous + 1.0e-6,
+                "distance must never rise as the road nears: depth {depth} gave {measured}");
+            assert!(measured <= reach + 1.0e-6, "cannot see past its reach: {measured}");
+            assert!(measured > 0.0, "the road is never at the wheel centre: {measured}");
+            previous = measured;
+        }
+        assert!(previous < reach, "the road must have come into reach by the end");
+    }
+
+    #[test]
+    fn the_tread_probe_normal_faces_out_of_the_road() {
+        let (controller, distance) = tread_probe_case(-0.5, 0.2);
+        assert!(distance.is_some());
+        let normal = controller.wheel_tread_normal(0).expect("a wheel has a normal");
+        // Opposing the suspension direction, so a renderer can clamp against it.
+        assert!(normal.dot(&-Vector::y()) < 0.0, "normal={normal:?}");
+        assert!((normal - Vector::y()).norm() < 1.0e-4, "normal={normal:?}");
+    }
+
+    #[test]
+    fn the_tread_probe_is_absent_only_for_a_wheel_that_does_not_exist() {
+        let (controller, _) = tread_probe_case(-0.5, 0.2);
+        assert_eq!(controller.wheel_tread_distance(1), None);
+        assert_eq!(controller.wheel_tread_normal(1), None);
     }
 
     #[test]
@@ -7462,19 +7703,29 @@ mod tests {
                         assert!((wheel.raycast_info.suspension_length - length).abs() < 2.0e-5);
                         assert!((wheel.center - expected_center).norm() < 2.0e-5);
                         let contact = wheel.raycast_info.contact_point_ws;
-                        let radial = contact - wheel.center;
                         assert!(
                             normal.dot(&contact.coords).abs() < 2.0e-5,
                             "contact must lie on the road"
                         );
-                        assert!(
-                            ((radial - world_axle * radial.dot(&world_axle)).norm() - radius).abs()
-                                < 2.0e-5,
-                            "contact must lie on the tire"
+                        // The reported contact walks across the tread with lean
+                        // (tread_slide) instead of snapping to the rigid rim edge, so
+                        // it no longer sits at a fixed `radius`/`width/2` offset from
+                        // the wheel center: it is the wheel center, moved down onto
+                        // the road plane, then nudged by the tread's lateral creep.
+                        // This pins the exact contact location under that model,
+                        // superseding the old fixed-offset bounds.
+                        let axial = normal.dot(&world_axle);
+                        let expected_offset = crate::control::wheel_contact::tread_slide(
+                            0.2,
+                            &world_axle,
+                            &normal,
+                            axial,
                         );
+                        let expected_contact =
+                            wheel.center - expected_offset - normal * support_height;
                         assert!(
-                            radial.dot(&world_axle).abs() <= 0.1 + 2.0e-5,
-                            "contact must lie within tire width"
+                            (contact - expected_contact).norm() < 2.0e-5,
+                            "contact must match the tread-crown offset from the wheel center"
                         );
                     }
                 }

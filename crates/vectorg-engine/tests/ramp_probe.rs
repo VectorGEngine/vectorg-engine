@@ -57,7 +57,8 @@ fn run(trimesh: bool) {
             QueryFilter::default().exclude_rigid_body(v.chassis));
         p.step(&(-Vector::y() * 9.81), &par, &mut il, &mut bp, &mut np, bodies, colliders,
             &mut ij, &mut mj, &mut cc, Some(q), &(), &());
-        v.finish_vehicle_update(bodies);
+        v.finish_vehicle_update(bodies, colliders, q,
+            QueryFilter::default().exclude_rigid_body(v.chassis));
     };
     for _ in 0..hz { tick(&mut bodies, &mut colliders, &mut q, &mut v); }
 

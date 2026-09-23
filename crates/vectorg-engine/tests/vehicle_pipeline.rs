@@ -134,7 +134,12 @@ impl Scene {
             &(),
             &(),
         );
-        self.vehicle.finish_vehicle_update(&mut self.bodies);
+        self.vehicle.finish_vehicle_update(
+            &mut self.bodies,
+            &self.colliders,
+            &self.queries,
+            QueryFilter::default(),
+        );
     }
 
     fn position(&self) -> Vector<f32> {
@@ -453,7 +458,12 @@ fn vehicle_preserves_custom_gravity_scale_and_zero_timestep() {
         assert_eq!(scene.bodies[handle].gravity_scale(), scale);
         let expected = -9.81 * scale / 60.0 / (1.0 + scene.bodies[handle].linear_damping() / 60.0);
         assert!((scene.bodies[handle].linvel().y - expected).abs() < 0.00001);
-        scene.vehicle.finish_vehicle_update(&mut scene.bodies);
+        scene.vehicle.finish_vehicle_update(
+            &mut scene.bodies,
+            &scene.colliders,
+            &scene.queries,
+            QueryFilter::default(),
+        );
         assert_eq!(scene.bodies[handle].gravity_scale(), scale);
     }
 }
