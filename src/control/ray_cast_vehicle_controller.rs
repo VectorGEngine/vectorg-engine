@@ -1,6 +1,6 @@
 use crate::dynamics::{RigidBody, RigidBodyHandle, RigidBodySet};
 use crate::geometry::{ColliderHandle, ColliderSet, Ray};
-use crate::math::{Point, Real, Rotation, Vector, DIM};
+use crate::math::{Isometry, Point, Real, Rotation, Vector, DIM};
 use crate::pipeline::{QueryFilter, QueryPipeline};
 use crate::utils::SimdDot;
 use std::collections::HashMap;
@@ -156,9 +156,13 @@ pub struct WheelTuning {
     ///
     /// Increase this value if the suspension appears to overshoot.
     pub suspension_damping: Real,
-    /// The maximum compression travel from the rest length. The suspension never
-    /// extends past its rest length.
-    pub max_suspension_travel: Real,
+    /// How far the suspension compresses from its rest length before the rigid
+    /// bump stop.
+    pub suspension_bump_travel: Real,
+    /// How far the suspension extends from its rest length before full droop.
+    pub suspension_droop_travel: Real,
+    /// Mass-normalized spring force at the rest length, in the stiffness units.
+    pub suspension_preload: Real,
     /// Parameter controlling how much traction the tire has.
     ///
     /// The larger the value, the more instantaneous braking will happen (with the risk of
@@ -176,7 +180,9 @@ impl Default for WheelTuning {
             suspension_stiffness: 5.88,
             suspension_compression: 0.83,
             suspension_damping: 0.88,
-            max_suspension_travel: 5.0,
+            suspension_bump_travel: 5.0,
+            suspension_droop_travel: 0.0,
+            suspension_preload: 0.0,
             friction_slip: 10.5,
             max_suspension_force: 6000.0,
             tire_type: "default".to_string(),
@@ -194,12 +200,14 @@ struct WheelDesc {
     pub direction_cs: Vector<Real>,
     /// The wheel’s axle axis, relative to the chassis.
     pub axle_cs: Vector<Real>,
-    /// The rest length of the wheel’s suspension spring, where it applies no force.
-    /// This is also full droop: the airborne length and the longest supported contact.
+    /// The suspension length where the spring applies its preload.
     pub suspension_rest_length: Real,
-    /// The maximum compression travel from the rest length. The suspension never
-    /// extends past its rest length.
-    pub max_suspension_travel: Real,
+    /// Compression from the rest length to the rigid bump stop.
+    pub suspension_bump_travel: Real,
+    /// Extension from the rest length to full droop.
+    pub suspension_droop_travel: Real,
+    /// Mass-normalized spring force at the rest length.
+    pub suspension_preload: Real,
     /// The wheel’s radius.
     pub radius: Real,
     /// Full tire width along the axle, centered on the tire center.
@@ -252,12 +260,23 @@ pub struct Wheel {
     pub direction_cs: Vector<Real>,
     /// The wheel’s axle axis, relative to the chassis.
     pub axle_cs: Vector<Real>,
-    /// The rest length of the wheel’s suspension spring, where it applies no force.
-    /// This is also full droop: the airborne length and the longest supported contact.
+    /// The suspension length (mount to joint) where the spring applies exactly its
+    /// preload. With a preload matching the wheel's static load, the parked car
+    /// sits here.
     pub suspension_rest_length: Real,
-    /// The maximum compression travel from the rest length. The suspension never
-    /// extends past its rest length.
-    pub max_suspension_travel: Real,
+    /// Compression from the rest length to the rigid bump stop. The suspension
+    /// never gets shorter than `rest - bump`.
+    pub suspension_bump_travel: Real,
+    /// Extension from the rest length to full droop: the airborne length and the
+    /// longest supported contact are `rest + droop`.
+    pub suspension_droop_travel: Real,
+    /// Mass-normalized spring force at the rest length, in the stiffness units
+    /// (force per chassis mass). Zero leaves the spring unloaded at rest.
+    pub suspension_preload: Real,
+    // Optional rigid arm the wheel swings on instead of sliding along `direction_cs`.
+    suspension_arm: Option<SuspensionArm>,
+    // The contact reached the bump stop in the last cast.
+    bump_stop_contact: bool,
     /// The wheel’s radius.
     pub radius: Real,
     /// Full tire width along the axle, centered on the tire center.
@@ -340,7 +359,7 @@ pub struct Wheel {
     pub ground_friction: Real,
     /// The type of ground this wheel is currently on.
     pub ground_type: String,
-    /// The suspension compression ratio, where 1.0 means the suspension is at its rest length.
+    /// Position within the suspension travel: 0.0 at full droop, 1.0 on the bump stop.
     pub suspension_compression_rate: Real,
     /// The type of tire for friction calculations
     pub tire_type: String,
@@ -365,7 +384,11 @@ impl Wheel {
             raycast_info: RayCastInfo::default(),
             debug: WheelDebug::default(),
             suspension_rest_length: info.suspension_rest_length,
-            max_suspension_travel: info.max_suspension_travel,
+            suspension_bump_travel: info.suspension_bump_travel,
+            suspension_droop_travel: info.suspension_droop_travel,
+            suspension_preload: info.suspension_preload,
+            suspension_arm: None,
+            bump_stop_contact: false,
             radius: info.radius,
             width: info.width,
             suspension_stiffness: info.suspension_stiffness,
@@ -459,6 +482,7 @@ impl Wheel {
         self.contact_forward_speed = 0.0;
         self.contact_side_speed = 0.0;
         self.wheel_suspension_force = 0.0;
+        self.bump_stop_contact = false;
         self.skid_info = 0.0;
         self.last_skid_info = 0.0;
         self.sliding_grip = 1.0;
@@ -561,6 +585,266 @@ impl Wheel {
     /// The world-space direction of the wheel’s axle.
     pub fn axle(&self) -> Vector<Real> {
         self.wheel_axle_ws
+    }
+
+    /// The shortest (bump stop) and longest (full droop) suspension lengths.
+    pub fn suspension_length_limits(&self) -> (Real, Real) {
+        let min = (self.suspension_rest_length - self.suspension_bump_travel).max(0.0);
+        let max = (self.suspension_rest_length + self.suspension_droop_travel).max(min);
+        match &self.suspension_arm {
+            // The arm cannot reach lengths outside its triangle inequality.
+            Some(arm) => {
+                let (reach_min, reach_max) = arm.length_range();
+                (
+                    min.clamp(reach_min, reach_max),
+                    max.clamp(reach_min, reach_max),
+                )
+            }
+            None => (min, max),
+        }
+    }
+
+    /// Whether the last contact reached the rigid bump stop.
+    pub fn is_on_bump_stop(&self) -> bool {
+        self.bump_stop_contact
+    }
+
+    /// The pivot the wheel swings about, if it rides on a suspension arm.
+    pub fn suspension_pivot_cs(&self) -> Option<Point<Real>> {
+        self.suspension_arm.as_ref().map(|arm| arm.pivot_cs)
+    }
+
+    /// Whether the wheel's hub tilts with its suspension arm.
+    pub fn suspension_arm_tilts(&self) -> bool {
+        self.suspension_arm.as_ref().map_or(false, |arm| arm.tilt)
+    }
+
+    /// Swings the joint on a rigid arm about `pivot_cs` instead of sliding it along
+    /// `direction_cs`. The arm rotates about `cross(mount - pivot, joint - pivot)`,
+    /// where the joint is `reference_length` from the mount along `direction_cs`:
+    /// the authored pose, which is also where `tilt` leaves the hub unrotated.
+    /// Suspension lengths stay mount-to-joint distances.
+    ///
+    /// Set the travel limits first; they are checked against the arm's geometry.
+    pub fn set_suspension_arm(
+        &mut self,
+        pivot_cs: Point<Real>,
+        reference_length: Real,
+        tilt: bool,
+    ) -> Result<(), &'static str> {
+        let arm = SuspensionArm::new(
+            pivot_cs,
+            self.chassis_connection_point_cs,
+            self.direction_cs,
+            reference_length,
+            tilt,
+        )?;
+        let min = (self.suspension_rest_length - self.suspension_bump_travel).max(0.0);
+        let max = self.suspension_rest_length + self.suspension_droop_travel;
+        for length in [min, max] {
+            let angle = arm
+                .angle_at(length)
+                .ok_or("Suspension travel leaves the arm's reach")?;
+            if arm.motion_ratio(angle) < MIN_SUSPENSION_ARM_MOTION_RATIO {
+                return Err("Suspension arm motion ratio is too small at a travel limit");
+            }
+        }
+        self.suspension_arm = Some(arm);
+        Ok(())
+    }
+
+    /// Returns the wheel to the straight suspension path along `direction_cs`.
+    pub fn clear_suspension_arm(&mut self) {
+        self.suspension_arm = None;
+    }
+
+    // Travel is parametrized by length on the straight path and by arm angle on
+    // an arm, where equal steps trace the arc evenly.
+    fn travel_parameter(&self, length: Real) -> Real {
+        match &self.suspension_arm {
+            Some(arm) => arm.clamped_angle_at(length),
+            None => length,
+        }
+    }
+
+    fn travel_pose(&self, parameter: Real) -> TravelPose {
+        match &self.suspension_arm {
+            Some(arm) => arm.pose(parameter),
+            None => TravelPose {
+                length: parameter,
+                joint_cs: self.chassis_connection_point_cs + self.direction_cs * parameter,
+                tangent_cs: self.direction_cs,
+                motion_ratio: 1.0,
+                tilt_cs: Rotation::identity(),
+            },
+        }
+    }
+
+    // The travel parameters bounding each straight sweep segment, from the bump
+    // stop outward. The straight path is exact in one segment; an arc is split
+    // into chords.
+    fn travel_segments(&self, min_length: Real, max_length: Real) -> Vec<(Real, Real)> {
+        let start = self.travel_parameter(min_length);
+        let end = self.travel_parameter(max_length);
+        let count = if self.suspension_arm.is_some() {
+            SUSPENSION_ARM_SEGMENTS
+        } else {
+            1
+        };
+        (0..count)
+            .map(|i| {
+                let a = start + (end - start) * i as Real / count as Real;
+                let b = start + (end - start) * (i + 1) as Real / count as Real;
+                (a, b)
+            })
+            .collect()
+    }
+
+    fn pose_center_cs(&self, pose: &TravelPose, steering: &Rotation<Real>) -> Point<Real> {
+        pose.joint_cs + pose.tilt_cs * (steering * self.center_offset_cs)
+    }
+
+    fn pose_axle_cs(&self, pose: &TravelPose, steering: &Rotation<Real>) -> Vector<Real> {
+        pose.tilt_cs * (steering * self.axle_cs)
+    }
+
+    fn place(&mut self, chassis: &Isometry<Real>, pose: &TravelPose, steering: &Rotation<Real>) {
+        // The straight path keeps its historical ray origin: the mount carrying the
+        // steered centre offset. An arm's travel originates at its pivot.
+        self.raycast_info.hard_point_ws = match &self.suspension_arm {
+            Some(arm) => chassis * arm.pivot_cs,
+            None => chassis * (self.chassis_connection_point_cs + steering * self.center_offset_cs),
+        };
+        self.wheel_direction_ws = chassis * pose.tangent_cs;
+        self.wheel_axle_ws = chassis * self.pose_axle_cs(pose, steering);
+        self.center = chassis * self.pose_center_cs(pose, steering);
+    }
+}
+
+/// Minimum suspension-length change per metre of wheel travel along an arm. Near
+/// zero the spring can neither hold nor move the wheel.
+const MIN_SUSPENSION_ARM_MOTION_RATIO: Real = 0.1;
+/// Straight chords the ground sweep follows along an arm's arc.
+const SUSPENSION_ARM_SEGMENTS: usize = 4;
+/// A contact this close to the shortest length is resting on the bump stop.
+const BUMP_STOP_TOLERANCE: Real = 1.0e-4;
+/// Sequential passes that share the rigid bump-stop impulse between wheels.
+const BUMP_STOP_ITERATIONS: usize = 4;
+
+/// Where the joint sits for one suspension length, in chassis coordinates.
+#[derive(Copy, Clone, Debug)]
+struct TravelPose {
+    length: Real,
+    joint_cs: Point<Real>,
+    /// Unit direction the joint moves as the suspension extends.
+    tangent_cs: Vector<Real>,
+    /// Suspension-length change per metre of joint travel.
+    motion_ratio: Real,
+    /// Hub rotation relative to the authored pose.
+    tilt_cs: Rotation<Real>,
+}
+
+/// A rigid arm from a chassis pivot to the wheel joint. The spring still spans
+/// mount to joint, so its length `L` fixes the arm angle `φ` between the
+/// pivot-to-mount and pivot-to-joint directions: `L² = a² + r² − 2ar·cos φ`,
+/// one-to-one over `0 < φ < π`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct SuspensionArm {
+    pivot_cs: Point<Real>,
+    axis_cs: Vector<Real>,
+    mount_direction_cs: Vector<Real>,
+    mount_distance: Real,
+    arm_length: Real,
+    reference_angle: Real,
+    tilt: bool,
+}
+
+impl SuspensionArm {
+    fn new(
+        pivot_cs: Point<Real>,
+        mount_cs: Point<Real>,
+        direction_cs: Vector<Real>,
+        reference_length: Real,
+        tilt: bool,
+    ) -> Result<Self, &'static str> {
+        if !pivot_cs.coords.iter().all(|value| value.is_finite())
+            || !reference_length.is_finite()
+            || reference_length <= 0.0
+        {
+            return Err("Suspension arm pivot and reference length must be finite");
+        }
+        let to_mount = mount_cs - pivot_cs;
+        let to_joint = mount_cs + direction_cs * reference_length - pivot_cs;
+        let mount_distance = to_mount.norm();
+        let arm_length = to_joint.norm();
+        let normal = to_mount.cross(&to_joint);
+        let sine = normal.norm();
+        if mount_distance <= Real::EPSILON
+            || arm_length <= Real::EPSILON
+            || sine <= 1.0e-6 * mount_distance * arm_length
+        {
+            return Err("Suspension arm pivot, mount and joint must not be collinear");
+        }
+        Ok(Self {
+            pivot_cs,
+            axis_cs: normal / sine,
+            mount_direction_cs: to_mount / mount_distance,
+            mount_distance,
+            arm_length,
+            reference_angle: sine.atan2(to_mount.dot(&to_joint)),
+            tilt,
+        })
+    }
+
+    fn length_range(&self) -> (Real, Real) {
+        (
+            (self.mount_distance - self.arm_length).abs(),
+            self.mount_distance + self.arm_length,
+        )
+    }
+
+    fn cosine_at(&self, length: Real) -> Real {
+        let (a, r) = (self.mount_distance, self.arm_length);
+        (a * a + r * r - length * length) / (2.0 * a * r)
+    }
+
+    fn angle_at(&self, length: Real) -> Option<Real> {
+        let cosine = self.cosine_at(length);
+        (cosine.is_finite() && cosine.abs() < 1.0).then(|| cosine.acos())
+    }
+
+    fn clamped_angle_at(&self, length: Real) -> Real {
+        self.cosine_at(length).clamp(-1.0, 1.0).acos()
+    }
+
+    fn length_at(&self, angle: Real) -> Real {
+        let (a, r) = (self.mount_distance, self.arm_length);
+        (a * a + r * r - 2.0 * a * r * angle.cos()).max(0.0).sqrt()
+    }
+
+    fn motion_ratio(&self, angle: Real) -> Real {
+        let length = self.length_at(angle);
+        if length > Real::EPSILON {
+            self.mount_distance * angle.sin() / length
+        } else {
+            0.0
+        }
+    }
+
+    fn pose(&self, angle: Real) -> TravelPose {
+        let arm = Rotation::new(self.axis_cs * angle) * self.mount_direction_cs;
+        TravelPose {
+            length: self.length_at(angle),
+            joint_cs: self.pivot_cs + arm * self.arm_length,
+            // Increasing the angle lengthens the spring over the whole range.
+            tangent_cs: self.axis_cs.cross(&arm),
+            motion_ratio: self.motion_ratio(angle),
+            tilt_cs: if self.tilt {
+                Rotation::new(self.axis_cs * (angle - self.reference_angle))
+            } else {
+                Rotation::identity()
+            },
+        }
     }
 }
 
@@ -1273,7 +1557,9 @@ impl DynamicRayCastVehicleController {
             damping_compression: tuning.suspension_compression,
             damping_relaxation: tuning.suspension_damping,
             friction_slip: tuning.friction_slip,
-            max_suspension_travel: tuning.max_suspension_travel,
+            suspension_bump_travel: tuning.suspension_bump_travel,
+            suspension_droop_travel: tuning.suspension_droop_travel,
+            suspension_preload: tuning.suspension_preload,
             max_suspension_force: tuning.max_suspension_force,
             tire_type: tuning.tire_type.clone(),
             role,
@@ -1293,35 +1579,17 @@ impl DynamicRayCastVehicleController {
         &mut self.wheels[wheel_id]
     }
 
-    #[cfg(feature = "dim2")]
     fn update_wheel_transform(&mut self, chassis: &RigidBody, wheel_index: usize) {
-        self.update_wheel_transforms_ws(chassis, wheel_index);
         let wheel = &mut self.wheels[wheel_index];
-        wheel.center = (wheel.raycast_info.hard_point_ws
-            + wheel.wheel_direction_ws * wheel.raycast_info.suspension_length)
-            .coords;
-    }
-
-    #[cfg(feature = "dim3")]
-    fn update_wheel_transform(&mut self, chassis: &RigidBody, wheel_index: usize) {
-        self.update_wheel_transforms_ws(chassis, wheel_index);
-        let wheel = &mut self.wheels[wheel_index];
-
-        wheel.center = wheel.raycast_info.hard_point_ws
-            + wheel.wheel_direction_ws * wheel.raycast_info.suspension_length;
-    }
-
-    fn update_wheel_transforms_ws(&mut self, chassis: &RigidBody, wheel_id: usize) {
-        let wheel = &mut self.wheels[wheel_id];
         wheel.raycast_info.is_in_contact = false;
-
-        let chassis_transform = chassis.position();
-
         let steering = Rotation::new(wheel.steering_axis_cs() * wheel.steering);
-        wheel.raycast_info.hard_point_ws = chassis_transform
-            * (wheel.chassis_connection_point_cs + steering * wheel.center_offset_cs);
-        wheel.wheel_direction_ws = chassis_transform * wheel.direction_cs;
-        wheel.wheel_axle_ws = chassis_transform * (steering * wheel.axle_cs);
+        let (min_length, max_length) = wheel.suspension_length_limits();
+        let length = wheel
+            .raycast_info
+            .suspension_length
+            .clamp(min_length, max_length);
+        let pose = wheel.travel_pose(wheel.travel_parameter(length));
+        wheel.place(chassis.position(), &pose, &steering);
     }
 
     #[profiling::function]
@@ -1331,47 +1599,78 @@ impl DynamicRayCastVehicleController {
         colliders: &ColliderSet,
         queries: &QueryPipeline,
         filter: QueryFilter,
-        _chassis: &RigidBody,
+        chassis: &RigidBody,
         wheel_id: usize,
     ) {
+        let chassis_pose = *chassis.position();
         let wheel = &mut self.wheels[wheel_id];
-        let min_length = (wheel.suspension_rest_length - wheel.max_suspension_travel).max(0.0);
-        // The spring is unloaded at rest length, so that is full droop. Ground
-        // beyond it cannot be supported, and ending the sweep there keeps the
-        // length continuous when contact is lost or regained.
-        let max_length = wheel.suspension_rest_length;
-        let source = wheel.raycast_info.hard_point_ws;
+        let steering = Rotation::new(wheel.steering_axis_cs() * wheel.steering);
+        // Ground beyond full droop cannot be supported, and ending the sweep there
+        // keeps the length continuous when contact is lost or regained. Ground
+        // inside the bump stop is carried rigidly at the stop.
+        let (min_length, max_length) = wheel.suspension_length_limits();
+        let droop = wheel.travel_pose(wheel.travel_parameter(max_length));
         wheel.debug = WheelDebug {
-            ray_end: source + wheel.wheel_direction_ws * max_length,
+            ray_end: chassis_pose * wheel.pose_center_cs(&droop, &steering),
             status: 1,
             ..WheelDebug::default()
         };
         wheel.raycast_info.ground_object = None;
         wheel.raycast_info.is_in_contact = false;
         wheel.raycast_info.contact_point_ws = wheel.debug.ray_end;
-        let sweep = WheelSweep {
-            mount: source,
-            direction: wheel.wheel_direction_ws,
-            axle: wheel.wheel_axle_ws,
-            radius: wheel.radius,
-            width: wheel.width,
-            min_length,
-            max_length,
-        };
-        let (support, rejected) = sweep.cast(bodies, colliders, queries, filter, self.chassis);
+        wheel.bump_stop_contact = false;
+
+        // Sweep each travel segment from the bump stop outward; the first
+        // support found is the one the wheel reaches first.
+        let mut support = None;
+        let mut rejected = None;
+        for (start, end) in wheel.travel_segments(min_length, max_length) {
+            let from = wheel.travel_pose(start);
+            let to = wheel.travel_pose(end);
+            let from_center = chassis_pose * wheel.pose_center_cs(&from, &steering);
+            let chord = chassis_pose * wheel.pose_center_cs(&to, &steering) - from_center;
+            let distance = chord.norm();
+            let direction = chord
+                .try_normalize(Real::EPSILON)
+                .unwrap_or_else(|| chassis_pose * from.tangent_cs);
+            let middle = wheel.travel_pose((start + end) * 0.5);
+            let sweep = WheelSweep {
+                mount: from_center,
+                direction,
+                axle: chassis_pose * wheel.pose_axle_cs(&middle, &steering),
+                radius: wheel.radius,
+                width: wheel.width,
+                min_length: 0.0,
+                max_length: distance,
+            };
+            let (hit, miss) = sweep.cast(bodies, colliders, queries, filter, self.chassis);
+            rejected = rejected.or(miss);
+            if let Some(hit) = hit {
+                let fraction = if distance > Real::EPSILON {
+                    (hit.length / distance).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                support = Some((hit, start + (end - start) * fraction));
+                break;
+            }
+        }
         if let Some(point) = rejected {
             wheel.debug.raw_hit = Some(point);
             wheel.debug.status = 2;
         }
-        if let Some(hit) = support {
+        let pose = if let Some((hit, parameter)) = support {
+            let pose = wheel.travel_pose(parameter);
+            let tangent = chassis_pose * pose.tangent_cs;
+            let incidence = -hit.normal.dot(&tangent);
             wheel.debug.raw_hit = Some(hit.point);
             wheel.debug.status = 4;
-            wheel.raycast_info.suspension_length = hit.length;
+            wheel.raycast_info.suspension_length = pose.length.clamp(min_length, max_length);
             wheel.raycast_info.contact_point_ws = hit.point;
             wheel.raycast_info.contact_normal_ws = hit.normal;
             wheel.raycast_info.is_in_contact = true;
             wheel.raycast_info.ground_object = Some(hit.collider);
-            let incidence = -hit.normal.dot(&wheel.wheel_direction_ws);
+            wheel.bump_stop_contact = pose.length <= min_length + BUMP_STOP_TOLERANCE;
             let velocity = relative_velocity_at_contact(
                 bodies,
                 colliders,
@@ -1379,19 +1678,23 @@ impl DynamicRayCastVehicleController {
                 Some(hit.collider),
                 &hit.point,
             );
-            wheel.clipped_inv_contact_dot_suspension = 1.0 / incidence;
-            wheel.suspension_relative_velocity = hit.normal.dot(&velocity) / incidence;
-        }
-        if !wheel.raycast_info.is_in_contact {
-            // No contact: the unloaded wheel hangs at full droop.
-            wheel.raycast_info.suspension_length = wheel.suspension_rest_length;
+            // Road-normal motion moves the wheel along its path at 1/incidence,
+            // and the spring by the motion ratio of that. By virtual work the
+            // spring's axial force reaches the road scaled the same way.
+            wheel.clipped_inv_contact_dot_suspension = pose.motion_ratio / incidence;
+            wheel.suspension_relative_velocity =
+                pose.motion_ratio * hit.normal.dot(&velocity) / incidence;
+            pose
+        } else {
+            // No contact: the wheel hangs at full droop.
+            wheel.raycast_info.suspension_length = max_length;
             wheel.suspension_relative_velocity = 0.0;
-            wheel.raycast_info.contact_normal_ws = -wheel.wheel_direction_ws;
+            wheel.raycast_info.contact_normal_ws = -(chassis_pose * droop.tangent_cs);
             wheel.clipped_inv_contact_dot_suspension = 1.0;
-        }
+            droop
+        };
         // Raycasting just solved this tick's travel; do not expose the previous length.
-        wheel.center = wheel.raycast_info.hard_point_ws
-            + wheel.wheel_direction_ws * wheel.raycast_info.suspension_length;
+        wheel.place(&chassis_pose, &pose, &steering);
 
         // The suspension sweep stops the moment the rigid wheel touches, so it can
         // never report a road the wheel has not reached. This probe can, which is
@@ -2055,6 +2358,7 @@ impl DynamicRayCastVehicleController {
             }
         }
 
+        self.apply_bump_stops(bodies, colliders, dt);
         self.update_friction(bodies, colliders, dt);
 
         for wheel in &mut self.wheels {
@@ -2139,9 +2443,16 @@ impl DynamicRayCastVehicleController {
                     let rest_length = wheels.suspension_rest_length;
                     let current_length = wheels.raycast_info.suspension_length;
                     let length_diff = rest_length - current_length;
-                    wheels.suspension_compression_rate = 1.0 - (current_length / rest_length);
+                    let (min_length, max_length) = wheels.suspension_length_limits();
+                    let range = max_length - min_length;
+                    // Zero at full droop, one on the bump stop.
+                    wheels.suspension_compression_rate = if range > Real::EPSILON {
+                        ((max_length - current_length) / range).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
 
-                    force = wheels.suspension_stiffness * length_diff;
+                    force = wheels.suspension_preload + wheels.suspension_stiffness * length_diff;
                 }
 
                 // Damper
@@ -2157,13 +2468,76 @@ impl DynamicRayCastVehicleController {
                     }
                 }
 
-                // Both spring and damper act along travel. Convert their combined
+                // Both spring and damper act along the spring. Convert their combined
                 // axial force into the supporting road-normal reaction.
                 wheels.wheel_suspension_force =
                     (force * wheels.clipped_inv_contact_dot_suspension * chassis_mass).max(0.0);
             } else {
                 wheels.wheel_suspension_force = 0.0;
             }
+        }
+    }
+
+    /// A wheel on its bump stop is a rigid strut: after the spring has acted, stop
+    /// whatever closing speed remains at its contact. Wheels landing together share
+    /// the load through sequential passes, so the stop never pushes the car away.
+    /// Cancelling speed cannot add energy, so unlike the spring the stop is not
+    /// bounded by the force limit; it adds to the reported suspension force so
+    /// friction sees the load.
+    fn apply_bump_stops(&mut self, bodies: &mut RigidBodySet, colliders: &ColliderSet, dt: Real) {
+        let stops: Vec<usize> = (0..self.wheels.len())
+            .filter(|&i| {
+                let wheel = &self.wheels[i];
+                wheel.raycast_info.is_in_contact && wheel.bump_stop_contact
+            })
+            .collect();
+        if stops.is_empty() {
+            return;
+        }
+        let mut accumulated = vec![0.0; self.wheels.len()];
+        for _ in 0..BUMP_STOP_ITERATIONS {
+            for &i in &stops {
+                let wheel = &self.wheels[i];
+                let point = wheel.raycast_info.contact_point_ws;
+                let normal = wheel.raycast_info.contact_normal_ws;
+                let ground = wheel.raycast_info.ground_object;
+                let closing = normal.dot(&relative_velocity_at_contact(
+                    bodies,
+                    colliders,
+                    self.chassis,
+                    ground,
+                    &point,
+                ));
+                let ground_body = ground
+                    .and_then(|handle| colliders[handle].parent())
+                    .filter(|handle| *handle != self.chassis && bodies[*handle].is_dynamic());
+                let mut response = normal_impulse_response(&bodies[self.chassis], &point, &normal);
+                if let Some(handle) = ground_body {
+                    response += normal_impulse_response(&bodies[handle], &point, &normal);
+                }
+                if !(response > Real::EPSILON) {
+                    continue;
+                }
+                let total = (accumulated[i] - closing / response).max(0.0);
+                let delta = total - accumulated[i];
+                if delta == 0.0 {
+                    continue;
+                }
+                accumulated[i] = total;
+                bodies
+                    .get_mut_internal_with_modification_tracking(self.chassis)
+                    .unwrap()
+                    .apply_impulse_at_point(normal * delta, point, false);
+                if let Some(handle) = ground_body {
+                    bodies
+                        .get_mut_internal_with_modification_tracking(handle)
+                        .unwrap()
+                        .apply_impulse_at_point(-normal * delta, point, true);
+                }
+            }
+        }
+        for &i in &stops {
+            self.wheels[i].wheel_suspension_force += accumulated[i] / dt;
         }
     }
 
@@ -7607,6 +7981,8 @@ mod tests {
         controller.wheels[0].chassis_connection_point_cs = mount;
         controller.wheels[0].direction_cs = direction;
         controller.wheels[0].axle_cs = axle;
+        controller.wheels[0].suspension_rest_length = 0.4;
+        controller.wheels[0].suspension_droop_travel = 0.2;
         controller.wheels[0]
             .set_steering_axis_cs(axis * 3.0)
             .unwrap();
@@ -7780,13 +8156,13 @@ mod tests {
                             &WheelTuning::default(),
                             WheelRole::new(WheelAxle::Front, false, true),
                         );
-                        wheel.max_suspension_travel = 0.6;
+                        wheel.suspension_bump_travel = 0.6;
                         wheel.steering = steering;
                         wheel.set_steering_axis_cs(kingpin).unwrap();
                         wheel.set_center_offset_cs(offset).unwrap();
                         let mut queries = QueryPipeline::new();
                         queries.update(&colliders);
-                        controller.update_wheel_transforms_ws(&bodies[chassis], 0);
+                        controller.update_wheel_transform(&bodies[chassis], 0);
                         controller.suspension_cast(
                             &bodies,
                             &colliders,
@@ -7863,7 +8239,7 @@ mod tests {
                 wheel.damping_relaxation = 3.0;
                 let mut queries = QueryPipeline::new();
                 queries.update(&colliders);
-                controller.update_wheel_transforms_ws(&bodies[chassis], 0);
+                controller.update_wheel_transform(&bodies[chassis], 0);
                 controller.suspension_cast(
                     &bodies,
                     &colliders,
@@ -7908,10 +8284,10 @@ mod tests {
                 &WheelTuning::default(),
                 WheelRole::new(WheelAxle::Front, false, true),
             );
-            wheel.max_suspension_travel = 0.1;
+            wheel.suspension_bump_travel = 0.1;
             let mut queries = QueryPipeline::new();
             queries.update(&colliders);
-            controller.update_wheel_transforms_ws(&bodies[chassis], 0);
+            controller.update_wheel_transform(&bodies[chassis], 0);
             controller.suspension_cast(
                 &bodies,
                 &colliders,
@@ -7958,14 +8334,14 @@ mod tests {
             &WheelTuning::default(),
             WheelRole::new(WheelAxle::Front, false, false),
         );
-        wheel.max_suspension_travel = 0.3;
+        wheel.suspension_bump_travel = 0.3;
         let mut previous: Option<Real> = None;
         // Lift the chassis from mid-travel until the road is well past full droop,
         // as on a jump take-off; landing retraces the same lengths.
         for i in 0..=60 {
             let road_length = 0.2 + i as Real * step;
             bodies[chassis].set_translation(Vector::y() * (road_length + radius), true);
-            controller.update_wheel_transforms_ws(&bodies[chassis], 0);
+            controller.update_wheel_transform(&bodies[chassis], 0);
             controller.suspension_cast(
                 &bodies,
                 &colliders,
@@ -8022,10 +8398,10 @@ mod tests {
             &WheelTuning::default(),
             WheelRole::new(WheelAxle::Front, false, true),
         );
-        wheel.max_suspension_travel = 0.3;
+        wheel.suspension_bump_travel = 0.3;
         let mut queries = QueryPipeline::new();
         queries.update(&colliders);
-        controller.update_wheel_transforms_ws(&bodies[chassis], 0);
+        controller.update_wheel_transform(&bodies[chassis], 0);
         controller.suspension_cast(
             &bodies,
             &colliders,
@@ -8071,7 +8447,7 @@ mod tests {
                 WheelRole::new(WheelAxle::Front, false, false),
             );
             wheel.suspension_stiffness = 0.0;
-            controller.update_wheel_transforms_ws(&bodies[chassis], 0);
+            controller.update_wheel_transform(&bodies[chassis], 0);
             controller.suspension_cast(
                 &bodies,
                 &colliders,
@@ -8129,7 +8505,7 @@ mod tests {
                             &WheelTuning::default(),
                             WheelRole::new(WheelAxle::Front, false, false),
                         );
-                        wheel.max_suspension_travel = 0.3;
+                        wheel.suspension_bump_travel = 0.3;
                         wheel.suspension_stiffness = 80.0;
                         wheel.damping_compression = 2.0;
                         wheel.damping_relaxation = 2.6;
@@ -8144,7 +8520,7 @@ mod tests {
                     let vertical = bodies[chassis].linvel().y;
                     bodies[chassis].set_linvel(Vector::new(0.0, vertical, horizontal), true);
                     for i in 0..4 {
-                        controller.update_wheel_transforms_ws(&bodies[chassis], i);
+                        controller.update_wheel_transform(&bodies[chassis], i);
                         controller.suspension_cast(
                             &bodies,
                             &colliders,
@@ -8182,13 +8558,307 @@ mod tests {
         }
     }
 
+    fn single_wheel_on_halfspace(
+        rest: Real,
+        radius: Real,
+    ) -> (
+        RigidBodySet,
+        ColliderSet,
+        QueryPipeline,
+        RigidBodyHandle,
+        DynamicRayCastVehicleController,
+    ) {
+        use crate::geometry::ColliderBuilder;
+        let mut bodies = RigidBodySet::new();
+        let chassis = bodies.insert(RigidBodyBuilder::dynamic());
+        let mut colliders = ColliderSet::new();
+        colliders.insert(ColliderBuilder::halfspace(na::Unit::new_normalize(
+            Vector::y(),
+        )));
+        let mut queries = QueryPipeline::new();
+        queries.update(&colliders);
+        let mut controller =
+            DynamicRayCastVehicleController::new(chassis, VehicleControllerConfig::default());
+        controller.add_wheel(
+            Point::origin(),
+            -Vector::y(),
+            Vector::x(),
+            rest,
+            radius,
+            0.2,
+            &WheelTuning::default(),
+            WheelRole::new(WheelAxle::Front, false, false),
+        );
+        (bodies, colliders, queries, chassis, controller)
+    }
+
+    fn cast_single_wheel(
+        bodies: &RigidBodySet,
+        colliders: &ColliderSet,
+        queries: &QueryPipeline,
+        chassis: RigidBodyHandle,
+        controller: &mut DynamicRayCastVehicleController,
+    ) {
+        controller.update_wheel_transform(&bodies[chassis], 0);
+        controller.suspension_cast(
+            bodies,
+            colliders,
+            queries,
+            QueryFilter::default(),
+            &bodies[chassis],
+            0,
+        );
+    }
+
+    #[test]
+    fn suspension_travel_stops_at_the_bump_stop_and_full_droop() {
+        let (rest, bump, droop, radius) = (0.4, 0.1, 0.15, 0.3);
+        let (mut bodies, colliders, queries, chassis, mut controller) =
+            single_wheel_on_halfspace(rest, radius);
+        controller.wheels[0].suspension_bump_travel = bump;
+        controller.wheels[0].suspension_droop_travel = droop;
+        assert_eq!(
+            controller.wheels[0].suspension_length_limits(),
+            (rest - bump, rest + droop)
+        );
+        for i in 0..=50 {
+            let road_length = 0.1 + i as Real * 0.012;
+            bodies[chassis].set_translation(Vector::y() * (road_length + radius), true);
+            cast_single_wheel(&bodies, &colliders, &queries, chassis, &mut controller);
+            let wheel = &controller.wheels[0];
+            let length = wheel.raycast_info.suspension_length;
+            if road_length < rest - bump - 1.0e-3 {
+                assert!(wheel.raycast_info.is_in_contact);
+                assert!(wheel.is_on_bump_stop(), "road={road_length}");
+                assert!((length - (rest - bump)).abs() < 1.0e-6);
+            } else if road_length > rest + droop + 1.0e-3 {
+                assert!(!wheel.raycast_info.is_in_contact, "road={road_length}");
+                assert!(!wheel.is_on_bump_stop());
+                assert_eq!(length, rest + droop);
+            } else if road_length > rest - bump + 1.0e-3 && road_length < rest + droop - 1.0e-3 {
+                assert!(wheel.raycast_info.is_in_contact);
+                assert!(!wheel.is_on_bump_stop());
+                assert!((length - road_length).abs() < 1.0e-4, "road={road_length}");
+            }
+        }
+    }
+
+    #[test]
+    fn preload_carries_the_static_load_at_the_rest_length() {
+        let (rest, radius) = (0.4, 0.3);
+        let (mut bodies, colliders, queries, chassis, mut controller) =
+            single_wheel_on_halfspace(rest, radius);
+        controller.wheels[0].suspension_bump_travel = 0.1;
+        controller.wheels[0].suspension_droop_travel = 0.1;
+        controller.wheels[0].suspension_stiffness = 40.0;
+        controller.wheels[0].suspension_preload = 2.5;
+        for (road_length, expected) in [
+            (rest, 2.5),
+            (rest - 0.05, 2.5 + 40.0 * 0.05),
+            (rest + 0.05, 0.5),
+        ] {
+            bodies[chassis].set_translation(Vector::y() * (road_length + radius), true);
+            cast_single_wheel(&bodies, &colliders, &queries, chassis, &mut controller);
+            controller.update_suspension(1_000.0);
+            let wheel = &controller.wheels[0];
+            assert!(wheel.raycast_info.is_in_contact);
+            assert!((wheel.wheel_suspension_force - expected * 1_000.0).abs() < 1.0e-2);
+        }
+        // Compression runs from zero at full droop to one on the bump stop.
+        bodies[chassis].set_translation(Vector::y() * (rest + radius), true);
+        cast_single_wheel(&bodies, &colliders, &queries, chassis, &mut controller);
+        controller.update_suspension(1_000.0);
+        assert!((controller.wheels[0].suspension_compression_rate - 0.5).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn suspension_arm_keeps_both_lengths_and_moves_perpendicular_to_the_arm() {
+        let mount = Point::new(0.1, 0.2, 0.0);
+        let direction = -Vector::y();
+        let reference = 0.4;
+        let pivot = Point::new(0.1, -0.15, 0.5);
+        for tilt in [false, true] {
+            let arm = SuspensionArm::new(pivot, mount, direction, reference, tilt).unwrap();
+            let joint = mount + direction * reference;
+            let reference_pose = arm.pose(arm.angle_at(reference).unwrap());
+            assert!((reference_pose.joint_cs - joint).norm() < 1.0e-5);
+            assert!(reference_pose.tilt_cs.angle() < 1.0e-5);
+            for length in [0.3, 0.4, 0.5] {
+                let angle = arm.angle_at(length).unwrap();
+                let pose = arm.pose(angle);
+                assert!((pose.length - length).abs() < 1.0e-5);
+                assert!(((pose.joint_cs - mount).norm() - length).abs() < 1.0e-5);
+                assert!(((pose.joint_cs - pivot).norm() - (joint - pivot).norm()).abs() < 1.0e-5);
+                assert!(pose.tangent_cs.dot(&(pose.joint_cs - pivot)).abs() < 1.0e-5);
+                assert!((pose.tangent_cs.norm() - 1.0).abs() < 1.0e-5);
+                // The motion ratio is the spring's length change per metre of arc.
+                let step = 1.0e-3;
+                let ahead = arm.pose(angle + step / arm.arm_length);
+                let ratio = (ahead.length - pose.length) / step;
+                assert!(
+                    (ratio - pose.motion_ratio).abs() < 1.0e-3,
+                    "{ratio} {}",
+                    pose.motion_ratio
+                );
+                let tilt_angle = pose.tilt_cs.angle();
+                if tilt {
+                    assert!((tilt_angle - (angle - arm.reference_angle).abs()).abs() < 1.0e-4);
+                } else {
+                    assert_eq!(tilt_angle, 0.0);
+                }
+            }
+        }
+        assert!(
+            SuspensionArm::new(mount + direction * 0.8, mount, direction, reference, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn suspension_arm_rejects_travel_outside_its_reach() {
+        let mut wheel = test_wheel();
+        wheel.suspension_rest_length = 0.4;
+        wheel.suspension_bump_travel = 0.1;
+        wheel.suspension_droop_travel = 0.1;
+        // Mount and joint lie 0.32 m and 0.14 m from this pivot: it reaches 0.46 m at most.
+        assert!(wheel
+            .set_suspension_arm(Point::new(0.0, -0.3, 0.1), 0.4, false)
+            .is_err());
+        assert!(wheel.suspension_pivot_cs().is_none());
+        wheel
+            .set_suspension_arm(Point::new(0.0, -0.4, 0.5), 0.4, true)
+            .unwrap();
+        assert_eq!(
+            wheel.suspension_pivot_cs(),
+            Some(Point::new(0.0, -0.4, 0.5))
+        );
+        assert!(wheel.suspension_arm_tilts());
+        wheel.clear_suspension_arm();
+        assert!(wheel.suspension_pivot_cs().is_none());
+    }
+
+    #[test]
+    fn suspension_arm_sweep_lands_the_wheel_on_the_road() {
+        let (rest, radius) = (0.4, 0.3);
+        let (mut bodies, colliders, queries, chassis, mut controller) =
+            single_wheel_on_halfspace(rest, radius);
+        let pivot = Point::new(0.0, -0.4, 0.6);
+        controller.wheels[0].suspension_bump_travel = 0.15;
+        controller.wheels[0].suspension_droop_travel = 0.15;
+        controller.wheels[0].suspension_stiffness = 30.0;
+        controller.wheels[0]
+            .set_suspension_arm(pivot, rest, true)
+            .unwrap();
+        for height in [0.62, 0.7, 0.78] {
+            bodies[chassis].set_translation(Vector::y() * height, true);
+            cast_single_wheel(&bodies, &colliders, &queries, chassis, &mut controller);
+            let wheel = &controller.wheels[0];
+            assert!(wheel.raycast_info.is_in_contact, "height={height}");
+            // The chord sweep sits within millimetres of the true arc contact.
+            assert!(
+                (wheel.center().y - radius).abs() < 3.0e-3,
+                "height={height} center={}",
+                wheel.center()
+            );
+            let local = wheel.center() - Vector::y() * height;
+            assert!(
+                ((local - pivot).norm() - (Point::new(0.0, -rest, 0.0) - pivot).norm()).abs()
+                    < 1.0e-4
+            );
+            let length = wheel.raycast_info.suspension_length;
+            assert!((local.coords.norm() - length).abs() < 1.0e-4);
+            // Arc travel leans the axle about the arm axis (world x here), so it stays on x.
+            assert!((wheel.axle() - Vector::x()).norm() < 1.0e-4);
+        }
+        // Too high: the wheel hangs at full droop on its arc.
+        bodies[chassis].set_translation(Vector::y() * 2.0, true);
+        cast_single_wheel(&bodies, &colliders, &queries, chassis, &mut controller);
+        let wheel = &controller.wheels[0];
+        assert!(!wheel.raycast_info.is_in_contact);
+        assert!((wheel.raycast_info.suspension_length - 0.55).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn bump_stops_arrest_a_landing_without_rebound() {
+        use crate::geometry::ColliderBuilder;
+        let dt = 1.0 / 60.0;
+        let mut bodies = RigidBodySet::new();
+        let chassis = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(Vector::y() * 0.35)
+                .linvel(Vector::new(0.0, -6.0, 0.0)),
+        );
+        let mut colliders = ColliderSet::new();
+        colliders.insert_with_parent(
+            ColliderBuilder::cuboid(0.8, 0.1, 1.5)
+                .mass(1_000.0)
+                .sensor(true),
+            chassis,
+            &mut bodies,
+        );
+        bodies[chassis].recompute_mass_properties_from_colliders(&colliders);
+        colliders.insert(ColliderBuilder::halfspace(na::Unit::new_normalize(
+            Vector::y(),
+        )));
+        let mut queries = QueryPipeline::new();
+        queries.update(&colliders);
+        let mut controller =
+            DynamicRayCastVehicleController::new(chassis, VehicleControllerConfig::default());
+        for (x, z) in [(0.8, 1.2), (-0.8, 1.2), (0.8, -1.2), (-0.8, -1.2)] {
+            let wheel = controller.add_wheel(
+                Point::new(x, 0.0, z),
+                -Vector::y(),
+                Vector::x(),
+                0.2,
+                0.3,
+                0.2,
+                &WheelTuning::default(),
+                WheelRole::new(WheelAxle::Front, false, false),
+            );
+            wheel.suspension_bump_travel = 0.15;
+            wheel.suspension_stiffness = 0.0;
+            wheel.damping_compression = 0.0;
+            wheel.damping_relaxation = 0.0;
+        }
+        let filter = QueryFilter::default().exclude_rigid_body(chassis);
+        for i in 0..4 {
+            controller.update_wheel_transform(&bodies[chassis], i);
+            controller.suspension_cast(&bodies, &colliders, &queries, filter, &bodies[chassis], i);
+            assert!(controller.wheels[i].is_on_bump_stop());
+        }
+        controller.update_suspension(1_000.0);
+        controller.apply_bump_stops(&mut bodies, &colliders, dt);
+        let body = &bodies[chassis];
+        // Sequential passes leave well under a millimetre per second of the landing.
+        assert!(body.linvel().y.abs() < 5.0e-3, "{}", body.linvel());
+        assert!(body.linvel().y <= 0.0, "the stop must not rebound the car");
+        assert!(body.angvel().norm() < 5.0e-3);
+        let total: Real = controller
+            .wheels
+            .iter()
+            .map(|w| w.wheel_suspension_force)
+            .sum();
+        assert!((total / (1_000.0 * 6.0 / dt) - 1.0).abs() < 1.0e-3);
+
+        // The stop only resists closing: a chassis already leaving is untouched.
+        bodies[chassis].set_linvel(Vector::y() * 2.0, true);
+        for i in 0..4 {
+            controller.suspension_cast(&bodies, &colliders, &queries, filter, &bodies[chassis], i);
+        }
+        controller.update_suspension(1_000.0);
+        controller.apply_bump_stops(&mut bodies, &colliders, dt);
+        assert!((bodies[chassis].linvel().y - 2.0).abs() < 1.0e-6);
+    }
+
     fn test_wheel() -> Wheel {
         let mut wheel = Wheel::new(WheelDesc {
             chassis_connection_cs: Point::origin(),
             direction_cs: -Vector::y(),
             axle_cs: Vector::x(),
             suspension_rest_length: 0.4,
-            max_suspension_travel: 5.0,
+            suspension_bump_travel: 5.0,
+            suspension_droop_travel: 0.0,
+            suspension_preload: 0.0,
             radius: 0.35,
             width: 0.2,
             suspension_stiffness: 5.88,
@@ -9044,6 +9714,13 @@ fn relative_velocity_at_contact(
         .unwrap_or_else(Vector::zeros);
 
     chassis_velocity - ground_velocity
+}
+
+/// Speed change along `normal` at `point` per unit impulse applied there.
+fn normal_impulse_response(body: &RigidBody, point: &Point<Real>, normal: &Vector<Real>) -> Real {
+    let angular = body.mprops.effective_world_inv_inertia_sqrt
+        * (point - body.center_of_mass()).cross(normal);
+    normal.dot(&normal.component_mul(&body.mprops.effective_inv_mass)) + angular.gdot(angular)
 }
 
 fn tangent_impulse_response(

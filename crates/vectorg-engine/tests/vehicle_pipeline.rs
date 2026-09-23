@@ -387,7 +387,7 @@ fn kerb_crossing_and_landing_settle_through_the_physics_pipeline() {
             );
             scene.queries.update(&scene.colliders);
             for wheel in scene.vehicle.wheels_mut() {
-                wheel.max_suspension_travel = 0.4;
+                wheel.suspension_bump_travel = 0.4;
                 wheel.max_suspension_force = 20_000.0;
             }
             for _ in 0..hz * 2 {
@@ -956,6 +956,36 @@ fn center_lock_does_not_lengthen_abs_braking() {
                     "{hz} Hz steering={steering} center={center}: {locked} vs open {open}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn preloaded_suspension_parks_at_its_rest_length_with_or_without_an_arm() {
+    for arm in [false, true] {
+        let mut scene = Scene::new(60, 4, 0.0, 0.0);
+        let wheel_count = scene.vehicle.wheels().len() as f32;
+        for wheel in scene.vehicle.wheels_mut() {
+            wheel.suspension_bump_travel = 0.15;
+            wheel.suspension_droop_travel = 0.1;
+            // The whole chassis weight shared evenly by four symmetric wheels.
+            wheel.suspension_preload = 9.81 / wheel_count;
+            wheel.max_suspension_force = 100_000.0;
+            if arm {
+                let mount = wheel.chassis_connection_point_cs;
+                wheel
+                    .set_suspension_arm(mount + Vector::new(0.0, -0.4, 0.5), 0.4, true)
+                    .unwrap();
+            }
+        }
+        for _ in 0..240 {
+            scene.tick();
+        }
+        for wheel in scene.vehicle.wheels() {
+            assert!(wheel.raycast_info().is_in_contact);
+            assert!(!wheel.is_on_bump_stop());
+            let length = wheel.raycast_info().suspension_length;
+            assert!((length - 0.4).abs() < 3.0e-3, "arm={arm} length={length}");
         }
     }
 }

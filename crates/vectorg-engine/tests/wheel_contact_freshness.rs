@@ -79,7 +79,7 @@ impl Rig {
                 },
                 WheelRole::new(axle, axle == WheelAxle::Rear, false),
             );
-            wheel.max_suspension_travel = REST;
+            wheel.suspension_bump_travel = REST;
         }
         let mut queries = QueryPipeline::new();
         queries.update(&colliders);
