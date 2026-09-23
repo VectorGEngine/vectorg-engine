@@ -45,6 +45,8 @@ const ABS_HYDRAULIC_PULSE_FREQUENCY: Real = 15.0;
 const ABS_HYDRAULIC_RELEASE_STEP: Real = 1.0;
 const ABS_HYDRAULIC_REAPPLY_STEP: Real = 0.2;
 const ABS_HYDRAULIC_TARGET_TOLERANCE: Real = 0.05;
+// A valve target is held until the next action, one full cycle later.
+const ABS_HYDRAULIC_HOLD_TIME: Real = 1.0 / ABS_HYDRAULIC_PULSE_FREQUENCY;
 
 // Nominal tire pressure in bar. A wheel at this pressure carrying its static
 // share of the chassis is the grip reference: its multiplier is exactly one.
@@ -873,9 +875,12 @@ fn update_abs_hydraulic_pressure(pressure: &mut Real, target: Real, enabled: boo
 
     let target = target.clamp(0.0, 1.0);
     let previous = *pressure;
-    if target + ABS_HYDRAULIC_TARGET_TOLERANCE < previous {
+    // The dead band is relative, so brakes far stronger than the tire grip can
+    // still hold the few percent of pressure they need instead of staying off.
+    let tolerance = ABS_HYDRAULIC_TARGET_TOLERANCE * previous.max(target);
+    if target + tolerance < previous {
         *pressure = (previous - ABS_HYDRAULIC_RELEASE_STEP).max(target);
-    } else if target > previous + ABS_HYDRAULIC_TARGET_TOLERANCE {
+    } else if target > previous + tolerance {
         *pressure = (previous + ABS_HYDRAULIC_REAPPLY_STEP).min(target);
     }
     (*pressure - previous).abs() > Real::EPSILON
@@ -3146,6 +3151,32 @@ impl VehicleContactSolver {
         }
     }
 
+    // ABS holds each valve target for a whole hydraulic cycle, so it must judge
+    // slip over that interval rather than one physics tick. This tick's brake,
+    // tire, drive and chassis impulses are extrapolated over the hold, which
+    // makes the selected pressure independent of the simulation rate. Clutch
+    // reactions are constraint responses, not sustained torques, so they stay
+    // at this tick's value.
+    fn abs_hold_contact(&self, i: usize, actuation: ContactActuation) -> CoupledContact {
+        let tick = self.contact(i, actuation);
+        let scale = if self.dt > 0.0 {
+            (ABS_HYDRAULIC_HOLD_TIME / self.dt).max(1.0)
+        } else {
+            1.0
+        };
+        let base_speed = self.contacts[i].base.speed;
+        CoupledContact {
+            speed: [
+                base_speed[0] + (tick.speed[0] - base_speed[0]) * scale,
+                base_speed[1] + (tick.speed[1] - base_speed[1]) * scale,
+            ],
+            omega: tick.omega + self.drive_deltas[i] * actuation.drive * (scale - 1.0),
+            brake_budget: tick.brake_budget * scale,
+            grip_impulse: tick.grip_impulse * scale,
+            ..tick
+        }
+    }
+
     // A clutch below its capacity holds its wheels together. The solver's clutch
     // residual is a surface speed, so compare the wheels' speed difference as
     // |d_omega| * radius; an angular comparison rejects converged near-rigid
@@ -3343,8 +3374,22 @@ impl VehicleContactSolver {
             })
         };
         let abs_target = if prepared.base.brake_budget > 0.0 {
+            let hold_time = ABS_HYDRAULIC_HOLD_TIME.max(self.dt);
             anti_lock_brake_torque_fraction(prepared.abs, prepared.direction, |brake| {
-                let result = solve(drive_for(brake), brake).0;
+                let actuation = ContactActuation {
+                    drive: drive_for(brake),
+                    brake,
+                    abs_target: 1.0,
+                    grip: 1.0,
+                };
+                let result = solve_with_grip_recovery(
+                    self.abs_hold_contact(i, actuation),
+                    prepared.kinetic_grip,
+                    prepared.previous_grip,
+                    prepared.sliding_floor,
+                    hold_time,
+                )
+                .0;
                 (
                     result.omega * prepared.base.radius,
                     self.assist_reference_for(i, result.speed[0], -prepared.direction),
@@ -6510,6 +6555,53 @@ mod tests {
     }
 
     #[test]
+    fn abs_stopping_distance_is_timestep_independent_and_beats_lockup() {
+        let stop = |hz: u32, abs: Real| {
+            let dt = 1.0 / hz as Real;
+            let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(27.8, 0.0);
+            controller.set_input(VehicleInput {
+                brake: 1.0,
+                clutch: 1.0,
+                ..VehicleInput::default()
+            });
+            for wheel in &mut controller.wheels {
+                wheel.brake = 1.0;
+                wheel.max_brake_force = 12_000.0;
+                wheel.anti_lock_brake = abs;
+                wheel.friction_slip = 1.2;
+                wheel.last_skid_info = 1.0;
+            }
+            let mut distance = 0.0;
+            for _ in 0..hz * 10 {
+                let speed = bodies[controller.chassis].linvel().z;
+                if speed <= 1.0 {
+                    break;
+                }
+                controller.current_vehicle_speed = speed;
+                let output = controller.update_powertrain(dt, speed.abs());
+                controller.apply_powertrain_output(output);
+                controller.update_friction(&mut bodies, &colliders, dt);
+                distance += bodies[controller.chassis].linvel().z * dt;
+            }
+            distance
+        };
+        let locked = stop(60, 0.0);
+        let distances: Vec<Real> = [30, 60, 120, 240].map(|hz| stop(hz, 1.0)).to_vec();
+        let shortest = distances.iter().copied().fold(Real::MAX, Real::min);
+        let longest = distances.iter().copied().fold(0.0, Real::max);
+        // ABS holds each valve target for a whole cycle; one-tick slip previews
+        // lengthened stops as the rate rose (32 m at 30 Hz, 52 m at 240 Hz).
+        assert!(
+            longest - shortest < longest * 0.03,
+            "ABS stopping distances vary with timestep: {distances:?}"
+        );
+        assert!(
+            longest < locked * 0.95,
+            "ABS {distances:?} must stop shorter than locked wheels {locked}"
+        );
+    }
+
+    #[test]
     fn full_abs_releases_existing_lock_and_recovers_without_speed_sync() {
         for hz in [30, 60, 120] {
             for direction in [-1.0, 1.0] {
@@ -6547,16 +6639,21 @@ mod tests {
                     controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
                     controller.update_friction(&mut bodies, &colliders, dt);
                 }
+                // Recovered wheels keep braking within the ABS slip allowance.
+                let allowed = anti_lock_brake_allowed_slip_ratio(1.0);
                 for wheel in &controller.wheels {
                     let road = bodies[controller.chassis]
                         .velocity_at_point(&wheel.raycast_info.contact_point_ws)
                         .z;
+                    let slip = (road - wheel.angular_velocity * wheel.radius) * direction;
                     assert!(
-                        !wheel.lock
-                            && (road - wheel.angular_velocity * wheel.radius) * direction < 0.1
+                        !wheel.lock && slip < road.abs() * allowed,
+                        "{hz} Hz direction {direction}: slip {slip} at road speed {road}"
                     );
                 }
-                assert!(bodies[controller.chassis].linvel().z.abs() < 40.0);
+                // About 1 g for 2 s from 40 m/s; brakes held off would barely slow it.
+                let speed = bodies[controller.chassis].linvel().z.abs();
+                assert!(speed < 25.0, "{hz} Hz direction {direction}: {speed} m/s");
             }
         }
     }
