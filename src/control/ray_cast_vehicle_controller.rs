@@ -128,6 +128,8 @@ pub struct DynamicRayCastVehicleController {
     pub index_forward_axis: usize,
     /// Available tire types
     pub tire_types: HashMap<String, TireType>,
+    /// Rolling-resistance multiplier per surface material name; unlisted surfaces use `1.0`.
+    surface_rolling_resistance: HashMap<String, Real>,
     powertrain: VehiclePowertrain,
     last_steering_compression: Real,
     counter_steer_assist_active: bool,
@@ -1195,6 +1197,7 @@ impl DynamicRayCastVehicleController {
             index_up_axis: 1,
             index_forward_axis: 0,
             tire_types,
+            surface_rolling_resistance: HashMap::new(),
             powertrain: VehiclePowertrain::new(config),
             last_steering_compression: 0.0,
             counter_steer_assist_active: false,
@@ -1306,6 +1309,42 @@ impl DynamicRayCastVehicleController {
     pub fn set_brake_bias(&mut self, bias: Real) {
         if bias.is_finite() {
             self.powertrain.config.dynamics.brake_bias = bias.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Sets the rolling-resistance multiplier applied while wheels rest on `surface`.
+    /// The vehicle's base coefficient is scaled by the mean multiplier of the
+    /// wheels in contact, so a car half on gravel rolls half as hard as one fully on it.
+    /// Non-finite or negative values are ignored.
+    pub fn set_surface_rolling_resistance(&mut self, surface: &str, multiplier: Real) {
+        if multiplier.is_finite() && multiplier >= 0.0 {
+            self.surface_rolling_resistance
+                .insert(surface.to_string(), multiplier);
+        }
+    }
+
+    /// Rolling-resistance multiplier for `surface`, or `1.0` when it has none.
+    pub fn surface_rolling_resistance(&self, surface: &str) -> Real {
+        self.surface_rolling_resistance
+            .get(surface)
+            .copied()
+            .unwrap_or(1.0)
+    }
+
+    /// Mean surface multiplier over the wheels currently in contact; `1.0` when airborne.
+    fn contact_rolling_resistance_multiplier(&self) -> Real {
+        let mut total = 0.0;
+        let mut count = 0;
+        for wheel in &self.wheels {
+            if wheel.raycast_info.is_in_contact {
+                total += self.surface_rolling_resistance(&wheel.ground_type);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            1.0
+        } else {
+            total / count as Real
         }
     }
 
@@ -2142,7 +2181,11 @@ impl DynamicRayCastVehicleController {
         let drag =
             0.5 * 1.225 * dynamics.drag_coefficient * dynamics.frontal_area * speed * speed_abs;
         let rolling = if speed_abs > 0.1 {
-            chassis.mass() * 9.81 * dynamics.rolling_resistance * speed.signum()
+            chassis.mass()
+                * 9.81
+                * dynamics.rolling_resistance
+                * self.contact_rolling_resistance_multiplier()
+                * speed.signum()
         } else {
             0.0
         };
@@ -4810,6 +4853,65 @@ mod tests {
         let (controller, _) = tread_probe_case(-0.5, 0.2);
         assert_eq!(controller.wheel_tread_distance(1), None);
         assert_eq!(controller.wheel_tread_normal(1), None);
+    }
+
+    #[test]
+    fn surface_rolling_resistance_scales_with_the_wheels_in_contact() {
+        let mut config = VehicleControllerConfig::default();
+        config.dynamics.drag_coefficient = 0.0;
+        config.dynamics.rolling_resistance = 0.02;
+        config.dynamics.downforce.max_force = 0.0;
+        config.dynamics.base_linear_damping = 0.0;
+        config.dynamics.linear_damping_per_speed = 0.0;
+        let dt = 0.01;
+        let speed = 20.0;
+        let mut bodies = RigidBodySet::new();
+        let chassis = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .additional_mass(100.0)
+                .linvel(Vector::z() * speed),
+        );
+        bodies[chassis].recompute_mass_properties_from_colliders(&ColliderSet::new());
+        let mut controller = DynamicRayCastVehicleController::new(chassis, config);
+        controller.index_forward_axis = 2;
+        controller.current_vehicle_speed = speed;
+        for _ in 0..2 {
+            controller.add_wheel(
+                Point::origin(),
+                -Vector::y(),
+                Vector::x(),
+                0.3,
+                0.4,
+                0.2,
+                &WheelTuning::default(),
+                WheelRole::new(WheelAxle::Front, false, false),
+            );
+        }
+        controller.set_surface_rolling_resistance("gravel", 4.0);
+        controller.set_surface_rolling_resistance("ignored", -1.0);
+        assert_eq!(controller.surface_rolling_resistance("gravel"), 4.0);
+        assert_eq!(controller.surface_rolling_resistance("ignored"), 1.0);
+        assert_eq!(controller.surface_rolling_resistance("tarmac"), 1.0);
+        let expect = |controller: &mut DynamicRayCastVehicleController,
+                      bodies: &mut RigidBodySet,
+                      multiplier: Real| {
+            bodies[chassis].set_linvel(Vector::z() * speed, true);
+            controller.apply_chassis_dynamics(dt, bodies);
+            let expected = speed - 9.81 * 0.02 * multiplier * dt;
+            assert!(
+                (bodies[chassis].linvel().z - expected).abs() < 1e-5,
+                "multiplier {multiplier}: {} vs {expected}",
+                bodies[chassis].linvel().z
+            );
+        };
+        // Airborne: the base coefficient applies unchanged.
+        expect(&mut controller, &mut bodies, 1.0);
+        controller.wheels[0].raycast_info.is_in_contact = true;
+        controller.wheels[0].ground_type = "gravel".to_string();
+        expect(&mut controller, &mut bodies, 4.0);
+        controller.wheels[1].raycast_info.is_in_contact = true;
+        controller.wheels[1].ground_type = "tarmac".to_string();
+        expect(&mut controller, &mut bodies, 2.5);
     }
 
     #[test]
