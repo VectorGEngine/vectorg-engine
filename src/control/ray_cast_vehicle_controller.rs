@@ -33,11 +33,11 @@ const WHEEL_STOP_EPSILON: Real = 1.0e-4;
 // Numerical allowance for a rolling constraint, in meters per second.
 const ASSIST_SURFACE_SPEED_TOLERANCE: Real = 0.01;
 // The player-facing 0..=1 ABS setting maps to at most 90% physical intervention.
-const ANTI_LOCK_BRAKE_STRENGTH_SCALE: Real = 0.9;
+const ANTI_LOCK_BRAKE_STRENGTH_SCALE: Real = 0.98;
 // Maximum powered wheel-surface overspeed in m/s; TC strength reduces this gap.
 const TRACTION_CONTROL_MAX_SPEED_GAP: Real = 10.0;
 // The player-facing 0..=1 setting maps to at most 90% physical intervention.
-const TRACTION_CONTROL_STRENGTH_SCALE: Real = 0.9;
+const TRACTION_CONTROL_STRENGTH_SCALE: Real = 0.98;
 const ESC_SIDESLIP_YAW_GAIN: Real = 2.0;
 // One hydraulic modulator drives every wheel through alternating action and
 // hold phases. Wheel pressure decisions remain independent within that cycle.
@@ -60,9 +60,38 @@ const TIRE_PRESSURE_MIN_LOAD_RATIO: Real = 0.15;
 
 const SLIDING_START_SPEED: Real = 4.0;
 const SLIDING_FULL_SPEED: Real = 8.0;
+// Below this contact speed a tire with cornering stiffness holds the road
+// rigidly, like a parked wheel; the slip angle is ill-defined there and a
+// compliant tire would creep sideways under any lateral load. Compliance ramps
+// in continuously above it.
+const CORNERING_STIFFNESS_SPEED_FLOOR: Real = 1.0;
 const RECOVERY_THRESHOLD: Real = 0.94;
 const RECOVERY_BASE_RATE: Real = 0.15;
 const RECOVERY_RATE: Real = 0.3;
+
+/// Lateral compliance of a rolling tire: the side speed it keeps per unit of
+/// lateral impulse, from its `cornering_stiffness` per radian of slip angle,
+/// normalized by wheel `load` in newtons, at contact speed `forward_speed`.
+///
+/// The lateral force of a real tire grows with its slip angle, `side_speed /
+/// forward_speed`, until the friction limit; only a locked or parked wheel
+/// holds the road rigidly. Per tick the tire impulse is `stiffness * load * dt
+/// * slip_angle`, so the slip speed it leaves is `forward_speed / (stiffness *
+/// load * dt)` per unit impulse. Zero stiffness is the rigid tire. Below
+/// `CORNERING_STIFFNESS_SPEED_FLOOR` the tire is rigid too, and the compliance
+/// ramps in continuously above it.
+fn tire_lateral_compliance(
+    cornering_stiffness: Real,
+    load: Real,
+    forward_speed: Real,
+    dt: Real,
+) -> Real {
+    let stiffness_impulse = cornering_stiffness * load * dt;
+    if !(stiffness_impulse > 0.0) || !forward_speed.is_finite() {
+        return 0.0;
+    }
+    (forward_speed.abs() - CORNERING_STIFFNESS_SPEED_FLOOR).max(0.0) / stiffness_impulse
+}
 
 /// Grip multiplier for a tire running `pressure` bar while carrying `load` newtons,
 /// against the `static_load` it carries at rest.
@@ -84,10 +113,14 @@ fn tire_pressure_grip(pressure: Real, load: Real, static_load: Real) -> Real {
     };
     let deviation = (pressure / TIRE_PRESSURE_REFERENCE).ln();
     let matched = load_ratio.ln();
-    let exponent = deviation * (2.0 * matched - deviation)
-        / (2.0 * TIRE_PRESSURE_SIGMA * TIRE_PRESSURE_SIGMA);
+    let exponent =
+        deviation * (2.0 * matched - deviation) / (2.0 * TIRE_PRESSURE_SIGMA * TIRE_PRESSURE_SIGMA);
     let grip = exponent.exp();
-    if grip.is_finite() { grip } else { 1.0 }
+    if grip.is_finite() {
+        grip
+    } else {
+        1.0
+    }
 }
 
 fn longitudinal_slip_amount(speed: Real) -> Real {
@@ -888,6 +921,8 @@ struct WheelContactState {
     friction: TireFriction,
     kinetic_grip: Real,
     peak_friction_limit: Real,
+    /// Lateral slip speed the tire keeps per unit of lateral impulse; zero is rigid.
+    lateral_compliance: Real,
 }
 
 impl Default for WheelContactState {
@@ -900,6 +935,7 @@ impl Default for WheelContactState {
             friction: TireFriction::new(0.0, 0.0, 1.0, 1.0),
             kinetic_grip: 1.0,
             peak_friction_limit: 0.0,
+            lateral_compliance: 0.0,
         }
     }
 }
@@ -1182,7 +1218,7 @@ impl DynamicRayCastVehicleController {
         // Create default tire types
         tire_types.insert(
             "default".to_string(),
-            TireType::new("default", TireFriction::new(1.0, 0.85, 1.0, 1.0)),
+            TireType::new("default", TireFriction::new(1.0, 0.85, 1.0, 1.0), 0.0),
         );
 
         Self {
@@ -1348,7 +1384,9 @@ impl DynamicRayCastVehicleController {
         }
     }
 
-    /// Adds a new tire type to the controller
+    /// Adds a new tire type to the controller. `cornering_stiffness` is the
+    /// tire's lateral force per radian of slip angle as a multiple of wheel
+    /// load; zero keeps the tire rigid. Panics if it is negative or not finite.
     pub fn add_tire_type(
         &mut self,
         tire_type: &str,
@@ -1356,12 +1394,14 @@ impl DynamicRayCastVehicleController {
         sliding: Real,
         longitudinal: Real,
         lateral: Real,
+        cornering_stiffness: Real,
     ) {
         self.tire_types.insert(
             tire_type.to_string(),
             TireType::new(
                 tire_type,
                 TireFriction::new(peak, sliding, longitudinal, lateral),
+                cornering_stiffness,
             ),
         );
     }
@@ -1743,7 +1783,11 @@ impl DynamicRayCastVehicleController {
         // can come back as NaN.
         let reach = {
             let candidate = wheel.radius * TREAD_PROBE_RADIUS_FACTOR;
-            if candidate.is_finite() { candidate.max(0.0) } else { 0.0 }
+            if candidate.is_finite() {
+                candidate.max(0.0)
+            } else {
+                0.0
+            }
         };
         let ray = Ray::new(wheel.center, wheel.wheel_direction_ws);
         let hit = if reach > 0.0 {
@@ -2772,6 +2816,16 @@ impl DynamicRayCastVehicleController {
                 tire_pressure_grip(wheel.pressure, suspension_force, static_wheel_load);
             let peak_friction_limit =
                 suspension_force * dt * wheel.ground_friction * wheel.friction_slip * pressure_grip;
+            // Cornering stiffness scales with wheel load only, not with the grip
+            // factor or pressure: equal per-load stiffness on both axles keeps the
+            // understeer gradient zero, so the steady yaw response stays kinematic
+            // below the peak whatever grip or pressure each axle runs.
+            let lateral_compliance = tire_lateral_compliance(
+                tire.map_or(0.0, |t| t.cornering_stiffness),
+                suspension_force,
+                wheel.contact_forward_speed,
+                dt,
+            );
             contacts[wheel_id] = WheelContactState {
                 is_grounded: true,
                 ground_object: Some(ground_object),
@@ -2780,6 +2834,7 @@ impl DynamicRayCastVehicleController {
                 friction,
                 kinetic_grip,
                 peak_friction_limit,
+                lateral_compliance,
             };
         }
 
@@ -2902,6 +2957,7 @@ impl DynamicRayCastVehicleController {
                     grip_impulse: contact.peak_friction_limit,
                     shape: [contact.friction.longitudinal, contact.friction.lateral],
                     brake_budget: requested_brake_impulse * radius,
+                    lateral_compliance: contact.lateral_compliance,
                 },
                 drive_delta: raw_drive_angular_impulse / inertia,
                 tc: if contact.is_grounded && powered_acceleration && tc_requested {
@@ -3590,6 +3646,9 @@ impl VehicleContactSolver {
             omega: tick.omega + self.drive_deltas[i] * actuation.drive * (scale - 1.0),
             brake_budget: tick.brake_budget * scale,
             grip_impulse: tick.grip_impulse * scale,
+            // The hold-window impulse is `scale` tick impulses for the same
+            // residual side speed, so the tire's compliance shrinks with it.
+            lateral_compliance: tick.lateral_compliance / scale,
             ..tick
         }
     }
@@ -3666,8 +3725,11 @@ impl VehicleContactSolver {
                         // force direction implies this unavoidable longitudinal
                         // slip; the lateral force left on the envelope is
                         // fy / fx * sqrt(fx^2 - longitudinal^2).
+                        // A compliant tire keeps side speed below saturation by
+                        // design; only the slip beyond that compliance is sliding.
                         let side = self.speed_without_self(i)[1]
-                            + multiply(c.response, self.impulses[i])[1];
+                            + multiply(c.response, self.impulses[i])[1]
+                            + c.lateral_compliance * self.impulses[i][1];
                         let [fx, fy] = [grip * c.shape[0], grip * c.shape[1]];
                         let steady = if longitudinal < fx {
                             side.abs() * longitudinal
@@ -4076,6 +4138,9 @@ impl VehicleContactSolver {
                 linear += (c.speed[0] + own[0]) * delta[0]
                     + (c.speed[1] + own[1]) * delta[1]
                     + self.omega(i) * angular;
+                // Tire compliance is part of the energy the block solve minimizes.
+                linear += c.lateral_compliance * self.impulses[i][1] * delta[1];
+                curvature += c.lateral_compliance * delta[1] * delta[1];
                 curvature += (0..self.contacts.len())
                     .map(|j| {
                         angular
@@ -4280,6 +4345,10 @@ struct CoupledContact {
     /// Longitudinal and lateral envelope axes as multipliers of grip_impulse.
     pub shape: [Real; 2],
     pub brake_budget: Real,
+    /// Lateral slip speed a rolling tire keeps per unit of lateral impulse, the
+    /// inverse of its cornering stiffness in impulse form. Zero is a rigid tire
+    /// that cancels all side speed it has grip for.
+    pub lateral_compliance: Real,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4428,13 +4497,24 @@ impl CoupledContact {
         }
     }
 
+    /// Contact response of a rolling wheel: the tire's own compliance joins the
+    /// lateral diagonal, so the free solve lands on the linear-tire fixed point
+    /// `j = -stiffness * residual side speed` instead of cancelling all side
+    /// speed. A held (locked) wheel slides and has no cornering stiffness, so it
+    /// keeps the bare body response.
+    fn rolling_response(self) -> [[Real; 2]; 2] {
+        let mut response = self.response;
+        response[0][0] += self.radius * self.radius / self.inertia;
+        response[1][1] += self.lateral_compliance;
+        response
+    }
+
     pub fn solve(self) -> CoupledContactSolution {
         if self.brake_budget == 0.0 {
             // The brake interval has collapsed to zero. Solve the same rolling
             // equations directly instead of first solving an impossible nonzero
             // holding-brake branch (especially costly inside TC previews).
-            let mut response = self.response;
-            response[0][0] += self.radius * self.radius / self.inertia;
+            let response = self.rolling_response();
             let rhs = [self.omega * self.radius - self.speed[0], -self.speed[1]];
             return self.finish(
                 friction_ellipse(response, rhs, self.grip_impulse, self.shape),
@@ -4476,8 +4556,7 @@ impl CoupledContact {
         // At the active brake bound, wheel inertia remains part of the
         // longitudinal contact response.
         let driven_omega = self.omega + brake / self.inertia;
-        let mut response = self.response;
-        response[0][0] += self.radius * self.radius / self.inertia;
+        let response = self.rolling_response();
         let tangent = friction_ellipse(
             response,
             [driven_omega * self.radius - self.speed[0], -self.speed[1]],
@@ -4736,8 +4815,11 @@ mod tests {
             WheelRole::new(WheelAxle::Front, false, false),
         );
         colliders.insert(
-            ColliderBuilder::cuboid(10.0, 0.05, 10.0)
-                .translation(Vector::new(0.0, ground_depth - 0.05, 0.0)),
+            ColliderBuilder::cuboid(10.0, 0.05, 10.0).translation(Vector::new(
+                0.0,
+                ground_depth - 0.05,
+                0.0,
+            )),
         );
         let mut queries = QueryPipeline::new();
         queries.update(&colliders);
@@ -4809,7 +4891,9 @@ mod tests {
             // Further from the wheel than the wheel is round, so nothing can squash.
             assert!(measured > radius, "the empty reading must clear the tire");
             // The fallback normal is the wheel's own up direction, never a stale surface.
-            let normal = controller.wheel_tread_normal(0).expect("a wheel has a normal");
+            let normal = controller
+                .wheel_tread_normal(0)
+                .expect("a wheel has a normal");
             assert!((normal - Vector::y()).norm() < 1.0e-6, "normal={normal:?}");
         }
     }
@@ -4829,20 +4913,33 @@ mod tests {
             let measured = tread_probe_case(depth, radius)
                 .1
                 .expect("every wheel reports a distance");
-            assert!(measured <= previous + 1.0e-6,
-                "distance must never rise as the road nears: depth {depth} gave {measured}");
-            assert!(measured <= reach + 1.0e-6, "cannot see past its reach: {measured}");
-            assert!(measured > 0.0, "the road is never at the wheel centre: {measured}");
+            assert!(
+                measured <= previous + 1.0e-6,
+                "distance must never rise as the road nears: depth {depth} gave {measured}"
+            );
+            assert!(
+                measured <= reach + 1.0e-6,
+                "cannot see past its reach: {measured}"
+            );
+            assert!(
+                measured > 0.0,
+                "the road is never at the wheel centre: {measured}"
+            );
             previous = measured;
         }
-        assert!(previous < reach, "the road must have come into reach by the end");
+        assert!(
+            previous < reach,
+            "the road must have come into reach by the end"
+        );
     }
 
     #[test]
     fn the_tread_probe_normal_faces_out_of_the_road() {
         let (controller, distance) = tread_probe_case(-0.5, 0.2);
         assert!(distance.is_some());
-        let normal = controller.wheel_tread_normal(0).expect("a wheel has a normal");
+        let normal = controller
+            .wheel_tread_normal(0)
+            .expect("a wheel has a normal");
         // Opposing the suspension direction, so a renderer can clamp against it.
         assert!(normal.dot(&-Vector::y()) < 0.0, "normal={normal:?}");
         assert!((normal - Vector::y()).norm() < 1.0e-4, "normal={normal:?}");
@@ -5037,6 +5134,7 @@ mod tests {
             grip_impulse: 50.0,
             shape: [1.0, 1.0],
             brake_budget: 100.0,
+            lateral_compliance: 0.0,
         }
     }
 
@@ -5152,6 +5250,7 @@ mod tests {
                 grip_impulse: range(0.0, 150.0),
                 shape: [longitudinal, lateral],
                 brake_budget: range(0.0, 400.0),
+                lateral_compliance: 0.0,
             };
             check_solution(contact, contact.solve());
         }
@@ -5590,6 +5689,7 @@ mod tests {
             grip_impulse: 50.0,
             shape: [1.0, 1.0],
             brake_budget: 0.0,
+            lateral_compliance: 0.0,
         }
     }
 
@@ -5811,7 +5911,13 @@ mod tests {
 
     #[test]
     fn aligned_contacts_do_not_depend_on_wheel_order() {
-        for toe in [-0.05_f64, 0.0, 0.1] {
+        for (toe, stiffness) in [
+            (-0.05_f64, 0.0),
+            (0.0, 0.0),
+            (0.1, 0.0),
+            (0.1, 20.0),
+            (-0.3, 20.0),
+        ] {
             for braking in [false, true] {
                 let mut reference: Option<(Vector<Real>, Vector<Real>)> = None;
                 for a in 0..4 {
@@ -5824,6 +5930,10 @@ mod tests {
                                 }
                                 let (mut controller, mut bodies, colliders) =
                                     four_wheel_test_vehicle(20.0, 0.0);
+                                controller
+                                    .get_tire_type_mut("default")
+                                    .unwrap()
+                                    .cornering_stiffness = stiffness;
                                 for wheel in &mut controller.wheels {
                                     let side = wheel.chassis_connection_point_cs.x.signum();
                                     let angle = (toe as Real).to_radians() * side;
@@ -5866,6 +5976,250 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn tire_lateral_compliance_is_rigid_at_zero_stiffness_and_below_the_speed_floor() {
+        let dt = 1.0 / 60.0;
+        assert_eq!(tire_lateral_compliance(0.0, 3000.0, 20.0, dt), 0.0);
+        assert_eq!(tire_lateral_compliance(20.0, 0.0, 20.0, dt), 0.0);
+        assert_eq!(tire_lateral_compliance(20.0, 3000.0, Real::NAN, dt), 0.0);
+        for speed in [0.0, 0.5, -0.9, CORNERING_STIFFNESS_SPEED_FLOOR] {
+            assert_eq!(tire_lateral_compliance(20.0, 3000.0, speed, dt), 0.0);
+        }
+        // The ramp above the floor is continuous, direction-independent and
+        // inverse in stiffness, load and timestep.
+        let just_above =
+            tire_lateral_compliance(20.0, 3000.0, CORNERING_STIFFNESS_SPEED_FLOOR + 1e-3, dt);
+        assert!(just_above > 0.0 && just_above < 1e-5);
+        for speed in [2.0, 20.0, 80.0] {
+            let expected = (speed - CORNERING_STIFFNESS_SPEED_FLOOR) / (20.0 * 3000.0 * dt);
+            let close = |value: Real| (value - expected).abs() < 1e-5 * expected;
+            assert!(close(tire_lateral_compliance(20.0, 3000.0, speed, dt)));
+            assert!(close(tire_lateral_compliance(20.0, 3000.0, -speed, dt)));
+            assert!(close(
+                tire_lateral_compliance(40.0, 3000.0, speed, dt) * 2.0
+            ));
+            assert!(close(
+                tire_lateral_compliance(20.0, 6000.0, speed, dt) * 2.0
+            ));
+            assert!(close(
+                tire_lateral_compliance(20.0, 3000.0, speed, dt * 2.0) * 2.0
+            ));
+        }
+    }
+
+    #[test]
+    fn compliant_contact_matches_a_linear_tire_below_saturation() {
+        let base = tire_test_contact();
+        for compliance in [0.002, 0.01, 0.05] {
+            for side in [0.02, 0.1, 0.2] {
+                let c = CoupledContact {
+                    speed: [40.0, side],
+                    lateral_compliance: compliance,
+                    ..base
+                };
+                let result = c.solve();
+                // Linear tire: the side speed it keeps is its impulse times its compliance.
+                assert!(
+                    (result.speed[1] + compliance * result.tangent[1]).abs() < 1e-5 * side,
+                    "compliance {compliance}, side {side}: {result:?}"
+                );
+                let expected = -side / (0.003 + compliance);
+                assert!((result.tangent[1] - expected).abs() < 1e-4 * expected.abs());
+                assert!(result.tangent[0].abs() < 1e-3);
+                assert!(envelope_norm(result.tangent, c.shape) < c.grip_impulse);
+                // The impulse only removes energy from the contact.
+                let j = result.tangent;
+                let energy = 0.5 * 0.003 * (j[0] * j[0] + j[1] * j[1])
+                    + c.speed[0] * j[0]
+                    + c.speed[1] * j[1];
+                assert!(energy <= 0.0);
+                // Skid demand is the compliant demand, so nothing is reported as skidding.
+                assert_eq!(result.requested_tangent, result.tangent);
+                assert_eq!(c.skid_info(result), 1.0);
+            }
+            // Beyond the friction limit the ellipse still binds.
+            let c = CoupledContact {
+                speed: [40.0, 5.0],
+                lateral_compliance: compliance,
+                ..base
+            };
+            let result = c.solve();
+            assert!((envelope_norm(result.tangent, c.shape) - c.grip_impulse).abs() < 1e-3);
+            assert!(result.tangent[1] < 0.0);
+        }
+        // Zero compliance is the rigid tire that cancels the side speed it has grip for.
+        let rigid = CoupledContact {
+            speed: [40.0, 0.1],
+            ..base
+        }
+        .solve();
+        assert!(rigid.speed[1].abs() < 1e-6);
+    }
+
+    struct RearToeProbe {
+        lateral_impulse: Real,
+        forward_impulse: Real,
+        drag_impulse: Real,
+        side_speed: Real,
+        forward_speed: Real,
+        skid_info: Real,
+        dt: Real,
+    }
+
+    fn rear_toe_probe(speed: Real, toe_degrees: Real, stiffness: Real, hz: u32) -> RearToeProbe {
+        let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(speed, 0.0);
+        controller
+            .get_tire_type_mut("default")
+            .unwrap()
+            .cornering_stiffness = stiffness;
+        for wheel in &mut controller.wheels {
+            let side = wheel.chassis_connection_point_cs.x.signum();
+            let angle = if wheel.role.axle == WheelAxle::Rear {
+                toe_degrees.to_radians() * side
+            } else {
+                0.0
+            };
+            wheel.wheel_axle_ws = Vector::new(angle.cos(), 0.0, -angle.sin());
+            wheel.friction_slip = 1.0;
+            // Roll exactly along the toed heading so the probe sees no drive slip.
+            wheel.angular_velocity = speed * angle.cos() / wheel.radius;
+        }
+        let dt = 1.0 / hz as Real;
+        controller.update_friction(&mut bodies, &colliders, dt);
+        assert!(
+            controller.contact_solver.residual <= CONTACT_SOLVER_TOLERANCE,
+            "speed {speed}, toe {toe_degrees}, stiffness {stiffness}, {hz} Hz: residual {}",
+            controller.contact_solver.residual
+        );
+        let body = &bodies[controller.chassis];
+        assert!(
+            body.linvel().x.abs() < 1e-4 && body.angvel().y.abs() < 1e-4,
+            "symmetric toe produces lateral/yaw bias: {:?} {:?}",
+            body.linvel(),
+            body.angvel()
+        );
+        let mut probe = RearToeProbe {
+            lateral_impulse: 0.0,
+            forward_impulse: 0.0,
+            drag_impulse: 0.0,
+            side_speed: 0.0,
+            forward_speed: 0.0,
+            skid_info: 1.0,
+            dt,
+        };
+        for (i, wheel) in controller.wheels.iter().enumerate() {
+            if wheel.role.axle != WheelAxle::Rear {
+                continue;
+            }
+            probe.lateral_impulse += wheel.side_impulse.abs() * 0.5;
+            probe.forward_impulse += wheel.forward_impulse.abs() * 0.5;
+            probe.drag_impulse -= (controller.forward_ws[i] * wheel.forward_impulse
+                + controller.axle[i] * wheel.side_impulse)
+                .z;
+            probe.side_speed += wheel.contact_side_speed.abs() * 0.5;
+            probe.forward_speed += wheel.contact_forward_speed.abs() * 0.5;
+            probe.skid_info = probe.skid_info.min(wheel.skid_info);
+        }
+        probe
+    }
+
+    #[test]
+    fn rear_toe_preload_follows_cornering_stiffness_instead_of_the_friction_limit() {
+        for speed in [10.0, 30.0, 80.0] {
+            for toe_degrees in [-1.0, -0.5, 0.2, 0.5, 1.0] {
+                for stiffness in [15.0, 30.0] {
+                    let rigid = rear_toe_probe(speed, toe_degrees, 0.0, 60);
+                    let mut forces = Vec::new();
+                    for hz in [60, 240] {
+                        let probe = rear_toe_probe(speed, toe_degrees, stiffness, hz);
+                        // Left and right cancel on the chassis, so each tire keeps its
+                        // full geometric side speed and answers it with the linear
+                        // tire impulse stiffness * load * dt * slip angle.
+                        let expected = stiffness * 3_000.0 * probe.dt * probe.side_speed
+                            / (probe.forward_speed - CORNERING_STIFFNESS_SPEED_FLOOR);
+                        // The solver converges to a velocity tolerance; over the
+                        // wheel's effective mass that is an impulse allowance.
+                        let allowance = CONTACT_SOLVER_TOLERANCE * 1_000.0;
+                        assert!(
+                            (probe.lateral_impulse - expected).abs() < 0.02 * expected + allowance,
+                            "speed {speed}, toe {toe_degrees}, stiffness {stiffness}, {hz} Hz: {} != {expected}",
+                            probe.lateral_impulse
+                        );
+                        assert!(
+                            probe.forward_impulse < 0.01 * probe.lateral_impulse + allowance,
+                            "speed {speed}, toe {toe_degrees}, stiffness {stiffness}, {hz} Hz: forward {} lateral {}",
+                            probe.forward_impulse, probe.lateral_impulse
+                        );
+                        assert!(
+                            probe.drag_impulse > 0.0 && probe.drag_impulse < rigid.drag_impulse,
+                            "speed {speed}, toe {toe_degrees}, stiffness {stiffness}, {hz} Hz: drag {} vs rigid {} (lateral {} vs rigid {}, rigid skid {})",
+                            probe.drag_impulse, rigid.drag_impulse, probe.lateral_impulse, rigid.lateral_impulse, rigid.skid_info
+                        );
+                        if toe_degrees.abs() <= 0.2 && speed >= 30.0 {
+                            // Game-like toe: the preload drops to a small fraction of
+                            // the friction limit the rigid tire always sits at, since
+                            // opposing rigid demands can never be met.
+                            assert!(
+                                probe.lateral_impulse < 0.15 * rigid.lateral_impulse,
+                                "speed {speed}, toe {toe_degrees}, stiffness {stiffness}, {hz} Hz: lateral {} vs rigid {}",
+                                probe.lateral_impulse, rigid.lateral_impulse
+                            );
+                        }
+                        assert!(probe.skid_info > 0.99, "skid {}", probe.skid_info);
+                        forces.push(probe.lateral_impulse / probe.dt);
+                    }
+                    assert!(
+                        (forces[0] - forces[1]).abs()
+                            < 0.02 * forces[0] + CONTACT_SOLVER_TOLERANCE * 1_000.0 * 240.0,
+                        "toe preload force depends on the timestep: {forces:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toe_preload_is_rigid_below_the_speed_floor() {
+        for speed in [0.3, 0.9] {
+            let rigid = rear_toe_probe(speed, 1.0, 0.0, 60);
+            let compliant = rear_toe_probe(speed, 1.0, 30.0, 60);
+            assert_eq!(compliant.lateral_impulse, rigid.lateral_impulse);
+            assert_eq!(compliant.drag_impulse, rigid.drag_impulse);
+        }
+    }
+
+    #[test]
+    fn abs_hold_preview_scales_lateral_compliance_with_the_hold_window() {
+        for hz in [60, 240] {
+            let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(20.0, 0.0);
+            controller
+                .get_tire_type_mut("default")
+                .unwrap()
+                .cornering_stiffness = 20.0;
+            for wheel in &mut controller.wheels {
+                wheel.brake = 0.5;
+                wheel.anti_lock_brake = 1.0;
+            }
+            let dt = 1.0 / hz as Real;
+            controller.update_friction(&mut bodies, &colliders, dt);
+            let solver = &controller.contact_solver;
+            let scale = (ABS_HYDRAULIC_HOLD_TIME / dt).max(1.0);
+            for i in 0..4 {
+                let tick = solver.contact(i, solver.actuations[i]);
+                let hold = solver.abs_hold_contact(i, solver.actuations[i]);
+                assert!(tick.lateral_compliance > 0.0);
+                assert!(
+                    (hold.lateral_compliance * scale - tick.lateral_compliance).abs()
+                        < 1e-6 * tick.lateral_compliance
+                );
+                assert!(
+                    (hold.grip_impulse - tick.grip_impulse * scale).abs()
+                        < 1e-6 * hold.grip_impulse
+                );
             }
         }
     }
@@ -6394,6 +6748,7 @@ mod tests {
             grip_impulse: 2.5,
             shape: [1.0, 1.0],
             brake_budget: 0.0,
+            lateral_compliance: 0.0,
         };
         // Wheel inertia gives a forward request of three; the lateral request
         // is minus four. Only reporting weights that lateral request by 0.2.
@@ -6441,6 +6796,7 @@ mod tests {
                     grip_impulse: 3000.0 / hz as Real,
                     shape: [1.0, 1.0],
                     brake_budget: 1500.0 / hz as Real,
+                    lateral_compliance: 0.0,
                 };
                 let result = contact.solve();
                 assert_eq!(result.omega, 0.0);
@@ -6471,6 +6827,7 @@ mod tests {
                 grip_impulse: 50.0,
                 shape: [1.0, 1.0],
                 brake_budget: 0.0,
+                lateral_compliance: 0.0,
             };
             let result = contact.solve();
             assert!((contact.skid_info(result) - expected).abs() < 1e-5);
@@ -6508,6 +6865,7 @@ mod tests {
                     * 0.85,
                 shape: [1.0, 1.0],
                 brake_budget: wheel.max_brake_force * brake * dt * wheel.radius,
+                lateral_compliance: 0.0,
             };
             controller.update_friction(&mut bodies, &colliders, dt);
             let wheel = &controller.wheels[0];
@@ -9850,15 +10208,24 @@ pub struct TireType {
     pub default_friction: TireFriction,
     /// Map of surface material names to friction coefficients
     pub surface_friction: HashMap<String, TireFriction>,
+    /// Lateral force per radian of slip angle as a multiple of wheel load, on
+    /// every surface. Zero keeps the tire rigid below its friction limit.
+    pub cornering_stiffness: Real,
 }
 
 impl TireType {
-    /// Creates a new tire type with the given name and default friction
-    pub fn new(name: &str, default_friction: TireFriction) -> Self {
+    /// Creates a new tire type with the given name, default friction and
+    /// cornering stiffness. Panics if the stiffness is negative or not finite.
+    pub fn new(name: &str, default_friction: TireFriction, cornering_stiffness: Real) -> Self {
+        assert!(
+            cornering_stiffness.is_finite() && cornering_stiffness >= 0.0,
+            "cornering stiffness must be finite and non-negative"
+        );
         Self {
             name: name.to_string(),
             default_friction,
             surface_friction: HashMap::new(),
+            cornering_stiffness,
         }
     }
 

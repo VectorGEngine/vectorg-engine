@@ -373,3 +373,60 @@ fn differential_stalled_contact_solves_stop_early_and_stay_feasible() {
     #[cfg(feature = "f64")]
     let _ = stalled;
 }
+
+#[test]
+fn differential_toe_with_cornering_stiffness_stays_feasible() {
+    // The stalled scenario above, but with compliant tires: opposing toe no
+    // longer saturates the rear, so the coupled contacts converge every tick
+    // while the limited-slip axle and unequal side grip still act.
+    let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(56.0, 1.0);
+    locks(&mut controller, 0.55);
+    set_test_drive(&mut controller, 300.0);
+    controller
+        .get_tire_type_mut("default")
+        .unwrap()
+        .cornering_stiffness = 20.0;
+    for wheel in &mut controller.wheels {
+        let side = wheel.chassis_connection_point_cs.x.signum();
+        let toe = if wheel.role.axle == WheelAxle::Front {
+            0.0005
+        } else {
+            0.0015
+        } * side;
+        wheel.wheel_axle_ws = Vector::new(toe.cos(), 0.0, -toe.sin());
+        wheel.friction_slip = 1.0 + 0.02 * side;
+        wheel.raycast_info.contact_point_ws.y = -0.3;
+    }
+    for _ in 0..240 {
+        controller.current_vehicle_speed = bodies[controller.chassis].linvel().z;
+        controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+        let solver = &controller.contact_solver;
+        assert!(
+            solver.residual <= CONTACT_SOLVER_TOLERANCE,
+            "residual {} after {} iterations",
+            solver.residual,
+            solver.iterations
+        );
+        for (i, prepared) in solver.contacts.iter().enumerate() {
+            let base = prepared.base;
+            let limit = base.grip_impulse * solver.actuations[i].grip;
+            assert!(envelope_norm(solver.impulses[i], base.shape) <= limit + 0.001);
+            assert!(
+                solver.brakes[i].abs() <= base.brake_budget * solver.actuations[i].brake + 0.001
+            );
+            if prepared.wheel_id >= 2 {
+                // Rear toe preload stays a small fraction of the envelope.
+                assert!(
+                    solver.impulses[i][1].abs() < 0.2 * limit,
+                    "rear tire {} carries {:?} of {limit}",
+                    prepared.wheel_id,
+                    solver.impulses[i]
+                );
+            }
+        }
+        assert!(bodies[controller.chassis]
+            .linvel()
+            .iter()
+            .all(|v| v.is_finite()));
+    }
+}

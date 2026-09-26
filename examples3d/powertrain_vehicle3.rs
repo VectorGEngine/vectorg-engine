@@ -79,7 +79,7 @@ pub fn init_world(testbed: &mut Testbed) {
     let mut vehicle = DynamicRayCastVehicleController::new(chassis_handle, config);
     vehicle.index_forward_axis = 2;
     vehicle.index_up_axis = 1;
-    vehicle.add_tire_type("road", 1.0, 0.85, 1.0, 1.0);
+    vehicle.add_tire_type("road", 1.0, 0.85, 1.0, 1.0, 0.0);
     vehicle.add_surface_to_tire_type("road", "tarmac", 1.15, 0.9775, 1.0, 1.0);
 
     let tuning = WheelTuning {
