@@ -4325,9 +4325,10 @@ fn cross_contact_response(
 // including chassis-roll influence and dynamic ground reactions.
 // The selected contact branch also supplies the demand for skid_info reporting.
 
-// Lateral demand weighting for skid reporting. This preserves its feedback and
-// effects scale without changing the contact impulses or exposing tire tuning.
-const SKID_LATERAL_DEMAND_WEIGHT: Real = 0.2;
+// Lateral demand weighting for skid reporting. Sideways demand counts in full, so a
+// tire sliding sideways reports its skid like one locking or spinning. Reporting
+// only: the contact impulses do not depend on it.
+const SKID_LATERAL_DEMAND_WEIGHT: Real = 1.0;
 
 #[derive(Clone, Copy, Debug)]
 struct CoupledContact {
@@ -6751,15 +6752,21 @@ mod tests {
             lateral_compliance: 0.0,
         };
         // Wheel inertia gives a forward request of three; the lateral request
-        // is minus four. Only reporting weights that lateral request by 0.2.
-        let demand = (3.0 as Real).hypot(0.8);
+        // is minus four. Only reporting weights that lateral request.
+        let demand = (3.0 as Real).hypot(4.0 * SKID_LATERAL_DEMAND_WEIGHT);
         let result = contact.solve();
         assert_eq!(result.requested_tangent, [3.0, -4.0]);
         assert!((contact.skid_info(result) - 2.5 / demand).abs() < 1e-6);
         assert!(result.tangent[0].hypot(result.tangent[1]) <= 2.5 + 1e-6);
         for (speed, omega, brake, budget, expected) in [
             ([0.0, 0.0], 10.0, 0.0, 2.5, 0.5),
-            ([0.0, 5.0], 0.0, 0.0, 2.5, 1.0),
+            (
+                [0.0, 5.0],
+                0.0,
+                0.0,
+                2.5,
+                (2.5 / (5.0 * SKID_LATERAL_DEMAND_WEIGHT)).min(1.0),
+            ),
             ([3.0, 4.0], 0.0, 100.0, 2.5, 2.5 / demand),
             ([0.0, 4.0], 6.0, 0.0, 5.0, 1.0),
             ([6.0, 0.0], 6.0, 0.0, 2.5, 1.0),
@@ -6816,8 +6823,9 @@ mod tests {
     }
 
     #[test]
-    fn lateral_skid_reporting_preserves_demand_scale_without_scaling_impulses() {
-        for (side_speed, expected) in [(1.0, 1.0), (2.0, 0.5), (10.0, 0.1)] {
+    fn lateral_skid_reporting_counts_full_demand_without_scaling_impulses() {
+        // The lateral request is 250 per m/s of side speed against a 50 grip budget.
+        for (side_speed, expected) in [(1.0, 0.2), (2.0, 0.1), (10.0, 0.02)] {
             let contact = CoupledContact {
                 speed: [20.0, side_speed],
                 response: [[0.004, 0.0], [0.0, 0.004]],
