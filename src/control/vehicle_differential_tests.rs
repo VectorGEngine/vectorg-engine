@@ -430,3 +430,70 @@ fn differential_toe_with_cornering_stiffness_stays_feasible() {
             .all(|v| v.is_finite()));
     }
 }
+
+#[test]
+fn partial_axle_locks_converge_at_the_lateral_limit_with_traction_control() {
+    // A partially locked clutch is a near-rigid scalar unknown. Relaxed together
+    // with the contacts it ran the solver to its iteration cap at every corner
+    // exit (F-Max, rear lock 0.75); settled exactly after each contact step it
+    // converges like the open and rigid endpoints and stays continuous in lock.
+    let cap = CONTACT_SOLVER_MAX_ITERATIONS * (CONTACT_SOLVER_MAX_ASSIST_ITERATIONS + 1);
+    for hz in [30, 60, 120] {
+        let dt = 1.0 / hz as Real;
+        let mut previous_slip: Option<Real> = None;
+        let mut endpoint_slips = Vec::new();
+        for lock in [0.0, 0.25, 0.5, 0.8, 0.99, 0.999, 1.0] {
+            let (mut c, mut bodies, colliders) = four_wheel_test_vehicle(30.0, 1.0);
+            c.powertrain.config.differential.rear_accel_lock = lock;
+            c.powertrain.config.differential.rear_decel_lock = lock;
+            bodies[c.chassis].set_linvel(Vector::new(2.0, 0.0, 30.0), true);
+            bodies[c.chassis].set_angvel(Vector::y() * 0.1, true);
+            set_test_drive(&mut c, 600.0);
+            for w in &mut c.wheels {
+                w.friction_slip = 1.0;
+                w.last_skid_info = 1.0;
+                if w.role.steered {
+                    w.steering = 0.12;
+                    w.wheel_axle_ws = Vector::new((0.12 as Real).cos(), 0.0, -(0.12 as Real).sin());
+                }
+                let forward = aligned_wheel_forward(&Vector::y(), &w.wheel_axle_ws, &Vector::z());
+                w.angular_velocity = forward
+                    .dot(&bodies[c.chassis].velocity_at_point(&w.raycast_info.contact_point_ws))
+                    / w.radius;
+            }
+            let mut max_iterations = 0;
+            let mut capped = 0;
+            for _ in 0..hz * 2 {
+                c.current_vehicle_speed = bodies[c.chassis].linvel().z;
+                c.update_friction(&mut bodies, &colliders, dt);
+                max_iterations = max_iterations.max(c.contact_solver.iterations);
+                if c.contact_solver.iterations >= cap {
+                    capped += 1;
+                }
+                assert!(bodies[c.chassis].linvel().iter().all(|v| v.is_finite()));
+            }
+            let slip = (c.wheels[2].angular_velocity - c.wheels[3].angular_velocity).abs()
+                * c.wheels[2].radius;
+            assert_eq!(capped, 0, "{hz} Hz lock {lock} hit the iteration cap");
+            assert!(
+                max_iterations * 2 <= cap,
+                "{hz} Hz lock {lock}: {max_iterations} iterations"
+            );
+            if let Some(previous) = previous_slip {
+                assert!(
+                    slip <= previous + 0.01,
+                    "{hz} Hz lock {lock}: rear slip {slip} grew from {previous}"
+                );
+            }
+            previous_slip = Some(slip);
+            if lock >= 0.999 {
+                endpoint_slips.push(slip);
+            }
+        }
+        // Lock 0.999 behaves like the algebraic rigid endpoint.
+        assert!(
+            endpoint_slips.iter().all(|slip| *slip < 0.05),
+            "{hz} Hz: {endpoint_slips:?}"
+        );
+    }
+}

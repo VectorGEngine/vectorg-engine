@@ -4112,19 +4112,6 @@ impl VehicleContactSolver {
                     - self.contacts[i].base.radius
                         * (self.next_impulses[i][0] - self.impulses[i][0]);
             }
-            for axle in &self.axles {
-                if axle.lock < 1.0 {
-                    let delta = axle.next_impulse - axle.impulse;
-                    self.angular_deltas[axle.a] += delta;
-                    self.angular_deltas[axle.b] -= delta;
-                }
-            }
-            if let Some(center) = self.center.as_ref().filter(|c| c.lock < 1.0) {
-                let delta = center.next_impulse - center.impulse;
-                for &(i, c) in &center.coefficients {
-                    self.angular_deltas[i] += delta * c;
-                }
-            }
             let mut linear = 0.0;
             let mut curvature = 0.0;
             for i in 0..self.contacts.len() {
@@ -4163,30 +4150,72 @@ impl VehicleContactSolver {
                 // For exact feasible block minima the optimum step is at
                 // least 1/N (Cauchy-Schwarz on the shared-body response).
                 // Retain that safe descent step when f32 cancellation dominates.
-                let couplings = self.axles.len()
-                    + self
-                        .center
-                        .as_ref()
-                        .filter(|c| c.lock < 1.0)
-                        .map_or(0, |_| 1);
-                (-linear / curvature).clamp(1.0 / (self.contacts.len() + couplings) as Real, 1.0)
+                (-linear / curvature).clamp(1.0 / self.contacts.len() as Real, 1.0)
             } else {
                 1.0
             };
-            for axle in &mut self.axles {
-                if axle.lock < 1.0 {
-                    axle.impulse += relaxation * (axle.next_impulse - axle.impulse);
-                }
-            }
-            if let Some(center) = self.center.as_mut().filter(|c| c.lock < 1.0) {
-                center.impulse += relaxation * (center.next_impulse - center.impulse);
-            }
             for i in 0..self.contacts.len() {
                 for axis in 0..2 {
                     self.impulses[i][axis] +=
                         relaxation * (self.next_impulses[i][axis] - self.impulses[i][axis]);
                 }
                 self.brakes[i] += relaxation * (self.next_brakes[i] - self.brakes[i]);
+            }
+            self.settle_clutches();
+        }
+    }
+
+    /// Exact block solve of every slipping-capable clutch given the current contact
+    /// impulses: the clutch impulse that equalizes its wheel speeds, clamped to the
+    /// lock limit. A scalar block solved exactly is a descent step on the same energy
+    /// the contact line search minimizes, so it needs no relaxation and it does not
+    /// depend on wheel order (each clutch is symmetric in its two wheels).
+    fn settle_clutches(&mut self) {
+        let n = self.contacts.len();
+        for k in 0..self.axles.len() {
+            let axle = &self.axles[k];
+            if axle.lock == 1.0 {
+                continue;
+            }
+            let response = self.rotation_response[axle.a * n + axle.a]
+                + self.rotation_response[axle.b * n + axle.b]
+                - self.rotation_response[axle.a * n + axle.b]
+                - self.rotation_response[axle.b * n + axle.a];
+            if response <= 0.0 {
+                continue;
+            }
+            let next = (axle.impulse + (self.omega(axle.b) - self.omega(axle.a)) / response)
+                .clamp(-axle.limit, axle.limit);
+            self.axles[k].impulse = next;
+            self.axles[k].next_impulse = next;
+        }
+        let center_update = self.center.as_ref().filter(|c| c.lock < 1.0).map(|center| {
+            let response: Real = center
+                .coefficients
+                .iter()
+                .map(|&(i, ci)| {
+                    center
+                        .coefficients
+                        .iter()
+                        .map(|&(j, cj)| ci * self.rotation_response[i * n + j] * cj)
+                        .sum::<Real>()
+                })
+                .sum();
+            let relative: Real = center
+                .coefficients
+                .iter()
+                .map(|&(i, c)| c * self.omega(i))
+                .sum();
+            if response > 0.0 {
+                Some((center.impulse - relative / response).clamp(-center.limit, center.limit))
+            } else {
+                None
+            }
+        });
+        if let Some(Some(next)) = center_update {
+            if let Some(center) = self.center.as_mut() {
+                center.impulse = next;
+                center.next_impulse = next;
             }
         }
     }
