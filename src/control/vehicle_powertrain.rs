@@ -272,6 +272,12 @@ pub struct SteeringConfig {
     ///
     /// A value of `0.0` is linear while `1.0` is fully cubic.
     pub road_wheel_curve: Real,
+    /// Percent Ackermann in the range `-1.0` through `1.0`.
+    ///
+    /// Scales the inner-minus-outer steered-wheel angle difference relative to
+    /// ideal Ackermann geometry. `1.0` is full Ackermann, `0.0` is parallel
+    /// steering and negative values steer the outer wheel more (anti-Ackermann).
+    pub ackermann: Real,
     /// Speed where assisted steering reaches its minimum multiplier.
     pub speed_sensitivity: Real,
     /// Assisted steering multiplier retained at and above the sensitivity speed.
@@ -290,6 +296,7 @@ impl Default for SteeringConfig {
         Self {
             max_angle: (35.0 as Real).to_radians(),
             road_wheel_curve: 0.0,
+            ackermann: 1.0,
             speed_sensitivity: 35.0,
             minimum_speed_factor: 0.25,
             assist: false,
@@ -1860,6 +1867,7 @@ fn sanitize_config(config: &mut VehicleControllerConfig) {
         non_negative_finite(config.dynamics.rear_anti_roll_bar_stiffness);
     config.steering.max_angle = config.steering.max_angle.abs();
     config.steering.road_wheel_curve = config.steering.road_wheel_curve.clamp(0.0, 1.0);
+    config.steering.ackermann = config.steering.ackermann.clamp(-1.0, 1.0);
     config.steering.minimum_speed_factor = config.steering.minimum_speed_factor.clamp(0.0, 1.0);
     config.steering.counter_steer_assist = config.steering.counter_steer_assist.clamp(0.0, 1.0);
 }
@@ -1919,6 +1927,19 @@ mod tests {
         config.steering.road_wheel_curve = 2.0;
         let cubic = VehiclePowertrain::new(config);
         assert_eq!(cubic.config.steering.road_wheel_curve, 1.0);
+    }
+
+    #[test]
+    fn clamps_ackermann_to_signed_normalized_range() {
+        let mut config = VehicleControllerConfig::default();
+        assert_eq!(config.steering.ackermann, 1.0);
+        config.steering.ackermann = -2.0;
+        let anti = VehiclePowertrain::new(config.clone());
+        assert_eq!(anti.config.steering.ackermann, -1.0);
+
+        config.steering.ackermann = 2.0;
+        let full = VehiclePowertrain::new(config);
+        assert_eq!(full.config.steering.ackermann, 1.0);
     }
 
     #[test]

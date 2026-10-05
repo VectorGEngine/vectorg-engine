@@ -2006,6 +2006,7 @@ impl DynamicRayCastVehicleController {
                 + (1.0 - normalized).powi(2) * (1.0 - steering_config.minimum_speed_factor)
         };
         let max_angle = steering_config.max_angle;
+        let ackermann = steering_config.ackermann;
         let normalized_input = input.steering.clamp(-1.0, 1.0);
         let driver_steering_angle = normalized_input * max_angle * speed_factor;
         let curved_input =
@@ -2146,6 +2147,7 @@ impl DynamicRayCastVehicleController {
         } else {
             0.0
         };
+        let forward_axis = Vector::ith(self.index_forward_axis, 1.0);
 
         for wheel in &mut self.wheels {
             if !wheel.role.steered {
@@ -2160,13 +2162,20 @@ impl DynamicRayCastVehicleController {
 
             let turn_radius = wheelbase / center_angle.abs().tan().max(1.0e-4);
             let side = wheel.chassis_connection_point_cs.coords[side_axis];
-            let inner_wheel = side.signum() == center_angle.signum();
+            // A positive rotation about the steering axis turns the wheel's
+            // forward direction towards `axis × forward`, so that side of the
+            // chassis is the inside of the turn.
+            let turn_side = wheel.steering_axis_cs().cross(&forward_axis)[side_axis];
+            let inner_wheel = side * turn_side * center_angle > 0.0;
             let wheel_radius = if inner_wheel {
                 (turn_radius - track_width * 0.5).max(0.05)
             } else {
                 turn_radius + track_width * 0.5
             };
-            wheel.steering = center_angle.signum() * (wheelbase / wheel_radius).atan();
+            let ideal = center_angle.signum() * (wheelbase / wheel_radius).atan();
+            // Percent Ackermann scales the ideal inner/outer difference about the
+            // centre angle; written from `ideal` so `1.0` reproduces it exactly.
+            wheel.steering = ideal + (1.0 - ackermann) * (center_angle - ideal);
         }
     }
 
@@ -9627,6 +9636,147 @@ mod tests {
         assert!((controller.state().driver_steering_angle - 0.3).abs() < 1.0e-5);
         assert!((controller.state().steering_angle - expected).abs() < 1.0e-5);
         assert!((controller.wheels[0].steering - expected).abs() < 1.0e-5);
+    }
+
+    const ACKERMANN_WHEELBASE: Real = 2.6;
+    const ACKERMANN_TRACK: Real = 1.6;
+
+    fn ackermann_controller(
+        ackermann: Real,
+        forward_axis: usize,
+        steering: Real,
+    ) -> DynamicRayCastVehicleController {
+        let mut config = VehicleControllerConfig::default();
+        config.steering.max_angle = 0.6;
+        config.steering.ackermann = ackermann;
+        let mut controller =
+            DynamicRayCastVehicleController::new(RigidBodyHandle::invalid(), config);
+        controller.index_forward_axis = forward_axis;
+        controller.index_up_axis = 1;
+        let side_axis = controller.side_axis();
+        for (forward, side, role) in [
+            (
+                ACKERMANN_WHEELBASE * 0.5,
+                ACKERMANN_TRACK * 0.5,
+                WheelRole::new(WheelAxle::Front, false, true),
+            ),
+            (
+                ACKERMANN_WHEELBASE * 0.5,
+                -ACKERMANN_TRACK * 0.5,
+                WheelRole::new(WheelAxle::Front, false, true),
+            ),
+            (
+                -ACKERMANN_WHEELBASE * 0.5,
+                ACKERMANN_TRACK * 0.5,
+                WheelRole::new(WheelAxle::Rear, false, false),
+            ),
+            (
+                -ACKERMANN_WHEELBASE * 0.5,
+                -ACKERMANN_TRACK * 0.5,
+                WheelRole::new(WheelAxle::Rear, false, false),
+            ),
+        ] {
+            let mut connection = Point::origin();
+            connection[forward_axis] = forward;
+            connection[side_axis] = side;
+            controller.add_wheel(
+                connection,
+                -Vector::y(),
+                Vector::ith(side_axis, 1.0),
+                0.4,
+                0.35,
+                0.2,
+                &WheelTuning::default(),
+                role,
+            );
+        }
+        controller.set_input(VehicleInput {
+            steering,
+            ..VehicleInput::default()
+        });
+        let chassis = RigidBodyBuilder::dynamic().build();
+        controller.update_steering(&chassis, 1.0 / 60.0);
+        controller
+    }
+
+    /// Returns `(inner, outer)` steered-wheel angles, choosing the inner wheel
+    /// from the direction the steered wheels actually point.
+    fn ackermann_inner_outer(controller: &DynamicRayCastVehicleController) -> (Real, Real) {
+        let side_axis = controller.side_axis();
+        let forward = Vector::ith(controller.index_forward_axis, 1.0);
+        let center = controller.state().steering_angle;
+        let heading = Rotation::new(controller.wheels[0].steering_axis_cs() * center) * forward;
+        let (inside, outside) = if controller.wheels[0].chassis_connection_point_cs[side_axis]
+            * heading[side_axis]
+            > 0.0
+        {
+            (&controller.wheels[0], &controller.wheels[1])
+        } else {
+            (&controller.wheels[1], &controller.wheels[0])
+        };
+        (inside.steering, outside.steering)
+    }
+
+    #[test]
+    fn full_ackermann_steers_the_physical_inner_wheel_more_on_any_chassis_axes() {
+        for forward_axis in [0, 2] {
+            for steering in [0.6, -0.6] {
+                let controller = ackermann_controller(1.0, forward_axis, steering);
+                let (inner, outer) = ackermann_inner_outer(&controller);
+                assert!(
+                    inner.abs() > outer.abs(),
+                    "axis {forward_axis}, input {steering}: inner {inner}, outer {outer}"
+                );
+                // Ideal Ackermann: cot(outer) - cot(inner) = track / wheelbase.
+                let cot_difference = 1.0 / outer.abs().tan() - 1.0 / inner.abs().tan();
+                assert!(
+                    (cot_difference - ACKERMANN_TRACK / ACKERMANN_WHEELBASE).abs() < 1.0e-4,
+                    "axis {forward_axis}, input {steering}: {cot_difference}"
+                );
+                assert_eq!(controller.wheels[2].steering, 0.0);
+                assert_eq!(controller.wheels[3].steering, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn ackermann_scales_the_ideal_inner_outer_difference_continuously() {
+        for forward_axis in [0, 2] {
+            for steering in [0.35, -0.8, 1.0] {
+                let ideal = ackermann_controller(1.0, forward_axis, steering);
+                let center = ideal.state().steering_angle;
+                let (ideal_inner, ideal_outer) = ackermann_inner_outer(&ideal);
+                let ideal_difference = ideal_inner.abs() - ideal_outer.abs();
+                assert!(ideal_difference > 0.0);
+
+                for ackermann in [-1.0, -0.999, -0.5, -0.25, 0.0, 0.25, 0.5, 0.8, 0.99, 0.999] {
+                    let controller = ackermann_controller(ackermann, forward_axis, steering);
+                    assert_eq!(controller.state().steering_angle, center);
+                    let (inner, outer) = ackermann_inner_outer(&controller);
+                    assert_eq!(inner.signum(), center.signum());
+                    assert_eq!(outer.signum(), center.signum());
+                    let difference = inner.abs() - outer.abs();
+                    assert!(
+                        (difference - ackermann * ideal_difference).abs() < 1.0e-5,
+                        "axis {forward_axis}, input {steering}, ackermann {ackermann}: \
+                         {difference} vs {}",
+                        ackermann * ideal_difference
+                    );
+                    assert!(((inner - center) - ackermann * (ideal_inner - center)).abs() < 1.0e-5);
+                    assert!(((outer - center) - ackermann * (ideal_outer - center)).abs() < 1.0e-5);
+                }
+
+                let parallel = ackermann_controller(0.0, forward_axis, steering);
+                assert!((parallel.wheels[0].steering - center).abs() < 1.0e-6);
+                assert!((parallel.wheels[1].steering - center).abs() < 1.0e-6);
+
+                let anti = ackermann_controller(-1.0, forward_axis, steering);
+                let (anti_inner, anti_outer) = ackermann_inner_outer(&anti);
+                assert!(anti_outer.abs() > anti_inner.abs());
+                assert!(((anti_outer - center) + (ideal_outer - center)).abs() < 1.0e-5);
+                assert!(((anti_inner - center) + (ideal_inner - center)).abs() < 1.0e-5);
+            }
+        }
     }
 
     #[test]
