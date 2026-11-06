@@ -38,6 +38,10 @@ const AUTO_CLUTCH_DISENGAGED_EPSILON: Real = 0.01;
 // Inertia-scaled PI gains give light and heavy engines the same idle response.
 const IDLE_CONTROL_RESPONSE: Real = 5.0;
 const IDLE_MAX_THROTTLE: Real = 0.25;
+// Free-engine pumping loss: the closed-throttle multiplier falls to the
+// open-throttle 1.0 by this throttle, as manifold vacuum collapses.
+const CLOSED_THROTTLE_PUMPING_LOSS: Real = 2.5;
+const PUMPING_LOSS_FADE_THROTTLE: Real = 0.2;
 
 /// Engine parameters used by the vehicle powertrain.
 #[derive(Clone, Debug)]
@@ -847,7 +851,7 @@ impl VehiclePowertrain {
         let torque_capacity = available_torque * boost * limiter_torque_factor;
         let idle_throttle = self.idle_throttle(dt, drive_throttle, torque_capacity, friction_scale);
         let engine_throttle = drive_throttle.max(idle_throttle);
-        let pumping_loss = 2.5 + (1.0 - 2.5) * engine_throttle;
+        let pumping_loss = pumping_loss(engine_throttle);
         let combustion_torque = if self.state.engine_running {
             torque_capacity * engine_throttle
         } else {
@@ -1025,12 +1029,18 @@ impl VehiclePowertrain {
 
         let error = (self.config.engine.idle_rpm - self.state.engine_rpm) * TAU / 60.0;
         let proportional = 2.0 * IDLE_CONTROL_RESPONSE * self.config.engine.inertia * error;
-        // At unloaded idle, losses are F * 0.2 * (2.5 - 1.5 * throttle).
+        // At unloaded idle, losses are F * 0.2 * pumping_loss(throttle).
         // Solve that balance through the torque curve, rather than adding a
         // second combustion source or forcing the crankshaft to an RPM.
-        let throttle_response = torque_capacity + friction_scale * 0.2 * 1.5;
-        let requested = (friction_scale * 0.2 * 2.5 + proportional + self.idle_integral_torque)
-            / throttle_response.max(Real::EPSILON);
+        let idle_loss = friction_scale * 0.2;
+        let requested = idle_throttle_for_net_torque(
+            proportional + self.idle_integral_torque,
+            torque_capacity,
+            idle_loss,
+        );
+        // Net torque the governor gains between closed and maximum idle throttle.
+        let idle_torque_range = IDLE_MAX_THROTTLE * torque_capacity
+            + idle_loss * (pumping_loss(0.0) - pumping_loss(IDLE_MAX_THROTTLE));
         let throttle = requested.clamp(0.0, IDLE_MAX_THROTTLE);
         if drive_throttle > throttle {
             self.idle_integral_torque = 0.0;
@@ -1039,7 +1049,7 @@ impl VehiclePowertrain {
             // driver/auto-blip demand which already overrides the governor.
             self.idle_integral_torque = (self.idle_integral_torque
                 + self.config.engine.inertia * IDLE_CONTROL_RESPONSE.powi(2) * error * dt)
-                .clamp(0.0, throttle_response * IDLE_MAX_THROTTLE);
+                .clamp(0.0, idle_torque_range);
         }
         throttle
     }
@@ -1826,6 +1836,29 @@ impl VehiclePowertrain {
     }
 }
 
+/// Free-engine pumping-loss multiplier, from closed throttle down to 1.0 at the fade throttle.
+fn pumping_loss(throttle: Real) -> Real {
+    let vacuum = (1.0 - throttle / PUMPING_LOSS_FADE_THROTTLE).clamp(0.0, 1.0);
+    1.0 + (CLOSED_THROTTLE_PUMPING_LOSS - 1.0) * vacuum * vacuum
+}
+
+/// Throttle at which unloaded idle combustion exceeds `idle_loss * pumping_loss`
+/// by `net_torque`. Net torque rises monotonically with throttle.
+fn idle_throttle_for_net_torque(net_torque: Real, capacity: Real, idle_loss: Real) -> Real {
+    let open_demand = net_torque + idle_loss;
+    if open_demand >= capacity * PUMPING_LOSS_FADE_THROTTLE {
+        return open_demand / capacity;
+    }
+    // Below the fade throttle: t * C = D + a * (1 - t / t0)^2. Take the
+    // smaller root in its cancellation-free form.
+    let t0 = PUMPING_LOSS_FADE_THROTTLE;
+    let a = idle_loss * (CLOSED_THROTTLE_PUMPING_LOSS - 1.0);
+    let slope = capacity + 2.0 * a / t0;
+    let demand = open_demand + a;
+    let discriminant = (slope * slope - 4.0 * a * demand / (t0 * t0)).max(0.0);
+    2.0 * demand / (slope + discriminant.sqrt())
+}
+
 fn sanitize_config(config: &mut VehicleControllerConfig) {
     assert!(
         config.differential.is_valid(),
@@ -2207,6 +2240,70 @@ mod tests {
         assert_eq!(powertrain.state.current_gear, 0);
         assert!(powertrain.state.engine_rpm >= powertrain.config.engine.idle_rpm);
         assert!(powertrain.state.engine_rpm < 2200.0);
+    }
+
+    #[test]
+    fn free_engine_reaches_the_limiter_from_a_partial_steady_pedal() {
+        for hz in [30.0, 60.0, 120.0] {
+            let mut config = VehicleControllerConfig::default();
+            config.transmission.automatic = false;
+            config.engine.idle_rpm = 1000.0;
+            config.engine.max_rpm = 8000.0;
+            config.engine.rev_limit_rpm = 7900.0;
+            config.engine.inertia = 0.2;
+            config.engine.friction_torque = Some(70.0);
+            config.engine.torque_curve = vec![
+                (1000.0, 405.0),
+                (4000.0, 600.0),
+                (6000.0, 574.0),
+                (8000.0, 473.0),
+            ];
+            let mut powertrain = VehiclePowertrain::new(config);
+            powertrain.set_input(VehicleInput {
+                throttle: 0.35,
+                ..VehicleInput::default()
+            });
+
+            for _ in 0..(3.0 * hz) as usize {
+                powertrain.update(1.0 / hz, 0.0, 0.0, 0.35);
+            }
+
+            assert_eq!(powertrain.state.current_gear, 0);
+            assert!(powertrain.state.engine_rpm >= 7900.0 * 0.97, "{hz} Hz");
+        }
+    }
+
+    #[test]
+    fn pumping_loss_fades_between_unchanged_closed_and_open_throttle_values() {
+        assert_eq!(pumping_loss(0.0), CLOSED_THROTTLE_PUMPING_LOSS);
+        assert_eq!(pumping_loss(PUMPING_LOSS_FADE_THROTTLE), 1.0);
+        assert_eq!(pumping_loss(1.0), 1.0);
+        let mut previous = pumping_loss(0.0);
+        for step in 1..=100 {
+            let loss = pumping_loss(step as Real / 100.0);
+            assert!(loss <= previous);
+            previous = loss;
+        }
+    }
+
+    #[test]
+    fn idle_throttle_solves_the_pumping_loss_balance() {
+        for capacity in [80.0, 405.0, 900.0] {
+            for idle_loss in [0.0, 14.0, 60.0] {
+                for net_torque in [-20.0, 0.0, 5.0, 40.0, 150.0] {
+                    let throttle = idle_throttle_for_net_torque(net_torque, capacity, idle_loss);
+                    let balance = throttle * capacity - idle_loss * pumping_loss(throttle);
+                    if throttle >= 0.0 {
+                        assert!(
+                            (balance - net_torque).abs() < 1.0e-5 * capacity,
+                            "{capacity} {idle_loss} {net_torque}: {throttle} -> {balance}"
+                        );
+                    } else {
+                        assert!(net_torque < -idle_loss * CLOSED_THROTTLE_PUMPING_LOSS);
+                    }
+                }
+            }
+        }
     }
 
     fn automatic_powertrain() -> VehiclePowertrain {
@@ -3884,7 +3981,8 @@ mod tests {
         // engine braking=0.2. Idle control is inactive at this speed.
         for (throttle, free_loss, connected_loss) in [
             (0.0, 150.71429, 51.42857),
-            (0.4, 114.54286, 30.85714),
+            (0.1, 82.89286, 46.28571),
+            (0.4, 60.28571, 30.85714),
             (1.0, 60.28571, 0.0),
         ] {
             for connected in [false, true] {
