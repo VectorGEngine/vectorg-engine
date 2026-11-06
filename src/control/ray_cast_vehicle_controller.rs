@@ -54,9 +54,9 @@ const TIRE_PRESSURE_REFERENCE: Real = 2.0;
 // Spread of the pressure match curve in log-pressure units. Smaller values make
 // pressure matter more and narrow the usable band around the matched pressure.
 const TIRE_PRESSURE_SIGMA: Real = 1.4;
-// A wheel barely touching the ground has no meaningful matched pressure, so its
-// load ratio is floored before the curve is evaluated.
-const TIRE_PRESSURE_MIN_LOAD_RATIO: Real = 0.15;
+// A wheel barely touching the ground has no meaningful matched pressure or load
+// reference, so its load ratio is floored before the tire curves are evaluated.
+const TIRE_MIN_LOAD_RATIO: Real = 0.15;
 
 const SLIDING_START_SPEED: Real = 4.0;
 const SLIDING_FULL_SPEED: Real = 8.0;
@@ -106,11 +106,7 @@ fn tire_pressure_grip(pressure: Real, load: Real, static_load: Real) -> Real {
     if !pressure.is_finite() || pressure <= 0.0 || !static_load.is_finite() || static_load <= 0.0 {
         return 1.0;
     }
-    let load_ratio = if load.is_finite() && load > 0.0 {
-        (load / static_load).max(TIRE_PRESSURE_MIN_LOAD_RATIO)
-    } else {
-        TIRE_PRESSURE_MIN_LOAD_RATIO
-    };
+    let load_ratio = tire_load_ratio(load, static_load);
     let deviation = (pressure / TIRE_PRESSURE_REFERENCE).ln();
     let matched = load_ratio.ln();
     let exponent =
@@ -121,6 +117,65 @@ fn tire_pressure_grip(pressure: Real, load: Real, static_load: Real) -> Real {
     } else {
         1.0
     }
+}
+
+/// The `load` in newtons a tire carries as a multiple of its `static_load` at
+/// rest, floored for a wheel barely touching the ground.
+fn tire_load_ratio(load: Real, static_load: Real) -> Real {
+    if load.is_finite() && load > 0.0 {
+        (load / static_load).max(TIRE_MIN_LOAD_RATIO)
+    } else {
+        TIRE_MIN_LOAD_RATIO
+    }
+}
+
+/// Grip multiplier for a tire of `load_sensitivity` carrying `load` newtons,
+/// against the `static_load` it carries at rest.
+///
+/// A real tire's friction coefficient falls as its load rises: twice the load
+/// buys less than twice the grip. The grip force follows the load raised to
+/// `load_sensitivity`, so the coefficient follows the load ratio raised to
+/// `load_sensitivity - 1`. One keeps grip proportional to load; lower values
+/// cost an axle grip as weight transfers onto it, which is what lets roll
+/// stiffness, weight transfer and aero load move the balance. A wheel at its
+/// static load keeps the tire table's grip.
+fn tire_load_grip(load_sensitivity: Real, load: Real, static_load: Real) -> Real {
+    if !static_load.is_finite() || static_load <= 0.0 {
+        return 1.0;
+    }
+    let grip = tire_load_ratio(load, static_load).powf(load_sensitivity - 1.0);
+    if grip.is_finite() {
+        grip
+    } else {
+        1.0
+    }
+}
+
+/// The friction a wheel's `tire` has on `ground_type`. A wheel without a
+/// registered tire type grips at its own `friction_slip`.
+fn tire_friction(tire: Option<&TireType>, ground_type: &str, friction_slip: Real) -> TireFriction {
+    tire.map(|t| t.get_friction(ground_type))
+        .unwrap_or_else(|| TireFriction::new(friction_slip, friction_slip, 1.0, 1.0))
+}
+
+/// Peak grip impulse over `dt` of a tire carrying `load` newtons on ground of
+/// `peak` friction, with the wheel's `friction_slip` grip factor, `pressure`
+/// and its tire's `load_sensitivity`, against the `static_load` it carries at
+/// rest. With `dt` of one it is the peak grip force in newtons.
+fn tire_peak_grip(
+    load: Real,
+    dt: Real,
+    peak: Real,
+    friction_slip: Real,
+    pressure: Real,
+    load_sensitivity: Real,
+    static_load: Real,
+) -> Real {
+    load * dt
+        * peak
+        * friction_slip
+        * tire_pressure_grip(pressure, load, static_load)
+        * tire_load_grip(load_sensitivity, load, static_load)
 }
 
 fn longitudinal_slip_amount(speed: Real) -> Real {
@@ -1218,7 +1273,7 @@ impl DynamicRayCastVehicleController {
         // Create default tire types
         tire_types.insert(
             "default".to_string(),
-            TireType::new("default", TireFriction::new(1.0, 0.85, 1.0, 1.0), 0.0),
+            TireType::new("default", TireFriction::new(1.0, 0.85, 1.0, 1.0), 0.0, 1.0),
         );
 
         Self {
@@ -1386,7 +1441,10 @@ impl DynamicRayCastVehicleController {
 
     /// Adds a new tire type to the controller. `cornering_stiffness` is the
     /// tire's lateral force per radian of slip angle as a multiple of wheel
-    /// load; zero keeps the tire rigid. Panics if it is negative or not finite.
+    /// load; zero keeps the tire rigid. `load_sensitivity` is the exponent its
+    /// grip force follows in wheel load; one keeps grip proportional to load.
+    /// Panics if the stiffness is negative or not finite, or the load
+    /// sensitivity lies outside zero to one.
     pub fn add_tire_type(
         &mut self,
         tire_type: &str,
@@ -1395,6 +1453,7 @@ impl DynamicRayCastVehicleController {
         longitudinal: Real,
         lateral: Real,
         cornering_stiffness: Real,
+        load_sensitivity: Real,
     ) {
         self.tire_types.insert(
             tire_type.to_string(),
@@ -1402,6 +1461,7 @@ impl DynamicRayCastVehicleController {
                 tire_type,
                 TireFriction::new(peak, sliding, longitudinal, lateral),
                 cornering_stiffness,
+                load_sensitivity,
             ),
         );
     }
@@ -1504,6 +1564,38 @@ impl DynamicRayCastVehicleController {
         chassis.angvel().dot(&up)
     }
 
+    /// The fastest steady yaw rate the tires can hold at `speed`: their combined
+    /// cornering grip as lateral acceleration, over speed. Each wheel's grip is the
+    /// peak the tire solve uses, from its current load, so weight transfer, aero
+    /// load, pressure and load sensitivity all count, and an airborne car holds
+    /// none.
+    fn grip_limited_yaw_rate(&self, chassis: &RigidBody, speed: Real) -> Real {
+        let mass = chassis.mass();
+        let static_wheel_load = mass * 9.81 / self.wheels.len() as Real;
+        let lateral_grip: Real = self
+            .wheels
+            .iter()
+            .map(|wheel| {
+                let tire = self.tire_types.get(&wheel.tire_type);
+                let friction = tire_friction(tire, &wheel.ground_type, wheel.friction_slip);
+                let load = wheel
+                    .wheel_suspension_force
+                    .min(wheel.max_suspension_force)
+                    .max(0.0);
+                tire_peak_grip(
+                    load,
+                    1.0,
+                    friction.peak,
+                    wheel.friction_slip,
+                    wheel.pressure,
+                    tire.map_or(1.0, |t| t.load_sensitivity),
+                    static_wheel_load,
+                ) * friction.lateral
+            })
+            .sum();
+        lateral_grip / (mass * speed.abs())
+    }
+
     fn esc_intervention(&self, chassis: &RigidBody) -> EscIntervention {
         let esc = self.esc.clamp(0.0, 1.0);
         let speed = self.current_vehicle_speed;
@@ -1533,7 +1625,14 @@ impl DynamicRayCastVehicleController {
         }
 
         let wheelbase = (max_forward - min_forward).abs().max(1.0);
-        let desired_yaw_rate = speed * steering.tan() / wheelbase;
+        // The yaw rate the steering asks for, held to what the tires can deliver.
+        // Past their grip the car cannot turn tighter; demanding more would read
+        // as understeer and brake the inside rear wheel into a spin.
+        let steered_yaw_rate = speed * steering.tan() / wheelbase;
+        let desired_yaw_rate = steered_yaw_rate.signum()
+            * steered_yaw_rate
+                .abs()
+                .min(self.grip_limited_yaw_rate(chassis, speed));
         let actual_yaw_rate = self.chassis_yaw_rate(chassis);
         let rotation = chassis.position().rotation;
         let local_up = Vector::ith(self.index_up_axis, 1.0);
@@ -2750,9 +2849,11 @@ impl DynamicRayCastVehicleController {
             let rotation = chassis.position().rotation;
             let chassis_forward = rotation * Vector::ith(self.index_forward_axis, 1.0);
             // The load each wheel carries at rest, used as the reference the tire
-            // pressure curve matches against. Weight distribution is deliberately
-            // ignored: an axle carrying more than its even share simply sits above
-            // its reference load and wants more pressure, which is the real effect.
+            // pressure and load-sensitivity curves match against. Weight
+            // distribution is deliberately ignored: an axle carrying more than its
+            // even share simply sits above its reference load, wants more pressure
+            // and, on a load-sensitive tire, holds less grip per newton, which are
+            // the real effects.
             let static_wheel_load = chassis.mass() * 9.81 / num_wheels as Real;
             (
                 intervention,
@@ -2823,12 +2924,22 @@ impl DynamicRayCastVehicleController {
                 .max(0.0);
             let pressure_grip =
                 tire_pressure_grip(wheel.pressure, suspension_force, static_wheel_load);
-            let peak_friction_limit =
-                suspension_force * dt * wheel.ground_friction * wheel.friction_slip * pressure_grip;
+            let load_grip = tire_load_grip(
+                tire.map_or(1.0, |t| t.load_sensitivity),
+                suspension_force,
+                static_wheel_load,
+            );
+            let peak_friction_limit = suspension_force
+                * dt
+                * wheel.ground_friction
+                * wheel.friction_slip
+                * pressure_grip
+                * load_grip;
             // Cornering stiffness scales with wheel load only, not with the grip
-            // factor or pressure: equal per-load stiffness on both axles keeps the
-            // understeer gradient zero, so the steady yaw response stays kinematic
-            // below the peak whatever grip or pressure each axle runs.
+            // factor, pressure or load sensitivity: equal per-load stiffness on
+            // both axles keeps the understeer gradient zero, so the steady yaw
+            // response stays kinematic below the peak whatever grip, pressure or
+            // load each axle runs.
             let lateral_compliance = tire_lateral_compliance(
                 tire.map_or(0.0, |t| t.cornering_stiffness),
                 suspension_force,
@@ -4827,8 +4938,142 @@ mod tests {
         assert_eq!(tire_pressure_grip(2.0, 2600.0, 0.0), 1.0);
         // A wheel barely touching the ground is floored, not extrapolated.
         let floored = tire_pressure_grip(1.0, 2600.0 * 1.0e-9, 2600.0);
-        let at_floor = tire_pressure_grip(1.0, 2600.0 * TIRE_PRESSURE_MIN_LOAD_RATIO, 2600.0);
+        let at_floor = tire_pressure_grip(1.0, 2600.0 * TIRE_MIN_LOAD_RATIO, 2600.0);
         assert_eq!(floored, at_floor);
+    }
+
+    const LOAD_SENSITIVITIES: [Real; 8] = [0.0, 0.25, 0.5, 0.8, 0.85, 0.99, 0.999, 1.0];
+
+    #[test]
+    fn unit_load_sensitivity_keeps_grip_proportional_to_load() {
+        let static_load = 2600.0;
+        for load_ratio in [0.0, 1.0e-9, 0.15, 0.6, 1.0, 1.7, 4.0, 1.0e6] {
+            assert_eq!(
+                tire_load_grip(1.0, static_load * load_ratio, static_load),
+                1.0,
+                "unit sensitivity must not alter grip at load ratio {load_ratio}"
+            );
+        }
+        assert_eq!(tire_load_grip(1.0, Real::NAN, static_load), 1.0);
+    }
+
+    #[test]
+    fn load_sensitive_grip_is_neutral_at_the_static_load() {
+        for sensitivity in LOAD_SENSITIVITIES {
+            assert_eq!(tire_load_grip(sensitivity, 2600.0, 2600.0), 1.0);
+        }
+    }
+
+    #[test]
+    fn grip_force_follows_load_raised_to_the_sensitivity() {
+        let static_load = 2600.0;
+        for sensitivity in LOAD_SENSITIVITIES {
+            for load_ratio in [0.2, 0.5, 1.5, 2.0, 3.0] {
+                let load = static_load * load_ratio;
+                let force = load * tire_load_grip(sensitivity, load, static_load);
+                let expected = static_load * load_ratio.powf(sensitivity);
+                assert!(
+                    (force - expected).abs() <= expected * 1.0e-5,
+                    "force {force} != {expected} at sensitivity {sensitivity}, ratio {load_ratio}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn load_sensitive_grip_never_rises_and_its_force_never_falls_with_load() {
+        let static_load = 2600.0;
+        for sensitivity in LOAD_SENSITIVITIES {
+            let mut previous_grip = Real::MAX;
+            let mut previous_force = -1.0;
+            let mut load_ratio = 0.0;
+            while load_ratio <= 4.0 {
+                let load = static_load * load_ratio;
+                let grip = tire_load_grip(sensitivity, load, static_load);
+                let force = load * grip;
+                assert!(
+                    grip <= previous_grip * (1.0 + 1.0e-6),
+                    "grip rose with load at sensitivity {sensitivity}, ratio {load_ratio}"
+                );
+                assert!(
+                    force >= previous_force - 1.0e-3,
+                    "grip force fell with load at sensitivity {sensitivity}, ratio {load_ratio}"
+                );
+                previous_grip = grip;
+                previous_force = force;
+                load_ratio += 0.005;
+            }
+        }
+    }
+
+    #[test]
+    fn weight_transfer_costs_a_load_sensitive_axle_grip() {
+        let static_load = 2600.0;
+        let axle_grip = |sensitivity: Real, transfer: Real| -> Real {
+            [1.0 + transfer, 1.0 - transfer]
+                .iter()
+                .map(|ratio| {
+                    let load = static_load * ratio;
+                    load * tire_load_grip(sensitivity, load, static_load)
+                })
+                .sum()
+        };
+        for sensitivity in LOAD_SENSITIVITIES {
+            let even = axle_grip(sensitivity, 0.0);
+            let mut previous = even;
+            for step in 1..=8 {
+                let grip = axle_grip(sensitivity, step as Real * 0.1);
+                if sensitivity > 0.0 && sensitivity < 1.0 {
+                    assert!(
+                        grip < previous,
+                        "transfer must cost grip at sensitivity {sensitivity}, step {step}"
+                    );
+                } else {
+                    assert!(
+                        (grip - even).abs() <= even * 1.0e-6,
+                        "transfer must not change grip at sensitivity {sensitivity}"
+                    );
+                }
+                previous = grip;
+            }
+        }
+    }
+
+    #[test]
+    fn load_sensitive_grip_stays_finite_and_floors_light_wheels() {
+        let static_load = 2600.0;
+        for sensitivity in LOAD_SENSITIVITIES {
+            for load_ratio in [0.0, 1.0e-9, 0.15, 1.0, 3.0, 1.0e6] {
+                let grip = tire_load_grip(sensitivity, static_load * load_ratio, static_load);
+                assert!(
+                    grip.is_finite() && grip > 0.0,
+                    "grip must stay finite and positive at {sensitivity}, ratio {load_ratio}"
+                );
+            }
+            assert_eq!(
+                tire_load_grip(sensitivity, static_load * 1.0e-9, static_load),
+                tire_load_grip(sensitivity, static_load * TIRE_MIN_LOAD_RATIO, static_load)
+            );
+            assert_eq!(tire_load_grip(sensitivity, static_load, 0.0), 1.0);
+            assert_eq!(tire_load_grip(sensitivity, static_load, Real::NAN), 1.0);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "load sensitivity must lie between zero and one")]
+    fn tire_type_rejects_load_sensitivity_above_one() {
+        TireType::new("tire", TireFriction::new(1.0, 0.85, 1.0, 1.0), 0.0, 1.01);
+    }
+
+    #[test]
+    #[should_panic(expected = "load sensitivity must lie between zero and one")]
+    fn tire_type_rejects_non_finite_load_sensitivity() {
+        TireType::new(
+            "tire",
+            TireFriction::new(1.0, 0.85, 1.0, 1.0),
+            0.0,
+            Real::NAN,
+        );
     }
 
     /// One wheel hanging at a chosen height over flat ground, with the probe's own
@@ -7553,7 +7798,9 @@ mod tests {
                     ..VehicleInput::default()
                 });
                 bodies[controller.chassis].set_linvel(Vector::new(2.0, 0.0, 40.0), true);
-                bodies[controller.chassis].set_angvel(Vector::y() * 0.1, true);
+                // Yawing well past the 0.15 rad/s its 0.6 grip holds at 40 m/s, so
+                // ESC has a real spin to catch while ABS and TC work.
+                bodies[controller.chassis].set_angvel(Vector::y() * 0.6, true);
                 set_test_drive(&mut controller, 600.0);
                 for wheel in &mut controller.wheels {
                     wheel.anti_lock_brake = strength;
@@ -8373,6 +8620,101 @@ mod tests {
         assert!(intervention.brake_strength > 0.0);
         assert_eq!(intervention.brake_axle, Some(WheelAxle::Front));
         assert_eq!(intervention.brake_side, -1.0);
+    }
+
+    const ESC_TEST_MASS: Real = 1000.0;
+
+    /// The ESC test car on the ground: every wheel carries an even share of a
+    /// 1000 kg chassis at unit grip, so the tires hold 1 g of cornering, a yaw
+    /// rate of 9.81 / 20 rad/s at the test speed.
+    fn grounded_esc_test_controller(steering: Real) -> DynamicRayCastVehicleController {
+        let mut controller = esc_test_controller();
+        for wheel in &mut controller.wheels {
+            wheel.friction_slip = 1.0;
+            wheel.wheel_suspension_force = ESC_TEST_MASS * 9.81 / 4.0;
+        }
+        controller.wheels[0].steering = steering;
+        controller.wheels[1].steering = steering;
+        controller
+    }
+
+    fn esc_test_chassis(mass: Real, yaw_rate: Real) -> RigidBody {
+        let mut chassis = RigidBodyBuilder::dynamic()
+            .additional_mass(mass)
+            .linvel(Vector::z() * 20.0)
+            .angvel(Vector::y() * yaw_rate)
+            .build();
+        chassis.recompute_mass_properties_from_colliders(&ColliderSet::new());
+        chassis
+    }
+
+    #[test]
+    fn esc_demand_is_held_to_the_yaw_rate_the_tires_can_deliver() {
+        let controller = grounded_esc_test_controller(0.2);
+        let grip_limit = 9.81 / 20.0;
+        let chassis = esc_test_chassis(ESC_TEST_MASS, grip_limit);
+        assert!(
+            (controller.grip_limited_yaw_rate(&chassis, 20.0) - grip_limit).abs() < 1.0e-4,
+            "grip limit {}",
+            controller.grip_limited_yaw_rate(&chassis, 20.0)
+        );
+
+        // Steering asks for 1.6 rad/s; a car already turning at its grip limit
+        // is not understeering and must not have its inside rear braked.
+        let intervention = controller.esc_intervention(&chassis);
+
+        assert_eq!(intervention.activity, 0.0);
+        assert_eq!(intervention.brake_strength, 0.0);
+        assert_eq!(intervention.engine_cut, 0.0);
+    }
+
+    #[test]
+    fn esc_still_helps_a_car_turning_less_than_its_tires_allow() {
+        let controller = grounded_esc_test_controller(0.2);
+        let chassis = esc_test_chassis(ESC_TEST_MASS, 0.0);
+
+        let intervention = controller.esc_intervention(&chassis);
+
+        // The understeer error is the grip-limited demand, not the steered one.
+        let expected = controller.esc * (9.81 / 20.0 - 0.14) / 0.75 * (0.2 / 0.55);
+        assert!(
+            (intervention.activity - expected).abs() < 1.0e-4,
+            "activity {} expected {expected}",
+            intervention.activity
+        );
+        assert_eq!(intervention.brake_axle, Some(WheelAxle::Rear));
+        assert_eq!(intervention.brake_side, 1.0);
+    }
+
+    #[test]
+    fn esc_below_the_grip_limit_acts_exactly_as_the_steered_demand() {
+        // 0.02 rad asks for 0.16 rad/s, well inside the 0.49 rad/s limit.
+        let grounded = grounded_esc_test_controller(0.02)
+            .esc_intervention(&esc_test_chassis(ESC_TEST_MASS, 0.0));
+        // A massless chassis leaves the demand unlimited.
+        let unlimited =
+            grounded_esc_test_controller(0.02).esc_intervention(&esc_test_chassis(0.0, 0.0));
+
+        assert!(grounded.activity > 0.0);
+        assert_eq!(grounded.activity, unlimited.activity);
+        assert_eq!(grounded.brake_strength, unlimited.brake_strength);
+        assert_eq!(grounded.engine_cut, unlimited.engine_cut);
+        assert_eq!(grounded.brake_axle, unlimited.brake_axle);
+        assert_eq!(grounded.brake_side, unlimited.brake_side);
+    }
+
+    #[test]
+    fn esc_asks_no_turn_from_an_airborne_car() {
+        let mut controller = esc_test_controller();
+        controller.wheels[0].steering = 0.2;
+        controller.wheels[1].steering = 0.2;
+        let chassis = esc_test_chassis(ESC_TEST_MASS, 0.0);
+
+        assert_eq!(controller.grip_limited_yaw_rate(&chassis, 20.0), 0.0);
+        let intervention = controller.esc_intervention(&chassis);
+
+        assert_eq!(intervention.activity, 0.0);
+        assert_eq!(intervention.brake_strength, 0.0);
     }
 
     #[test]
@@ -10398,21 +10740,36 @@ pub struct TireType {
     /// Lateral force per radian of slip angle as a multiple of wheel load, on
     /// every surface. Zero keeps the tire rigid below its friction limit.
     pub cornering_stiffness: Real,
+    /// Exponent the grip force follows in wheel load, on every surface, from
+    /// zero to one. One keeps grip proportional to load; lower values make the
+    /// friction coefficient fall as load rises above the static load.
+    pub load_sensitivity: Real,
 }
 
 impl TireType {
-    /// Creates a new tire type with the given name, default friction and
-    /// cornering stiffness. Panics if the stiffness is negative or not finite.
-    pub fn new(name: &str, default_friction: TireFriction, cornering_stiffness: Real) -> Self {
+    /// Creates a new tire type with the given name, default friction, cornering
+    /// stiffness and load sensitivity. Panics if the stiffness is negative or not
+    /// finite, or the load sensitivity lies outside zero to one.
+    pub fn new(
+        name: &str,
+        default_friction: TireFriction,
+        cornering_stiffness: Real,
+        load_sensitivity: Real,
+    ) -> Self {
         assert!(
             cornering_stiffness.is_finite() && cornering_stiffness >= 0.0,
             "cornering stiffness must be finite and non-negative"
+        );
+        assert!(
+            (0.0..=1.0).contains(&load_sensitivity),
+            "load sensitivity must lie between zero and one"
         );
         Self {
             name: name.to_string(),
             default_friction,
             surface_friction: HashMap::new(),
             cornering_stiffness,
+            load_sensitivity,
         }
     }
 
