@@ -826,7 +826,10 @@ impl VehiclePowertrain {
             .min(self.config.engine.max_rpm);
         // Limit the torque source before exchanging clutch torque. Cutting only
         // the wheel output leaves the engine and wheel integrations inconsistent.
-        let limiter_blend = ((self.state.engine_rpm.max(signed_drivetrain_rpm.max(0.0))
+        // This tick's clutch engagement depends on the limited torque, so the
+        // limiter reads the driveline through the engagement known at its start.
+        let limiter_blend = ((self
+            .coupled_limiter_rpm(signed_drivetrain_rpm, self.limiter_clutch_engagement(ratio))
             - limit * 0.97)
             / (limit * 0.03).max(1.0))
         .clamp(0.0, 1.0);
@@ -940,7 +943,10 @@ impl VehiclePowertrain {
             self.state.engine_rpm = 0.0;
         }
 
-        let limiter_rpm = self.state.engine_rpm.max(signed_drivetrain_rpm.max(0.0));
+        let limiter_rpm = self.coupled_limiter_rpm(
+            signed_drivetrain_rpm,
+            if ratio == 0.0 { 0.0 } else { clutch_engagement },
+        );
         self.state.rev_limiter_amount = if self.state.engine_running {
             ((limiter_rpm - limit * 0.97) / (limit * 0.03).max(1.0)).clamp(0.0, 1.0)
         } else {
@@ -1052,6 +1058,33 @@ impl VehiclePowertrain {
                 .clamp(0.0, idle_torque_range);
         }
         throttle
+    }
+
+    /// Crank speed the limiter acts on. A driven wheel speed reaches the
+    /// crankshaft only through the clutch: a disengaged clutch leaves the
+    /// engine's own speed, a fully engaged clutch reads the faster of the two
+    /// without integration lag, and partial engagement scales between them in
+    /// proportion to clutch capacity.
+    fn coupled_limiter_rpm(&self, signed_drivetrain_rpm: Real, clutch_engagement: Real) -> Real {
+        let engine_rpm = self.state.engine_rpm;
+        let coupled_rpm = engine_rpm.max(signed_drivetrain_rpm.max(0.0));
+        let engagement = clutch_engagement.clamp(0.0, 1.0);
+        engine_rpm * (1.0 - engagement) + coupled_rpm * engagement
+    }
+
+    /// Clutch engagement at the start of this tick, before the automatic clutch
+    /// responds to the torque that the limiter is about to set.
+    fn limiter_clutch_engagement(&self, ratio: Real) -> Real {
+        if self.state.engine_starting || ratio == 0.0 {
+            return 0.0;
+        }
+        let pedal_engagement = 1.0 - self.input.clutch.max(self.shift_clutch_override());
+        let engagement = if self.uses_automatic_clutch() {
+            self.automatic_clutch_engagement * pedal_engagement
+        } else {
+            pedal_engagement
+        };
+        engagement.clamp(0.0, 1.0)
     }
 
     fn effective_pedals(&self) -> (Real, Real) {
@@ -2220,6 +2253,59 @@ mod tests {
         powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
 
         assert!((powertrain.state.rev_limiter_amount - 1.0).abs() < 1.0e-12);
+    }
+
+    fn clutch_in_over_limit_powertrain(clutch: Real) -> (VehiclePowertrain, Real, Real) {
+        let mut config = VehicleControllerConfig::default();
+        config.transmission.automatic = false;
+        config.transmission.auto_clutch = false;
+        config.transmission.auto_blip = false;
+        let mut powertrain = VehiclePowertrain::new(config);
+        powertrain.state.current_gear = 1;
+        powertrain.shift_target = 1;
+        let limit = powertrain
+            .config
+            .engine
+            .rev_limit_rpm
+            .min(powertrain.config.engine.max_rpm);
+        powertrain.state.engine_rpm = powertrain.config.engine.idle_rpm * 2.0;
+        powertrain.set_input(VehicleInput {
+            throttle: 1.0,
+            clutch,
+            ..VehicleInput::default()
+        });
+        let wheel_radius = 0.35;
+        let wheel_speed = wheel_speed_for_crank_rpm(&powertrain, limit * 1.2, wheel_radius);
+        (powertrain, wheel_speed, wheel_radius)
+    }
+
+    #[test]
+    fn disengaged_clutch_keeps_driven_wheel_rpm_out_of_the_rev_limiter() {
+        for hz in [30.0, 60.0, 120.0] {
+            let (mut powertrain, wheel_speed, wheel_radius) = clutch_in_over_limit_powertrain(1.0);
+            let start_rpm = powertrain.state.engine_rpm;
+            powertrain.update(1.0 / hz, wheel_speed, wheel_speed, wheel_radius);
+
+            assert_eq!(powertrain.state.rev_limiter_amount, 0.0, "{hz} Hz");
+            assert!(powertrain.state.engine_load > 0.5, "{hz} Hz");
+            assert!(powertrain.state.engine_rpm > start_rpm, "{hz} Hz");
+        }
+    }
+
+    #[test]
+    fn partial_clutch_scales_driven_wheel_rpm_into_the_rev_limiter() {
+        let amount = |clutch: Real| {
+            let (mut powertrain, wheel_speed, wheel_radius) =
+                clutch_in_over_limit_powertrain(clutch);
+            powertrain.update(1.0 / 60.0, wheel_speed, wheel_speed, wheel_radius);
+            powertrain.state.rev_limiter_amount
+        };
+        let samples = [1.0, 0.999, 0.99, 0.8, 0.5, 0.25, 0.0].map(amount);
+        assert_eq!(samples[0], 0.0);
+        assert_eq!(samples[6], 1.0);
+        for pair in samples.windows(2) {
+            assert!(pair[0] <= pair[1], "{samples:?}");
+        }
     }
 
     #[test]
