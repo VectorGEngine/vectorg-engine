@@ -66,8 +66,12 @@ const SLIDING_FULL_SPEED: Real = 8.0;
 // in continuously above it.
 const CORNERING_STIFFNESS_SPEED_FLOOR: Real = 1.0;
 const RECOVERY_THRESHOLD: Real = 0.94;
-const RECOVERY_BASE_RATE: Real = 0.15;
-const RECOVERY_RATE: Real = 0.3;
+// Grip recovery in grip fraction per second. A tire that stops sliding gets its
+// grip back in about 0.1 s, as a real tire does: the fall to a sliding grip of
+// about 0.78 is recovered in 0.11 s at the base rate and in 0.07 s at the full
+// rate near supportable demand.
+const RECOVERY_BASE_RATE: Real = 2.0;
+const RECOVERY_RATE: Real = 3.0;
 
 /// Lateral compliance of a rolling tire: the side speed it keeps per unit of
 /// lateral impulse, from its `cornering_stiffness` per radian of slip angle,
@@ -2935,14 +2939,16 @@ impl DynamicRayCastVehicleController {
                 * wheel.friction_slip
                 * pressure_grip
                 * load_grip;
-            // Cornering stiffness scales with wheel load only, not with the grip
-            // factor, pressure or load sensitivity: equal per-load stiffness on
-            // both axles keeps the understeer gradient zero, so the steady yaw
-            // response stays kinematic below the peak whatever grip, pressure or
-            // load each axle runs.
+            // Cornering stiffness follows the wheel load with the same load
+            // sensitivity as the grip: a tire with twice the load has less than
+            // twice the stiffness. Lateral load transfer thus costs an axle
+            // stiffness, and the axle with more roll stiffness takes more of the
+            // loss, which gives the understeer gradient. Grip factor and pressure
+            // do not change the stiffness. A tire at its static load and a load
+            // sensitivity of one keep stiffness proportional to load.
             let lateral_compliance = tire_lateral_compliance(
                 tire.map_or(0.0, |t| t.cornering_stiffness),
-                suspension_force,
+                suspension_force * load_grip,
                 wheel.contact_forward_speed,
                 dt,
             );
@@ -3849,7 +3855,7 @@ impl VehicleContactSolver {
                         // design; only the slip beyond that compliance is sliding.
                         let side = self.speed_without_self(i)[1]
                             + multiply(c.response, self.impulses[i])[1]
-                            + c.lateral_compliance * self.impulses[i][1];
+                            + c.lateral_slip_speed(self.impulses[i]);
                         let [fx, fy] = [grip * c.shape[0], grip * c.shape[1]];
                         let steady = if longitudinal < fx {
                             side.abs() * longitudinal
@@ -4246,8 +4252,12 @@ impl VehicleContactSolver {
                     + (c.speed[1] + own[1]) * delta[1]
                     + self.omega(i) * angular;
                 // Tire compliance is part of the energy the block solve minimizes.
-                linear += c.lateral_compliance * self.impulses[i][1] * delta[1];
-                curvature += c.lateral_compliance * delta[1] * delta[1];
+                // The brush-model curve is convex: its slope is the slip speed,
+                // and the secant of the slip speed over the step is its
+                // curvature along the step.
+                let slip = c.lateral_slip_speed(self.impulses[i]);
+                linear += slip * delta[1];
+                curvature += (c.lateral_slip_speed(self.next_impulses[i]) - slip) * delta[1];
                 curvature += (0..self.contacts.len())
                     .map(|j| {
                         angular
@@ -4609,6 +4619,22 @@ fn envelope_norm(impulse: [Real; 2], shape: [Real; 2]) -> Real {
     (impulse[0] / shape[0]).hypot(impulse[1] / shape[1])
 }
 
+// The brush-model secant multiplier goes from one at zero force to three at the
+// grip limit.
+const BRUSH_SECANT_MAX: Real = 3.0;
+const BRUSH_SECANT_TOLERANCE: Real = 1.0e-5;
+const BRUSH_SECANT_ITERATIONS: usize = 40;
+
+/// Ratio of the brush-model slip angle to the linear-tire slip angle at the
+/// same lateral force, for a lateral use `u` of the available grip:
+/// `3 * (1 - c) / u` with `c = (1 - u)^(1/3)`. Because `1 - c^3 = u`, this is
+/// `3 / (1 + c + c^2)`, which has no cancellation near zero use. One at zero
+/// use, three at full use.
+fn brush_secant(use_ratio: Real) -> Real {
+    let c = (1.0 - use_ratio.clamp(0.0, 1.0)).cbrt();
+    3.0 / (1.0 + c + c * c)
+}
+
 impl CoupledContact {
     fn skid_info(self, solution: CoupledContactSolution) -> Real {
         if self.grip_impulse <= 0.0 {
@@ -4647,16 +4673,114 @@ impl CoupledContact {
         }
     }
 
-    /// Contact response of a rolling wheel: the tire's own compliance joins the
-    /// lateral diagonal, so the free solve lands on the linear-tire fixed point
-    /// `j = -stiffness * residual side speed` instead of cancelling all side
-    /// speed. A held (locked) wheel slides and has no cornering stiffness, so it
-    /// keeps the bare body response.
-    fn rolling_response(self) -> [[Real; 2]; 2] {
+    /// Lateral impulse the friction envelope leaves at longitudinal impulse
+    /// `longitudinal`: the lateral half-axis of the ellipse at that point.
+    fn lateral_capacity(self, longitudinal: Real) -> Real {
+        let lateral = self.grip_impulse * self.shape[1];
+        let axis = self.grip_impulse * self.shape[0];
+        if !(lateral > 0.0) {
+            return 0.0;
+        }
+        if !(axis > 0.0) {
+            return lateral;
+        }
+        let ratio = longitudinal / axis;
+        lateral * (1.0 - ratio * ratio).max(0.0).sqrt()
+    }
+
+    /// Lateral slip speed that the rolling tire keeps at tangent impulse
+    /// `impulse`, from its brush-model force curve. Zero compliance is a rigid
+    /// tire.
+    fn lateral_slip_speed(self, impulse: [Real; 2]) -> Real {
+        if self.lateral_compliance == 0.0 {
+            return 0.0;
+        }
+        let capacity = self.lateral_capacity(impulse[0]);
+        let secant = if capacity > 0.0 {
+            brush_secant(impulse[1].abs() / capacity)
+        } else {
+            1.0
+        };
+        self.lateral_compliance * secant * impulse[1]
+    }
+
+    /// Contact response of a rolling wheel with the tire compliance multiplied
+    /// by `secant`. The tire's compliance joins the lateral diagonal, so the
+    /// free solve lands on the tire fixed point `j = -stiffness * residual side
+    /// speed` instead of cancelling all side speed. A held (locked) wheel slides
+    /// and has no cornering stiffness, so it keeps the bare body response.
+    fn rolling_response(self, secant: Real) -> [[Real; 2]; 2] {
         let mut response = self.response;
         response[0][0] += self.radius * self.radius / self.inertia;
-        response[1][1] += self.lateral_compliance;
+        response[1][1] += self.lateral_compliance * secant;
         response
+    }
+
+    /// Rolling contact on the brush-model tire curve. The lateral force of the
+    /// tire is the cornering stiffness times the slip angle at small slip, and
+    /// bends over smoothly to the grip limit at three times the slip angle where
+    /// the linear force meets the limit. At a lateral use `u` of the available
+    /// grip, the slip speed is the linear slip speed times
+    /// `brush_secant(u) = 3 * (1 - (1 - u)^(1/3)) / u`, which goes from one to
+    /// three. The solve finds the secant multiplier `m` for which the contact
+    /// solution has `brush_secant(u) = m`. That solution satisfies the curve
+    /// exactly. The difference `m - brush_secant(u(m))` is negative at `m = 1`
+    /// and positive at `m = 3`, so a bracketed search always finds it.
+    fn rolling_solve(self, rhs: [Real; 2]) -> ([Real; 2], [[Real; 2]; 2]) {
+        let solve_at = |secant: Real| {
+            let response = self.rolling_response(secant);
+            (
+                friction_ellipse(response, rhs, self.grip_impulse, self.shape),
+                response,
+            )
+        };
+        let error = |secant: Real, tangent: [Real; 2]| {
+            let capacity = self.lateral_capacity(tangent[0]);
+            let curve = if capacity > 0.0 {
+                brush_secant(tangent[1].abs() / capacity)
+            } else {
+                1.0
+            };
+            secant - curve
+        };
+        let linear = solve_at(1.0);
+        if self.lateral_compliance == 0.0 {
+            return linear;
+        }
+        let mut low = (1.0, error(1.0, linear.0));
+        if low.1 >= -BRUSH_SECANT_TOLERANCE {
+            return linear;
+        }
+        let saturated = solve_at(BRUSH_SECANT_MAX);
+        let mut high = (BRUSH_SECANT_MAX, error(BRUSH_SECANT_MAX, saturated.0));
+        if high.1 <= BRUSH_SECANT_TOLERANCE {
+            return saturated;
+        }
+        // Illinois false position: bracketed, and superlinear near the root.
+        let mut result = saturated;
+        let mut side = 0;
+        for _ in 0..BRUSH_SECANT_ITERATIONS {
+            let secant = (low.0 * high.1 - high.0 * low.1) / (high.1 - low.1);
+            result = solve_at(secant);
+            let value = error(secant, result.0);
+            if value.abs() <= BRUSH_SECANT_TOLERANCE || high.0 - low.0 <= BRUSH_SECANT_TOLERANCE {
+                break;
+            }
+            if value < 0.0 {
+                low = (secant, value);
+                if side == -1 {
+                    high.1 *= 0.5;
+                }
+                side = -1;
+            } else {
+                high = (secant, value);
+                if side == 1 {
+                    low.1 *= 0.5;
+                }
+                side = 1;
+            }
+        }
+        result
     }
 
     pub fn solve(self) -> CoupledContactSolution {
@@ -4664,14 +4788,9 @@ impl CoupledContact {
             // The brake interval has collapsed to zero. Solve the same rolling
             // equations directly instead of first solving an impossible nonzero
             // holding-brake branch (especially costly inside TC previews).
-            let response = self.rolling_response();
             let rhs = [self.omega * self.radius - self.speed[0], -self.speed[1]];
-            return self.finish(
-                friction_ellipse(response, rhs, self.grip_impulse, self.shape),
-                0.0,
-                response,
-                rhs,
-            );
+            let (tangent, response) = self.rolling_solve(rhs);
+            return self.finish(tangent, 0.0, response, rhs);
         }
         let brake = if self.inertia * self.omega.abs()
             > self.brake_budget + self.radius * (self.grip_impulse * self.shape[0])
@@ -4706,19 +4825,9 @@ impl CoupledContact {
         // At the active brake bound, wheel inertia remains part of the
         // longitudinal contact response.
         let driven_omega = self.omega + brake / self.inertia;
-        let response = self.rolling_response();
-        let tangent = friction_ellipse(
-            response,
-            [driven_omega * self.radius - self.speed[0], -self.speed[1]],
-            self.grip_impulse,
-            self.shape,
-        );
-        self.finish(
-            tangent,
-            brake,
-            response,
-            [driven_omega * self.radius - self.speed[0], -self.speed[1]],
-        )
+        let rhs = [driven_omega * self.radius - self.speed[0], -self.speed[1]];
+        let (tangent, response) = self.rolling_solve(rhs);
+        self.finish(tangent, brake, response, rhs)
     }
 }
 
@@ -6029,10 +6138,10 @@ mod tests {
             let dt = 1.0 / hz as Real;
             let c = tire_test_contact();
             let (_, boosted) = solve_with_grip_recovery(c, 1.0, 0.85, 0.85, dt);
-            assert!((boosted - (0.85 + 0.3 * dt)).abs() < 1e-6);
+            assert!((boosted - (0.85 + RECOVERY_RATE * dt)).abs() < 1e-6);
             let overloaded = CoupledContact { omega: 200.0, ..c };
             let (first, grip) = solve_with_grip_recovery(overloaded, 1.0, 0.85, 0.85, dt);
-            assert!((grip - (0.85 + 0.15 * dt)).abs() < 1e-6);
+            assert!((grip - (0.85 + RECOVERY_BASE_RATE * dt)).abs() < 1e-6);
             for _ in 0..24 {
                 let (preview, g) = solve_with_grip_recovery(overloaded, 1.0, 0.85, 0.85, dt);
                 assert_eq!(preview.tangent, first.tangent);
@@ -6296,7 +6405,26 @@ mod tests {
     }
 
     #[test]
-    fn compliant_contact_matches_a_linear_tire_below_saturation() {
+    fn brush_secant_goes_from_one_to_three_continuously() {
+        assert_eq!(brush_secant(0.0), 1.0);
+        assert!((brush_secant(1.0) - 3.0).abs() < 1e-6);
+        let mut previous = 1.0;
+        for step in 1..=1000 {
+            let u = step as Real / 1000.0;
+            let value = brush_secant(u);
+            assert!(value >= previous - 1e-5, "not increasing at {u}");
+            previous = value;
+        }
+        // It matches the brush-model expression in f64 over the whole range.
+        for step in 1..=100 {
+            let u = step as f64 / 100.0;
+            let reference = 3.0 * (1.0 - (1.0 - u).cbrt()) / u;
+            assert!((brush_secant(u as Real) as f64 - reference).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn compliant_contact_follows_the_brush_tire_curve_below_saturation() {
         let base = tire_test_contact();
         for compliance in [0.002, 0.01, 0.05] {
             for side in [0.02, 0.1, 0.2] {
@@ -6306,13 +6434,17 @@ mod tests {
                     ..base
                 };
                 let result = c.solve();
-                // Linear tire: the side speed it keeps is its impulse times its compliance.
+                // The side speed the tire keeps is its slip speed on the brush curve.
                 assert!(
-                    (result.speed[1] + compliance * result.tangent[1]).abs() < 1e-5 * side,
+                    (result.speed[1] + c.lateral_slip_speed(result.tangent)).abs() < 1e-4 * side,
                     "compliance {compliance}, side {side}: {result:?}"
                 );
-                let expected = -side / (0.003 + compliance);
-                assert!((result.tangent[1] - expected).abs() < 1e-4 * expected.abs());
+                // The brush tire gives at most the linear-tire impulse, and nearly
+                // all of it at a small use of the grip.
+                let linear = -side / (0.003 + compliance);
+                let use_ratio = result.tangent[1].abs() / c.lateral_capacity(result.tangent[0]);
+                assert!(result.tangent[1] <= 0.0 && result.tangent[1] >= linear * (1.0 + 1e-5));
+                assert!(result.tangent[1].abs() >= linear.abs() * (1.0 - use_ratio));
                 assert!(result.tangent[0].abs() < 1e-3);
                 assert!(envelope_norm(result.tangent, c.shape) < c.grip_impulse);
                 // The impulse only removes energy from the contact.
@@ -6325,9 +6457,9 @@ mod tests {
                 assert_eq!(result.requested_tangent, result.tangent);
                 assert_eq!(c.skid_info(result), 1.0);
             }
-            // Beyond the friction limit the ellipse still binds.
+            // Beyond the full-slide slip of the brush curve the ellipse still binds.
             let c = CoupledContact {
-                speed: [40.0, 5.0],
+                speed: [40.0, 200.0],
                 lateral_compliance: compliance,
                 ..base
             };
@@ -6351,6 +6483,7 @@ mod tests {
         side_speed: Real,
         forward_speed: Real,
         skid_info: Real,
+        ground_friction: Real,
         dt: Real,
     }
 
@@ -6393,6 +6526,7 @@ mod tests {
             side_speed: 0.0,
             forward_speed: 0.0,
             skid_info: 1.0,
+            ground_friction: 0.0,
             dt,
         };
         for (i, wheel) in controller.wheels.iter().enumerate() {
@@ -6407,6 +6541,7 @@ mod tests {
             probe.side_speed += wheel.contact_side_speed.abs() * 0.5;
             probe.forward_speed += wheel.contact_forward_speed.abs() * 0.5;
             probe.skid_info = probe.skid_info.min(wheel.skid_info);
+            probe.ground_friction = wheel.ground_friction;
         }
         probe
     }
@@ -6421,10 +6556,13 @@ mod tests {
                     for hz in [60, 240] {
                         let probe = rear_toe_probe(speed, toe_degrees, stiffness, hz);
                         // Left and right cancel on the chassis, so each tire keeps its
-                        // full geometric side speed and answers it with the linear
-                        // tire impulse stiffness * load * dt * slip angle.
-                        let expected = stiffness * 3_000.0 * probe.dt * probe.side_speed
+                        // full geometric side speed and answers it on the brush curve
+                        // of the linear tire impulse stiffness * load * dt * slip angle.
+                        let linear = stiffness * 3_000.0 * probe.dt * probe.side_speed
                             / (probe.forward_speed - CORNERING_STIFFNESS_SPEED_FLOOR);
+                        let capacity = 3_000.0 * probe.dt * probe.ground_friction;
+                        let theta = (linear / (3.0 * capacity)).min(1.0);
+                        let expected = capacity * (1.0 - (1.0 - theta).powi(3));
                         // The solver converges to a velocity tolerance; over the
                         // wheel's effective mass that is an impulse allowance.
                         let allowance = CONTACT_SOLVER_TOLERANCE * 1_000.0;

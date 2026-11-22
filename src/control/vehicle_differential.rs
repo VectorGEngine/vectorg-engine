@@ -60,16 +60,17 @@ impl VehicleDifferentialConfig {
     }
 }
 
-// A modest clutch preload remains at zero input torque. The tuning curve is a
-// capacity control, not a prescribed slip ratio: 50% gives one reference capacity,
-// 99% gives 99. The exact 100% endpoint is handled algebraically, never with a
-// large spring or an infinite floating-point torque. Equal static/kinetic limits
-// keep the fixed-budget impulse problem convex at the sticking/sliding transition.
-const CLUTCH_PRELOAD_TORQUE: Real = 50.0;
-
+// The lock is the share of the input torque that the clutch can move between
+// the two outputs, as in a torque-sensing limited-slip differential: the torque
+// difference between the outputs is at most `lock * |axle_torque|`. The clutch
+// impulse acts with opposite signs on the two outputs, so its limit is half of
+// that difference. There is no preload: with no input torque the outputs turn
+// freely. The exact 100% endpoint is handled algebraically as one shared
+// rotation. Equal static/kinetic limits keep the fixed-budget impulse problem
+// convex at the sticking/sliding transition.
 pub(super) fn clutch_impulse_limit(lock: Real, axle_torque: Real, dt: Real) -> Real {
     debug_assert!((0.0..1.0).contains(&lock));
-    dt.max(0.0) * lock / (1.0 - lock) * (CLUTCH_PRELOAD_TORQUE + axle_torque.abs() * 0.5)
+    dt.max(0.0) * lock * axle_torque.abs() * 0.5
 }
 
 pub(super) fn acceleration_mode(
@@ -121,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn clutch_capacity_has_open_endpoint_preload_and_timestep_scaling() {
+    fn clutch_capacity_is_a_share_of_input_torque_with_timestep_scaling() {
         assert_eq!(clutch_impulse_limit(0.0, 1000.0, 0.02), 0.0);
         let mut previous = 0.0;
         for p in [0.01, 0.25, 0.5, 0.75, 0.99] {
@@ -129,7 +130,9 @@ mod tests {
             assert!(value > previous);
             assert_eq!(value, clutch_impulse_limit(p, -200.0, 0.02));
             assert_eq!(value, 2.0 * clutch_impulse_limit(p, 200.0, 0.01));
-            assert!(clutch_impulse_limit(p, 0.0, 0.02) > 0.0);
+            // The torque difference between the outputs is at most `p` of the input.
+            assert!((2.0 * value / 0.02 - p * 200.0).abs() < 1e-3);
+            assert_eq!(clutch_impulse_limit(p, 0.0, 0.02), 0.0);
             previous = value;
         }
     }

@@ -1450,8 +1450,7 @@ fn update_testbed(
                 harness.step_with_graphics(Some(&mut testbed_graphics));
                 #[cfg(feature = "dim3")]
                 if let Some(vehicle) = &mut state.vehicle_controller {
-                    let filter = QueryFilter::exclude_dynamic()
-                        .exclude_rigid_body(vehicle.chassis);
+                    let filter = QueryFilter::exclude_dynamic().exclude_rigid_body(vehicle.chassis);
                     let physics = &mut harness.physics;
                     vehicle.finish_vehicle_update(
                         &mut physics.bodies,
