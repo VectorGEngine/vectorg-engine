@@ -62,7 +62,6 @@ pub fn init_world(testbed: &mut Testbed) {
     config.transmission.auto_reverse = true;
     config.turbo.enabled = true;
     config.turbo.max_boost = 1.350_000_023_841_858;
-    config.turbo.spool_rate = 1.0;
     config.dynamics.brake_bias = 0.6;
     config.dynamics.abs_strength = 1.0;
     config.dynamics.traction_control_strength = 1.0;

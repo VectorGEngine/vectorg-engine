@@ -42,6 +42,15 @@ const IDLE_MAX_THROTTLE: Real = 0.25;
 // open-throttle 1.0 by this throttle, as manifold vacuum collapses.
 const CLOSED_THROTTLE_PUMPING_LOSS: Real = 2.5;
 const PUMPING_LOSS_FADE_THROTTLE: Real = 0.2;
+// Below this throttle the throttle plate is closed: the blow-off valve opens and dumps boost.
+const TURBO_THROTTLE_CLOSED: Real = 0.15;
+// The blow-off valve arms only above this throttle, so pedal noise near closed does not re-fire it.
+const TURBO_BLOW_ARM_THROTTLE: Real = 0.3;
+// Boost pressure below this fraction has no audible release.
+const TURBO_BLOW_MIN_LOAD: Real = 0.2;
+// Time constants in seconds of boost pressure toward a spinning shaft, and of the valve dump.
+const TURBO_BOOST_BUILD_TIME: Real = 0.05;
+const TURBO_BOOST_DUMP_TIME: Real = 0.08;
 
 /// Engine parameters used by the vehicle powertrain.
 #[derive(Clone, Debug)]
@@ -142,16 +151,25 @@ impl Default for TransmissionConfig {
 }
 
 /// Turbocharger spool and release parameters.
+///
+/// The turbo shaft speed moves toward `throttle * (rpm / boost_rpm)^spool_curve`
+/// (at most 1), with `spool_time` while it speeds up and `spin_down_time` while
+/// it slows down. Boost pressure follows the shaft speed while the throttle is
+/// open and the blow-off valve dumps it when the throttle closes.
 #[derive(Clone, Debug)]
 pub struct TurboConfig {
     /// Whether turbo boost is simulated.
     pub enabled: bool,
     /// Maximum engine-torque multiplier at full turbo load.
     pub max_boost: Real,
-    /// Turbo-load increase per second at full throttle.
-    pub spool_rate: Real,
-    /// Turbo-load decrease per second after throttle release.
-    pub release_rate: Real,
+    /// Engine RPM at which full throttle gives full boost.
+    pub boost_rpm: Real,
+    /// Exponent of the boost target below `boost_rpm`.
+    pub spool_curve: Real,
+    /// Time constant in seconds of the shaft speed-up.
+    pub spool_time: Real,
+    /// Time constant in seconds of the shaft spin-down.
+    pub spin_down_time: Real,
 }
 
 impl Default for TurboConfig {
@@ -159,8 +177,10 @@ impl Default for TurboConfig {
         Self {
             enabled: false,
             max_boost: 1.0,
-            spool_rate: 1.0,
-            release_rate: 3.0,
+            boost_rpm: 4000.0,
+            spool_curve: 2.0,
+            spool_time: 0.5,
+            spin_down_time: 1.5,
         }
     }
 }
@@ -406,10 +426,14 @@ pub struct VehicleState {
     pub engine_load: Real,
     /// Normalized proximity to or activity of the rev limiter.
     pub rev_limiter_amount: Real,
-    /// Normalized turbocharger load.
+    /// Normalized turbocharger boost pressure (0..1 of the maximum boost).
     pub turbo_load: Real,
-    /// Sequence incremented whenever a loaded turbo is released.
+    /// Normalized turbocharger shaft speed (0..1).
+    pub turbo_speed: Real,
+    /// Sequence incremented whenever the blow-off valve releases boost.
     pub turbo_release_sequence: u32,
+    /// Boost pressure (0..1) at the latest blow-off release.
+    pub turbo_release_load: Real,
     /// Number of wheels currently contacting the ground.
     pub wheels_in_contact: usize,
     /// Fraction of wheels whose ABS valves are acting during the shared hydraulic cycle.
@@ -549,7 +573,8 @@ pub(crate) struct VehiclePowertrain {
     stopped_time: Real,
     movement_speed: Real,
     turbo_load: Real,
-    previous_throttle: Real,
+    turbo_speed: Real,
+    turbo_blow_armed: bool,
     restart_armed: bool,
     engine_start_requested: bool,
     engine_start_elapsed: Real,
@@ -590,7 +615,8 @@ impl VehiclePowertrain {
             stopped_time: 0.0,
             movement_speed: 0.0,
             turbo_load: 0.0,
-            previous_throttle: 0.0,
+            turbo_speed: 0.0,
+            turbo_blow_armed: false,
             restart_armed: true,
             engine_start_requested: false,
             engine_start_elapsed: 0.0,
@@ -634,8 +660,7 @@ impl VehiclePowertrain {
         self.throttle_intent = DirectionPedal::NeedsRelease;
         self.stopped_time = 0.0;
         self.movement_speed = 0.0;
-        self.turbo_load = 0.0;
-        self.previous_throttle = 0.0;
+        self.stop_turbo();
         self.restart_armed = true;
         self.engine_start_requested = false;
         self.engine_start_elapsed = 0.0;
@@ -805,14 +830,11 @@ impl VehiclePowertrain {
         } else {
             requested_drive_throttle
         };
+        // The turbo reads the driver throttle before the shift blip: a blip with the
+        // clutch open has no load, so it neither builds boost nor opens the blow-off valve.
+        let turbo_throttle = drive_throttle;
         if !self.state.engine_starting {
             drive_throttle = drive_throttle.max(self.shift_throttle_override());
-        }
-        if self.state.engine_running {
-            self.update_turbo(dt, drive_throttle);
-        } else {
-            self.turbo_load = 0.0;
-            self.previous_throttle = drive_throttle;
         }
 
         let ratio = self.current_ratio();
@@ -835,6 +857,11 @@ impl VehiclePowertrain {
         .clamp(0.0, 1.0);
         let limiter_torque_factor =
             1.0 - limiter_blend * limiter_blend * (3.0 - 2.0 * limiter_blend);
+        if self.state.engine_running {
+            self.update_turbo(dt, turbo_throttle, limiter_torque_factor);
+        } else {
+            self.stop_turbo();
+        }
         let available_torque = self.torque_at(self.state.engine_rpm);
         let boost = if self.config.turbo.enabled {
             1.0 + (self.config.turbo.max_boost - 1.0) * self.turbo_load
@@ -929,7 +956,7 @@ impl VehiclePowertrain {
             self.state.engine_running = false;
             self.state.engine_rpm = 0.0;
             self.idle_integral_torque = 0.0;
-            self.turbo_load = 0.0;
+            self.stop_turbo();
             self.restart_armed = drive_throttle <= TRANSMISSION_PEDAL_RELEASE;
         } else if self.state.engine_running {
             self.state.engine_rpm = next_rpm.clamp(0.0, limit);
@@ -1001,6 +1028,7 @@ impl VehiclePowertrain {
             0.0
         };
         self.state.turbo_load = self.turbo_load;
+        self.state.turbo_speed = self.turbo_speed;
 
         self.update_transmission(vehicle_speed, driven_wheel_speed.abs(), driven_wheel_radius);
         if self.engine_state() != previous_engine_state {
@@ -1817,24 +1845,57 @@ impl VehiclePowertrain {
             * wheel_radius.max(0.01)
     }
 
-    fn update_turbo(&mut self, dt: Real, throttle: Real) {
+    fn update_turbo(&mut self, dt: Real, throttle: Real, exhaust_factor: Real) {
         if !self.config.turbo.enabled {
-            self.turbo_load = 0.0;
-            self.previous_throttle = throttle;
+            self.stop_turbo();
             return;
         }
+        let turbo = &self.config.turbo;
 
-        if throttle > 0.05 {
-            self.turbo_load =
-                (self.turbo_load + throttle * self.config.turbo.spool_rate * dt).clamp(0.0, 1.0);
+        // Exhaust energy grows with RPM and throttle; the rev limiter cuts it.
+        let rpm_factor = (self.state.engine_rpm.max(0.0) / turbo.boost_rpm)
+            .powf(turbo.spool_curve)
+            .min(1.0);
+        let speed_target = (throttle * rpm_factor * exhaust_factor).clamp(0.0, 1.0);
+        let speed_time = if speed_target > self.turbo_speed {
+            turbo.spool_time
         } else {
-            if self.previous_throttle > 0.2 && self.turbo_load > 0.2 {
+            turbo.spin_down_time
+        };
+        self.turbo_speed = approach(self.turbo_speed, speed_target, dt, speed_time);
+
+        // The blow-off valve arms under boost with the throttle open and releases
+        // the boost that is present when the throttle closes, at any lift speed.
+        let throttle_open = throttle > TURBO_THROTTLE_CLOSED;
+        if throttle >= TURBO_BLOW_ARM_THROTTLE {
+            self.turbo_blow_armed = self.turbo_load > TURBO_BLOW_MIN_LOAD;
+        } else if !throttle_open {
+            if self.turbo_blow_armed {
+                self.state.turbo_release_load = self.turbo_load;
                 self.state.turbo_release_sequence =
                     self.state.turbo_release_sequence.wrapping_add(1);
             }
-            self.turbo_load = (self.turbo_load - self.config.turbo.release_rate * dt).max(0.0);
+            self.turbo_blow_armed = false;
         }
-        self.previous_throttle = throttle;
+
+        // Boost pressure follows the shaft while the throttle is open; the valve dumps it otherwise.
+        let (load_target, load_time) = if throttle_open {
+            let time = if self.turbo_speed > self.turbo_load {
+                TURBO_BOOST_BUILD_TIME
+            } else {
+                TURBO_BOOST_DUMP_TIME
+            };
+            (self.turbo_speed, time)
+        } else {
+            (0.0, TURBO_BOOST_DUMP_TIME)
+        };
+        self.turbo_load = approach(self.turbo_load, load_target, dt, load_time);
+    }
+
+    fn stop_turbo(&mut self) {
+        self.turbo_load = 0.0;
+        self.turbo_speed = 0.0;
+        self.turbo_blow_armed = false;
     }
 
     fn current_ratio(&self) -> Real {
@@ -1936,6 +1997,26 @@ fn sanitize_config(config: &mut VehicleControllerConfig) {
     config.steering.ackermann = config.steering.ackermann.clamp(-1.0, 1.0);
     config.steering.minimum_speed_factor = config.steering.minimum_speed_factor.clamp(0.0, 1.0);
     config.steering.counter_steer_assist = config.steering.counter_steer_assist.clamp(0.0, 1.0);
+    config.turbo.boost_rpm = positive_finite(config.turbo.boost_rpm, 1.0);
+    config.turbo.spool_curve = positive_finite(config.turbo.spool_curve, 1.0);
+    config.turbo.spool_time = non_negative_finite(config.turbo.spool_time);
+    config.turbo.spin_down_time = non_negative_finite(config.turbo.spin_down_time);
+}
+
+fn positive_finite(value: Real, fallback: Real) -> Real {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+/// First-order approach of `value` to `target` with time constant `time`; 0 reaches it at once.
+fn approach(value: Real, target: Real, dt: Real, time: Real) -> Real {
+    if time <= Real::EPSILON {
+        return target;
+    }
+    value + (target - value) * (1.0 - (-dt / time).exp())
 }
 
 fn non_negative_finite(value: Real) -> Real {
@@ -2808,7 +2889,9 @@ mod tests {
             engine_load: 0.8,
             rev_limiter_amount: 0.6,
             turbo_load: 0.9,
+            turbo_speed: 0.95,
             turbo_release_sequence: 7,
+            turbo_release_load: 0.8,
             wheels_in_contact: 4,
             abs_activity: 0.5,
             esc_activity: 0.6,
@@ -2830,7 +2913,8 @@ mod tests {
         powertrain.stopped_time = AUTO_DIRECTION_STOP_DURATION;
         powertrain.movement_speed = 30.0;
         powertrain.turbo_load = 0.9;
-        powertrain.previous_throttle = 1.0;
+        powertrain.turbo_speed = 0.95;
+        powertrain.turbo_blow_armed = true;
         powertrain.restart_armed = false;
         powertrain.engine_start_elapsed = 0.5;
         powertrain.idle_integral_torque = 20.0;
@@ -2868,7 +2952,8 @@ mod tests {
         assert_eq!(powertrain.stopped_time, 0.0);
         assert_eq!(powertrain.movement_speed, 0.0);
         assert_eq!(powertrain.turbo_load, 0.0);
-        assert_eq!(powertrain.previous_throttle, 0.0);
+        assert_eq!(powertrain.turbo_speed, 0.0);
+        assert!(!powertrain.turbo_blow_armed);
         assert!(powertrain.restart_armed);
         assert_eq!(powertrain.engine_start_elapsed, 0.0);
         assert_eq!(powertrain.idle_integral_torque, 0.0);
@@ -3691,6 +3776,174 @@ mod tests {
         assert_eq!(powertrain.shift_phase, ShiftPhase::Idle);
         assert_eq!(powertrain.shift_clutch_override(), 0.0);
         assert_eq!(powertrain.shift_throttle_override(), 0.0);
+    }
+
+    fn turbo_powertrain() -> VehiclePowertrain {
+        let mut config = VehicleControllerConfig::default();
+        config.turbo.enabled = true;
+        config.turbo.max_boost = 1.4;
+        config.turbo.boost_rpm = 4000.0;
+        config.turbo.spool_curve = 2.0;
+        config.turbo.spool_time = 0.5;
+        config.turbo.spin_down_time = 1.5;
+        VehiclePowertrain::new(config)
+    }
+
+    /// Runs the turbo alone at a held engine RPM for `seconds`; returns the blow-off count.
+    fn run_turbo(
+        p: &mut VehiclePowertrain,
+        hz: u32,
+        seconds: Real,
+        rpm: Real,
+        throttle: impl Fn(Real) -> Real,
+    ) -> u32 {
+        let dt = 1.0 / hz as Real;
+        let start = p.state.turbo_release_sequence;
+        let steps = (seconds * hz as Real).round() as u32;
+        for step in 0..steps {
+            p.state.engine_rpm = rpm;
+            p.update_turbo(dt, throttle((step + 1) as Real * dt), 1.0);
+        }
+        p.state.turbo_release_sequence.wrapping_sub(start)
+    }
+
+    #[test]
+    fn turbo_boost_follows_rpm_with_lag_at_every_rate() {
+        for hz in [30, 60, 120] {
+            // Below the boost RPM, full throttle gives (rpm / boost_rpm)^curve.
+            let mut p = turbo_powertrain();
+            run_turbo(&mut p, hz, 6.0, 2000.0, |_| 1.0);
+            assert!(
+                (p.turbo_speed - 0.25).abs() < 0.01,
+                "{hz}Hz {}",
+                p.turbo_speed
+            );
+            assert!(
+                (p.turbo_load - 0.25).abs() < 0.01,
+                "{hz}Hz {}",
+                p.turbo_load
+            );
+
+            // From zero at the boost RPM, one spool time reaches 1 - 1/e of full speed.
+            let mut p = turbo_powertrain();
+            run_turbo(&mut p, hz, 0.5, 4000.0, |_| 1.0);
+            assert!(
+                (p.turbo_speed - 0.632).abs() < 0.01,
+                "{hz}Hz {}",
+                p.turbo_speed
+            );
+            run_turbo(&mut p, hz, 4.0, 6000.0, |_| 1.0);
+            assert!(p.turbo_speed > 0.99 && p.turbo_speed <= 1.0);
+        }
+    }
+
+    #[test]
+    fn turbo_lift_dumps_boost_but_shaft_keeps_spinning() {
+        for hz in [30, 60, 120] {
+            let mut p = turbo_powertrain();
+            run_turbo(&mut p, hz, 5.0, 5000.0, |_| 1.0);
+            let released = run_turbo(&mut p, hz, 0.3, 5000.0, |_| 0.0);
+            assert_eq!(released, 1);
+            assert!(p.state.turbo_release_load > 0.95);
+            assert!(p.turbo_load < 0.05, "{hz}Hz boost {}", p.turbo_load);
+            // exp(-0.3 / 1.5) of the shaft speed is left after a 0.3 s gear change.
+            assert!(
+                (p.turbo_speed - 0.819).abs() < 0.02,
+                "{hz}Hz shaft {}",
+                p.turbo_speed
+            );
+            run_turbo(&mut p, hz, 0.15, 5000.0, |_| 1.0);
+            assert!(p.turbo_load > 0.75, "{hz}Hz rebuilt {}", p.turbo_load);
+        }
+    }
+
+    #[test]
+    fn turbo_blow_fires_once_for_any_lift_speed() {
+        for hz in [30, 60, 120] {
+            for lift in [0.0, 0.1, 0.5, 1.0] {
+                let mut p = turbo_powertrain();
+                run_turbo(&mut p, hz, 5.0, 5000.0, |_| 1.0);
+                let released = run_turbo(&mut p, hz, lift + 0.5, 5000.0, |t| {
+                    if lift <= 0.0 {
+                        0.0
+                    } else {
+                        (1.0 - t / lift).max(0.0)
+                    }
+                });
+                assert_eq!(released, 1, "{hz}Hz lift {lift}s");
+                assert!(p.state.turbo_release_load > 0.5, "{hz}Hz lift {lift}s");
+            }
+        }
+    }
+
+    #[test]
+    fn turbo_blow_needs_boost_and_ignores_pedal_noise_near_closed() {
+        for hz in [30, 60, 120] {
+            // No boost at idle RPM: a lift is silent.
+            let mut p = turbo_powertrain();
+            run_turbo(&mut p, hz, 5.0, 900.0, |_| 1.0);
+            assert_eq!(run_turbo(&mut p, hz, 0.5, 900.0, |_| 0.0), 0);
+
+            // After a release, a pedal moving between 0.1 and 0.25 does not fire again.
+            let mut p = turbo_powertrain();
+            run_turbo(&mut p, hz, 5.0, 5000.0, |_| 1.0);
+            let released = run_turbo(&mut p, hz, 2.0, 5000.0, |t| {
+                if t < 0.1 {
+                    0.0
+                } else if ((t * 10.0) as i32) % 2 == 0 {
+                    0.1
+                } else {
+                    0.25
+                }
+            });
+            assert_eq!(released, 1, "{hz}Hz");
+        }
+    }
+
+    #[test]
+    fn turbo_limiter_cut_lowers_shaft_target_without_a_blow() {
+        let mut p = turbo_powertrain();
+        let dt = 1.0 / 60.0;
+        for _ in 0..600 {
+            p.state.engine_rpm = 6000.0;
+            p.update_turbo(dt, 1.0, 0.0);
+        }
+        assert!(p.turbo_speed < 0.01);
+        assert_eq!(p.state.turbo_release_sequence, 0);
+    }
+
+    #[test]
+    fn auto_blip_does_not_spool_turbo_or_blow() {
+        for hz in [30, 60, 120] {
+            let mut powertrain = manual_auto_clutch_powertrain();
+            powertrain.config.turbo = turbo_powertrain().config.turbo;
+            select_manual_gear(&mut powertrain, 3);
+            powertrain.config.engine.inertia = 0.2;
+            powertrain.config.transmission.auto_blip_duration = 0.5;
+            powertrain.state.engine_rpm = 4500.0;
+            let wheel_radius = 0.35;
+            let wheel_speed = wheel_speed_for_gear_crank_rpm(&powertrain, 2, 5500.0, wheel_radius);
+            powertrain.shift_down();
+            let mut blipped = false;
+            for _ in 0..hz {
+                powertrain.update(1.0 / hz as Real, wheel_speed, wheel_speed, wheel_radius);
+                blipped |= powertrain.shift_phase == ShiftPhase::Blipping;
+                assert_eq!(powertrain.state.turbo_speed, 0.0, "{hz}Hz");
+                assert_eq!(powertrain.state.turbo_load, 0.0, "{hz}Hz");
+            }
+            assert!(blipped);
+            assert_eq!(powertrain.state.turbo_release_sequence, 0);
+        }
+    }
+
+    #[test]
+    fn disabled_turbo_keeps_no_boost() {
+        let mut p = turbo_powertrain();
+        p.config.turbo.enabled = false;
+        run_turbo(&mut p, 60, 5.0, 6000.0, |_| 1.0);
+        assert_eq!(run_turbo(&mut p, 60, 1.0, 6000.0, |_| 0.0), 0);
+        assert_eq!(p.turbo_speed, 0.0);
+        assert_eq!(p.turbo_load, 0.0);
     }
 
     #[test]
