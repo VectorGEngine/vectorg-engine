@@ -415,6 +415,14 @@ pub struct Wheel {
     pub forward_impulse: Real,
     /// The side impulses applied by the wheel on the chassis.
     pub side_impulse: Real,
+    /// Reaction torque about the steering axis from the last tire solve, in N·m.
+    pub steering_feedback_torque: Real,
+    /// Combined tire demand relative to the grip limit in the last tire solve.
+    pub feedback_slip: Real,
+    /// Flat-spot vibration in the last tire solve, from -1 to 1.
+    pub flat_spot_feedback: Real,
+    flat_spot_severity: Real,
+    flat_spot_angle: Real,
     /// The braking impulse applied by this wheel on the chassis.
     pub brake_impulse: Real,
 
@@ -529,6 +537,11 @@ impl Wheel {
             last_skid_info: 0.0,
             sliding_grip: 1.0,
             side_impulse: 0.0,
+            steering_feedback_torque: 0.0,
+            feedback_slip: 0.0,
+            flat_spot_feedback: 0.0,
+            flat_spot_severity: 0.0,
+            flat_spot_angle: 0.0,
             brake_impulse: 0.0,
             forward_impulse: 0.0,
             lock: false,
@@ -564,6 +577,11 @@ impl Wheel {
         self.handbrake_overrides_abs = false;
         self.forward_impulse = 0.0;
         self.side_impulse = 0.0;
+        self.steering_feedback_torque = 0.0;
+        self.feedback_slip = 0.0;
+        self.flat_spot_feedback = 0.0;
+        self.flat_spot_severity = 0.0;
+        self.flat_spot_angle = 0.0;
         self.brake_impulse = 0.0;
         self.steering = 0.0;
         self.engine_force = 0.0;
@@ -2847,7 +2865,7 @@ impl DynamicRayCastVehicleController {
         self.axle.resize(num_wheels, Default::default());
         let mut contacts = vec![WheelContactState::default(); num_wheels];
 
-        let (esc_intervention, esc_side_axis, chassis_forward, static_wheel_load) = {
+        let (esc_intervention, esc_side_axis, chassis_forward, static_wheel_load, chassis_pose) = {
             let chassis = &bodies[self.chassis];
             let intervention = self.esc_intervention(chassis);
             let rotation = chassis.position().rotation;
@@ -2864,6 +2882,7 @@ impl DynamicRayCastVehicleController {
                 self.side_axis(),
                 chassis_forward,
                 static_wheel_load,
+                *chassis.position(),
             )
         };
         self.powertrain.state_mut().esc_activity = esc_intervention.activity;
@@ -2872,6 +2891,9 @@ impl DynamicRayCastVehicleController {
             wheel.brake_impulse = 0.0;
             wheel.differential_torque = 0.0;
             wheel.side_impulse = 0.0;
+            wheel.steering_feedback_torque = 0.0;
+            wheel.feedback_slip = 0.0;
+            wheel.flat_spot_feedback = 0.0;
             wheel.forward_impulse = 0.0;
             wheel.is_anti_lock_brake = false;
             wheel.ground_friction = 1.0;
@@ -3340,7 +3362,38 @@ impl DynamicRayCastVehicleController {
             };
             wheel.lock =
                 prepared.base.brake_budget > Real::EPSILON && final_angular_velocity == 0.0;
+            if wheel.lock && wheel.contact_forward_speed.abs() > 3.0 {
+                let skid_distance = wheel.contact_forward_speed.abs() * dt;
+                wheel.flat_spot_severity = (wheel.flat_spot_severity + skid_distance * 0.02).min(1.0);
+                wheel.flat_spot_angle = wheel.rotation;
+            } else if wheel.flat_spot_severity > 0.0 {
+                let phase = (wheel.rotation - wheel.flat_spot_angle) / std::f64::consts::TAU as Real;
+                let load = (wheel.wheel_suspension_force / static_wheel_load.max(1.0)).clamp(0.0, 1.0);
+                let speed = (final_angular_velocity.abs() * wheel.radius / 5.0).clamp(0.0, 1.0);
+                wheel.flat_spot_feedback = wheel.flat_spot_severity * load * speed
+                    * (1.0 - 2.0 * phase.rem_euclid(1.0));
+            }
             let impulse = axes[0] * result.tangent[0] + axes[1] * result.tangent[1];
+            if final_contact.grip_impulse > Real::EPSILON {
+                let demand = envelope_norm(result.requested_tangent, final_contact.shape);
+                wheel.feedback_slip = (demand / final_contact.grip_impulse).min(10.0);
+            }
+            if wheel.role.steered && dt > Real::EPSILON {
+                let travel = wheel
+                    .travel_pose(wheel.travel_parameter(wheel.raycast_info.suspension_length));
+                let pivot = chassis_pose * travel.joint_cs;
+                let axis = chassis_pose * (travel.tilt_cs * wheel.steering_axis_cs());
+                let normal = wheel.raycast_info.contact_normal_ws;
+                let force = impulse / dt + normal * wheel.wheel_suspension_force;
+                let arm = wheel.raycast_info.contact_point_ws - pivot;
+                // Pneumatic trail shrinks as the brush model approaches full slip.
+                let grip_left = (1.0 - wheel.feedback_slip).clamp(0.0, 1.0);
+                let direction = wheel.contact_forward_speed.clamp(-1.0, 1.0);
+                let trail = axes[0] * (-wheel.width * 0.2 * grip_left.cbrt() * direction);
+                let lateral_force = axes[1] * (result.tangent[1] / dt);
+                wheel.steering_feedback_torque =
+                    axis.dot(&(arm.cross(&force) + trail.cross(&lateral_force)));
+            }
             chassis_impulse += impulse;
             chassis_torque +=
                 angular_axes[0] * result.tangent[0] + angular_axes[1] * result.tangent[1];
@@ -6300,6 +6353,31 @@ mod tests {
             wheel.angular_velocity = speed / wheel.radius;
         }
         (controller, bodies, colliders)
+    }
+
+    #[test]
+    fn steering_feedback_opposes_steering_and_clears_on_contact_loss() {
+        let mut feedback = [0.0; 2];
+        for (index, angle) in [-0.005, 0.005].into_iter().enumerate() {
+            let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(20.0, 0.0);
+            controller
+                .get_tire_type_mut("default")
+                .unwrap()
+                .cornering_stiffness = 20.0;
+            for wheel in controller.wheels.iter_mut().filter(|wheel| wheel.role.steered) {
+                wheel.wheel_axle_ws = Rotation::new(Vector::y() * angle) * Vector::x();
+            }
+            controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+            for wheel in controller.wheels.iter_mut().filter(|wheel| wheel.role.steered) {
+                feedback[index] += wheel.steering_feedback_torque;
+                assert!(wheel.feedback_slip > 0.0 && wheel.feedback_slip < 1.0);
+                wheel.raycast_info.ground_object = None;
+            }
+            assert!(feedback[index] * angle < 0.0);
+            controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+            assert!(controller.wheels.iter().all(|wheel| wheel.steering_feedback_torque == 0.0));
+        }
+        assert!((feedback[0] + feedback[1]).abs() < 0.01);
     }
 
     #[test]
