@@ -65,6 +65,14 @@ const SLIDING_FULL_SPEED: Real = 8.0;
 // compliant tire would creep sideways under any lateral load. Compliance ramps
 // in continuously above it.
 const CORNERING_STIFFNESS_SPEED_FLOOR: Real = 1.0;
+// A locked wheel faster than this (m/s) wears a flat spot.
+const FLAT_SPOT_MIN_SKID_SPEED: Real = 3.0;
+// Flat-spot severity added for each metre of locked-wheel skid.
+const FLAT_SPOT_GROWTH_PER_METRE: Real = 0.02;
+// Rolling speed (m/s) at which the flat-spot vibration reaches full amplitude.
+const FLAT_SPOT_FULL_FEEDBACK_SPEED: Real = 5.0;
+// Pneumatic trail at full grip, as a fraction of the tyre width.
+const PNEUMATIC_TRAIL_WIDTH_RATIO: Real = 0.2;
 const RECOVERY_THRESHOLD: Real = 0.94;
 // Grip recovery in grip fraction per second. A tire that stops sliding gets its
 // grip back in about 0.1 s, as a real tire does: the fall to a sliding grip of
@@ -3362,14 +3370,14 @@ impl DynamicRayCastVehicleController {
             };
             wheel.lock =
                 prepared.base.brake_budget > Real::EPSILON && final_angular_velocity == 0.0;
-            if wheel.lock && wheel.contact_forward_speed.abs() > 3.0 {
+            if wheel.lock && wheel.contact_forward_speed.abs() > FLAT_SPOT_MIN_SKID_SPEED {
                 let skid_distance = wheel.contact_forward_speed.abs() * dt;
-                wheel.flat_spot_severity = (wheel.flat_spot_severity + skid_distance * 0.02).min(1.0);
+                wheel.flat_spot_severity = (wheel.flat_spot_severity + skid_distance * FLAT_SPOT_GROWTH_PER_METRE).min(1.0);
                 wheel.flat_spot_angle = wheel.rotation;
             } else if wheel.flat_spot_severity > 0.0 {
                 let phase = (wheel.rotation - wheel.flat_spot_angle) / std::f64::consts::TAU as Real;
                 let load = (wheel.wheel_suspension_force / static_wheel_load.max(1.0)).clamp(0.0, 1.0);
-                let speed = (final_angular_velocity.abs() * wheel.radius / 5.0).clamp(0.0, 1.0);
+                let speed = (final_angular_velocity.abs() * wheel.radius / FLAT_SPOT_FULL_FEEDBACK_SPEED).clamp(0.0, 1.0);
                 wheel.flat_spot_feedback = wheel.flat_spot_severity * load * speed
                     * (1.0 - 2.0 * phase.rem_euclid(1.0));
             }
@@ -3389,7 +3397,7 @@ impl DynamicRayCastVehicleController {
                 // Pneumatic trail shrinks as the brush model approaches full slip.
                 let grip_left = (1.0 - wheel.feedback_slip).clamp(0.0, 1.0);
                 let direction = wheel.contact_forward_speed.clamp(-1.0, 1.0);
-                let trail = axes[0] * (-wheel.width * 0.2 * grip_left.cbrt() * direction);
+                let trail = axes[0] * (-wheel.width * PNEUMATIC_TRAIL_WIDTH_RATIO * grip_left.cbrt() * direction);
                 let lateral_force = axes[1] * (result.tangent[1] / dt);
                 wheel.steering_feedback_torque =
                     axis.dot(&(arm.cross(&force) + trail.cross(&lateral_force)));
@@ -6353,6 +6361,29 @@ mod tests {
             wheel.angular_velocity = speed / wheel.radius;
         }
         (controller, bodies, colliders)
+    }
+
+    #[test]
+    fn flat_spot_feedback_follows_wheel_rotation_and_stays_zero_without_a_flat_spot() {
+        let tau = std::f64::consts::TAU as Real;
+        let mut feedback = Vec::new();
+        for (severity, turn) in [(1.0, 0.25), (1.0, 0.75), (0.0, 0.25)] {
+            let (mut controller, mut bodies, colliders) = four_wheel_test_vehicle(20.0, 0.0);
+            for wheel in controller.wheels.iter_mut() {
+                wheel.flat_spot_severity = severity;
+                wheel.flat_spot_angle = 0.0;
+                wheel.rotation = turn * tau;
+            }
+            controller.update_friction(&mut bodies, &colliders, 1.0 / 60.0);
+            let wheel = &controller.wheels[0];
+            assert!(!wheel.lock);
+            assert!(wheel.flat_spot_feedback.abs() <= 1.0);
+            feedback.push(wheel.flat_spot_feedback);
+        }
+        assert!(feedback[0] > 0.1);
+        assert!(feedback[1] < -0.1);
+        assert!((feedback[0] + feedback[1]).abs() < 0.05);
+        assert_eq!(feedback[2], 0.0);
     }
 
     #[test]
