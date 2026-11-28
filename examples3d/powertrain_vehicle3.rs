@@ -63,7 +63,7 @@ pub fn init_world(testbed: &mut Testbed) {
     config.turbo.enabled = true;
     config.turbo.max_boost = 1.350_000_023_841_858;
     config.dynamics.brake_bias = 0.6;
-    config.dynamics.abs_strength = 1.0;
+    config.dynamics.abs_slip_target = 0.11;
     config.dynamics.traction_control_strength = 1.0;
     config.dynamics.esc_strength = 0.0;
     config.dynamics.drag_coefficient = 0.5;

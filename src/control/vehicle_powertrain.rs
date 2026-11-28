@@ -238,10 +238,12 @@ impl VehicleDownforceConfig {
 pub struct VehicleDynamicsConfig {
     /// Fraction of service braking assigned to the front axle.
     pub brake_bias: Real,
-    /// Anti-lock braking strength.
-    pub abs_strength: Real,
+    /// Target braking slip ratio. Zero disables ABS.
+    pub abs_slip_target: Real,
     /// Driven-wheel traction-control strength.
     pub traction_control_strength: Real,
+    /// Number of active TC levels. Zero lets callers set continuous strength.
+    pub traction_control_max_level: u32,
     /// Electronic stability-control strength.
     pub esc_strength: Real,
     /// Linear front-axle anti-roll coupling stiffness.
@@ -270,8 +272,9 @@ impl Default for VehicleDynamicsConfig {
     fn default() -> Self {
         Self {
             brake_bias: 0.6,
-            abs_strength: 1.0,
+            abs_slip_target: 0.11,
             traction_control_strength: 0.8,
+            traction_control_max_level: 0,
             esc_strength: 0.8,
             front_anti_roll_bar_stiffness: 0.0,
             rear_anti_roll_bar_stiffness: 0.0,
@@ -505,10 +508,13 @@ pub(crate) struct PowertrainOutput {
     pub drive_torque: Real,
     pub engine_brake_torque: Real,
     pub wheel_coupling_torque: Real,
+    /// Drive torque requested at the wheels before the assist cuts.
+    pub requested_drive_torque: Real,
     pub wheel_target_velocity: Real,
     pub drive_throttle: Real,
     pub drivetrain_connected: bool,
     pub service_brake: Real,
+    pub traction_control_cut: Real,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -812,7 +818,7 @@ impl VehiclePowertrain {
         driven_wheel_radius: Real,
         wheel_inverse_inertia: Real,
         wheel_load_acceleration: Real,
-        wheel_drive_fraction: Real,
+        traction_control_drive_fraction: Real,
     ) -> PowertrainOutput {
         let dt = dt.clamp(0.0, 0.05);
         let previous_engine_state = self.engine_state();
@@ -898,11 +904,19 @@ impl VehiclePowertrain {
             * rpm_rate
             * (1.0 - engine_throttle);
         let free_engine_torque = combustion_torque - friction_torque;
-        let drivetrain_engine_torque = if self.state.engine_running {
+        let requested_torque = if self.state.engine_running {
             combustion_torque - engine_braking_torque
         } else {
             0.0
         };
+        let can_cut_drive =
+            requested_torque > 0.0 && requested_drive_throttle > 0.0 && ratio != 0.0;
+        let tc_drive_fraction = if can_cut_drive {
+            traction_control_drive_fraction.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let drivetrain_engine_torque = requested_torque * tc_drive_fraction;
         let clutch_engagement = self.clutch_engagement(
             dt,
             ratio,
@@ -933,7 +947,6 @@ impl VehiclePowertrain {
                 * self.config.engine.force_scale
                 * wheel_inverse_inertia,
             ratio * self.config.transmission.final_drive_ratio * wheel_load_acceleration,
-            wheel_drive_fraction,
         );
         let angular_acceleration =
             (engine_source_torque - clutch_torque) / self.config.engine.inertia;
@@ -1039,10 +1052,20 @@ impl VehiclePowertrain {
             drive_torque,
             engine_brake_torque,
             wheel_coupling_torque,
+            requested_drive_torque: if can_cut_drive && drivetrain_connected {
+                requested_torque * wheel_torque_scale
+            } else {
+                0.0
+            },
             wheel_target_velocity,
             drive_throttle,
             drivetrain_connected,
             service_brake,
+            traction_control_cut: if drivetrain_connected {
+                1.0 - tc_drive_fraction
+            } else {
+                0.0
+            },
         }
     }
 
@@ -1115,7 +1138,7 @@ impl VehiclePowertrain {
         engagement.clamp(0.0, 1.0)
     }
 
-    fn effective_pedals(&self) -> (Real, Real) {
+    pub(super) fn effective_pedals(&self) -> (Real, Real) {
         if self.state.reverse_direction {
             if self.brake_intent == DirectionPedal::Driving {
                 (self.input.brake, self.input.throttle)
@@ -1156,7 +1179,6 @@ impl VehiclePowertrain {
         engine_source_torque: Real,
         driveline_inverse_inertia: Real,
         driveline_load_acceleration: Real,
-        drive_fraction: Real,
     ) -> Real {
         if clutch_engagement <= Real::EPSILON {
             return 0.0;
@@ -1189,18 +1211,7 @@ impl VehiclePowertrain {
         // Both ends of the clutch move. Using engine inertia alone over-corrects
         // light wheels by the square of the gearing and can reverse torque each tick.
         let engine_inverse_inertia = 1.0 / self.config.engine.inertia;
-        let correction = engine_source_torque * engine_inverse_inertia
-            + driveline_load_acceleration
-            + slip * synchronization_rate;
-        // TC reduces positive wheel torque, not negative clutch torque. Reflect
-        // that actuator in the wheel response seen by the engine as well.
-        let wheel_response = if correction > 0.0 {
-            drive_fraction.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        let coupled_inverse_inertia =
-            engine_inverse_inertia + driveline_inverse_inertia * wheel_response;
+        let coupled_inverse_inertia = engine_inverse_inertia + driveline_inverse_inertia;
         let synchronization_torque = slip * synchronization_rate / coupled_inverse_inertia;
         let load_torque = (engine_source_torque * engine_inverse_inertia
             + driveline_load_acceleration)
@@ -1984,7 +1995,7 @@ fn sanitize_config(config: &mut VehicleControllerConfig) {
         config.transmission.forward_ratios.push(1.0);
     }
     config.dynamics.brake_bias = config.dynamics.brake_bias.clamp(0.0, 1.0);
-    config.dynamics.abs_strength = config.dynamics.abs_strength.clamp(0.0, 1.0);
+    config.dynamics.abs_slip_target = config.dynamics.abs_slip_target.clamp(0.0, 1.0);
     config.dynamics.traction_control_strength =
         config.dynamics.traction_control_strength.clamp(0.0, 1.0);
     config.dynamics.esc_strength = config.dynamics.esc_strength.clamp(0.0, 1.0);
@@ -2098,6 +2109,49 @@ mod tests {
     }
 
     #[test]
+    fn tc_cuts_positive_torque_and_preserves_engine_braking() {
+        fn output(throttle: Real, tc_fraction: Real) -> PowertrainOutput {
+            let mut config = VehicleControllerConfig::default();
+            config.transmission.automatic = false;
+            config.transmission.auto_clutch = false;
+            config.transmission.auto_reverse = false;
+            let mut powertrain = VehiclePowertrain::new(config);
+            select_first_gear(&mut powertrain);
+            powertrain.state.engine_rpm = 3000.0;
+            powertrain.set_input(VehicleInput {
+                throttle,
+                ..VehicleInput::default()
+            });
+            let radius = 0.35;
+            let speed = 3000.0
+                / (powertrain.current_ratio() * powertrain.config.transmission.final_drive_ratio)
+                / 60.0
+                * TAU
+                * radius;
+            powertrain.update_with_wheel_dynamics(
+                1.0 / 60.0,
+                speed,
+                speed,
+                speed,
+                radius,
+                0.0,
+                0.0,
+                tc_fraction,
+            )
+        }
+        let baseline = output(1.0, 1.0);
+        let tc = output(1.0, 0.6);
+        assert!(tc.wheel_coupling_torque < baseline.wheel_coupling_torque);
+        let coast = output(0.0, 1.0);
+        let coast_with_request = output(0.0, 0.6);
+        assert!(coast.wheel_coupling_torque < 0.0);
+        assert_eq!(
+            coast_with_request.wheel_coupling_torque,
+            coast.wheel_coupling_torque
+        );
+    }
+
+    #[test]
     fn force_scale_does_not_change_mechanical_wheel_coupling_torque() {
         fn output(force_scale: Real) -> PowertrainOutput {
             let mut config = VehicleControllerConfig::default();
@@ -2190,7 +2244,6 @@ mod tests {
                             0.0,
                             inverse,
                             0.0,
-                            1.0,
                         );
                         let engine_after =
                             engine_speed - torque * dt / powertrain.config.engine.inertia;
@@ -2214,32 +2267,22 @@ mod tests {
         powertrain.automatic_clutch_phase = AutomaticClutchPhase::Launch;
         for hz in [30, 60, 120] {
             for inverse in [0.1, 1.0, 50.0] {
-                for drive_fraction in [0.1, 0.5, 1.0] {
-                    for slip in [-100.0, 100.0] {
-                        let dt = 1.0 / hz as Real;
-                        let engine = 300.0;
-                        let shaft = engine - slip;
-                        powertrain.state.engine_rpm = engine * 60.0 / TAU;
-                        let torque = powertrain.clutch_torque(
-                            dt,
-                            shaft * 60.0 / TAU,
-                            1.0,
-                            0.0,
-                            inverse,
-                            0.0,
-                            drive_fraction,
-                        );
-                        let wheel_fraction = if torque > 0.0 { drive_fraction } else { 1.0 };
-                        let after_engine = engine - torque * dt / powertrain.config.engine.inertia;
-                        let after_shaft = shaft + torque * dt * inverse * wheel_fraction;
-                        let after_slip = after_engine - after_shaft;
-                        assert!(after_slip * slip >= -0.01 && after_slip.abs() < slip.abs());
-                        let before_energy = powertrain.config.engine.inertia * engine.powi(2)
-                            + shaft.powi(2) / inverse;
-                        let after_energy = powertrain.config.engine.inertia * after_engine.powi(2)
-                            + after_shaft.powi(2) / inverse;
-                        assert!(after_energy <= before_energy + 0.01);
-                    }
+                for slip in [-100.0, 100.0] {
+                    let dt = 1.0 / hz as Real;
+                    let engine = 300.0;
+                    let shaft = engine - slip;
+                    powertrain.state.engine_rpm = engine * 60.0 / TAU;
+                    let torque =
+                        powertrain.clutch_torque(dt, shaft * 60.0 / TAU, 1.0, 0.0, inverse, 0.0);
+                    let after_engine = engine - torque * dt / powertrain.config.engine.inertia;
+                    let after_shaft = shaft + torque * dt * inverse;
+                    let after_slip = after_engine - after_shaft;
+                    assert!(after_slip * slip >= -0.01 && after_slip.abs() < slip.abs());
+                    let before_energy =
+                        powertrain.config.engine.inertia * engine.powi(2) + shaft.powi(2) / inverse;
+                    let after_energy = powertrain.config.engine.inertia * after_engine.powi(2)
+                        + after_shaft.powi(2) / inverse;
+                    assert!(after_energy <= before_energy + 0.01);
                 }
             }
         }
@@ -2259,7 +2302,6 @@ mod tests {
                     source,
                     inverse,
                     load_acceleration,
-                    1.0,
                 );
                 let engine_acceleration = (source - torque) / powertrain.config.engine.inertia;
                 let shaft_acceleration = torque * inverse - load_acceleration;

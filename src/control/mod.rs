@@ -8,7 +8,7 @@ pub use self::pid_controller::{PdController, PdErrors, PidController};
 
 #[cfg(feature = "dim3")]
 pub use self::ray_cast_vehicle_controller::{
-    DynamicRayCastVehicleController, TireFriction, Wheel, WheelTuning,
+    abs_slip_target, DynamicRayCastVehicleController, TireFriction, Wheel, WheelTuning,
 };
 #[cfg(feature = "dim3")]
 pub use self::vehicle_differential::VehicleDifferentialConfig;

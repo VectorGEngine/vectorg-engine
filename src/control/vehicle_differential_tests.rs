@@ -1,4 +1,4 @@
-use super::tests::{four_wheel_test_vehicle, set_test_drive};
+use super::tests::{four_wheel_test_vehicle, set_test_drive, test_abs_slip_target};
 use super::*;
 
 fn locks(controller: &mut DynamicRayCastVehicleController, value: Real) {
@@ -55,7 +55,7 @@ fn differential_full_lock_survives_brakes_assists_and_lost_contacts() {
                     locks(&mut c, 1.0);
                     for w in &mut c.wheels {
                         w.role.driven = true;
-                        w.anti_lock_brake = assist;
+                        w.abs_slip_target = test_abs_slip_target(assist);
                     }
                     c.wheels[3].radius = 0.45;
                     c.wheels[2].wheel_suspension_force = 200.0;
@@ -154,10 +154,12 @@ fn differential_awd_weights_and_shaft_speed_follow_center_balance() {
             drive_torque: 1000.0,
             engine_brake_torque: 0.0,
             wheel_coupling_torque: 1000.0,
+            requested_drive_torque: 0.0,
             wheel_target_velocity: 100.0,
             drive_throttle: 1.0,
             drivetrain_connected: true,
             service_brake: 0.0,
+            traction_control_cut: 0.0,
         });
         for (w, weight) in c.wheels.iter().zip(weights) {
             assert_eq!(w.wheel_coupling_torque, 1000.0 * weight);
@@ -351,9 +353,7 @@ fn differential_stalled_contact_solves_stop_early_and_stay_feasible() {
             let base = prepared.base;
             let limit = base.grip_impulse * solver.actuations[i].grip;
             assert!(envelope_norm(solver.impulses[i], base.shape) <= limit + 0.001);
-            assert!(
-                solver.brakes[i].abs() <= base.brake_budget * solver.actuations[i].brake + 0.001
-            );
+            assert!(solver.brakes[i].abs() <= base.brake_budget + 0.001);
         }
         assert!(bodies[controller.chassis]
             .linvel()
@@ -411,9 +411,7 @@ fn differential_toe_with_cornering_stiffness_stays_feasible() {
             let base = prepared.base;
             let limit = base.grip_impulse * solver.actuations[i].grip;
             assert!(envelope_norm(solver.impulses[i], base.shape) <= limit + 0.001);
-            assert!(
-                solver.brakes[i].abs() <= base.brake_budget * solver.actuations[i].brake + 0.001
-            );
+            assert!(solver.brakes[i].abs() <= base.brake_budget + 0.001);
             if prepared.wheel_id >= 2 {
                 // Rear toe preload stays a small fraction of the envelope.
                 assert!(

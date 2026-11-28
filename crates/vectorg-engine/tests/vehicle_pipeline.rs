@@ -85,7 +85,7 @@ impl Scene {
                 WheelRole::new(axle, axle == WheelAxle::Rear, false),
             );
             wheel.max_brake_force = 180_000.0;
-            wheel.anti_lock_brake = 0.0;
+            wheel.abs_slip_target = 0.0;
         }
         let mut queries = QueryPipeline::new();
         queries.update(&colliders);
@@ -147,6 +147,330 @@ impl Scene {
     }
     fn tangent(&self, v: Vector<f32>) -> Vector<f32> {
         v - self.normal * v.dot(&self.normal)
+    }
+}
+
+#[test]
+fn suspension_loads_settle_after_a_roll_disturbance() {
+    for hz in [30, 60, 120] {
+        let mut scene = Scene::new(hz, 4, 0.0, 0.0);
+        for wheel in scene.vehicle.wheels_mut() {
+            wheel.damping_compression = 18.0;
+            wheel.damping_relaxation = 18.0;
+        }
+        for _ in 0..hz {
+            scene.tick();
+        }
+        let chassis = scene.vehicle.chassis;
+        scene.bodies[chassis].set_angvel(Vector::z() * 0.3, true);
+        for _ in 0..3 * hz {
+            scene.tick();
+        }
+        let loads: Vec<_> = scene
+            .vehicle
+            .wheels()
+            .iter()
+            .map(|wheel| wheel.wheel_suspension_force)
+            .collect();
+        for pair in loads.chunks_exact(2) {
+            assert!(
+                (pair[0] - pair[1]).abs() < 200.0,
+                "{hz} Hz left/right loads did not settle: {loads:?}"
+            );
+        }
+        assert!(loads.iter().all(|load| *load > 1_000.0), "{loads:?}");
+    }
+}
+
+#[test]
+fn measured_abs_braking_with_split_grip_and_contact_loss() {
+    for hz in [30, 60, 120] {
+        for abs in [0.0, 0.11] {
+            let mut config = VehicleControllerConfig::default();
+            config.dynamics.abs_slip_target = abs;
+            config.dynamics.traction_control_strength = 0.0;
+            let mut scene = Scene::with_config(hz, 4, 0.0, 0.0, config);
+            for (index, wheel) in scene.vehicle.wheels_mut().iter_mut().enumerate() {
+                wheel.abs_slip_target = abs;
+                wheel.max_brake_force = 12_000.0;
+                wheel.friction_slip = if index % 2 == 0 { 0.55 } else { 1.0 };
+            }
+            scene.vehicle.wheels_mut()[2].suspension_preload = 0.6;
+            for _ in 0..hz {
+                scene.tick();
+            }
+            scene.bodies[scene.vehicle.chassis].set_linvel(Vector::z() * (100.0 / 3.6), true);
+            scene.vehicle.set_input(VehicleInput {
+                clutch: 1.0,
+                ..Default::default()
+            });
+            for _ in 0..hz / 4 {
+                scene.tick();
+            }
+            let start = scene.position();
+            let mount = scene.vehicle.wheels()[2].chassis_connection_point_cs;
+            scene.vehicle.set_input(VehicleInput {
+                brake: 1.0,
+                clutch: 1.0,
+                ..Default::default()
+            });
+            let mut peak_activity: f32 = 0.0;
+            let mut elapsed = 0.0;
+            let mut load_difference: f32 = 0.0;
+            for step in 0..hz * 12 {
+                if step == hz / 4 {
+                    scene.vehicle.wheels_mut()[2].chassis_connection_point_cs.y += 0.5;
+                } else if step == hz / 2 {
+                    scene.vehicle.wheels_mut()[2].chassis_connection_point_cs = mount;
+                }
+                scene.tick();
+                let wheels = scene.vehicle.wheels();
+                if step == hz / 4 {
+                    assert!(!wheels[2].raycast_info().is_in_contact);
+                    assert!(!wheels[2].is_anti_lock_brake);
+                    assert!(wheels[3].raycast_info().is_in_contact);
+                } else if step == hz / 2 {
+                    assert!(wheels[2].raycast_info().is_in_contact);
+                }
+                let activity = scene.vehicle.state().abs_activity;
+                peak_activity = peak_activity.max(activity);
+                load_difference = load_difference.max(
+                    (wheels[0].wheel_suspension_force - wheels[1].wheel_suspension_force).abs(),
+                );
+                elapsed += scene.params.dt;
+                if scene.bodies[scene.vehicle.chassis].linvel().norm() < 0.2 {
+                    break;
+                }
+            }
+            let distance = (scene.position() - start).norm();
+            eprintln!("ABS {hz} Hz target {abs}: {elapsed:.3} s, {distance:.3} m, peak activity {peak_activity:.2}");
+            assert!(elapsed < 12.0 && distance > 0.0);
+            assert!(load_difference > 10.0);
+            assert_eq!(peak_activity > 0.0, abs > 0.0);
+            assert_eq!(scene.vehicle.state().abs_activity, 0.0);
+        }
+    }
+}
+
+#[test]
+fn full_abs_leaves_lateral_grip_during_brake_turn_in() {
+    for hz in [30, 60, 120] {
+        let mut scene = Scene::new(hz, 4, 0.0, 0.0);
+        scene
+            .vehicle
+            .add_tire_type("turn", 1.05, 0.8, 1.0, 1.0, 15.0, 0.9);
+        for (index, wheel) in scene.vehicle.wheels_mut().iter_mut().enumerate() {
+            wheel.role.steered = index < 2;
+            wheel.tire_type = "turn".into();
+            wheel.friction_slip = if index % 2 == 0 { 0.85 } else { 1.0 };
+            wheel.max_brake_force = 12_000.0;
+            wheel.abs_slip_target = 0.11;
+        }
+        scene.vehicle.wheels_mut()[2].suspension_preload = 0.6;
+        for _ in 0..hz {
+            scene.tick();
+        }
+        let chassis = scene.vehicle.chassis;
+        scene.bodies[chassis].set_linvel(Vector::z() * (80.0 / 3.6), true);
+        scene.vehicle.set_input(VehicleInput {
+            clutch: 1.0,
+            ..Default::default()
+        });
+        for _ in 0..hz / 4 {
+            scene.tick();
+        }
+        let start = scene.position();
+        let mount = scene.vehicle.wheels()[2].chassis_connection_point_cs;
+        scene.vehicle.set_input(VehicleInput {
+            brake: 1.0,
+            steering: 0.28,
+            clutch: 1.0,
+            ..Default::default()
+        });
+        let mut yaw = 0.0;
+        for step in 0..hz {
+            if step == hz / 3 {
+                scene.vehicle.wheels_mut()[2].chassis_connection_point_cs.y += 0.5;
+            } else if step == hz / 2 {
+                scene.vehicle.wheels_mut()[2].chassis_connection_point_cs = mount;
+            }
+            scene.tick();
+            if step == hz / 3 {
+                assert!(!scene.vehicle.wheels()[2].raycast_info().is_in_contact);
+            } else if step == hz / 2 {
+                assert!(scene.vehicle.wheels()[2].raycast_info().is_in_contact);
+            }
+            yaw += scene.bodies[chassis].angvel().y * scene.params.dt;
+        }
+        let lateral_distance = (scene.position().x - start.x).abs();
+        let speed = scene.bodies[chassis].linvel().norm();
+        eprintln!("ABS turn {hz} Hz: yaw {yaw:.3} rad, lateral distance {lateral_distance:.3} m, speed {speed:.3} m/s");
+        assert!(yaw.abs() > 0.5 && lateral_distance > 2.0 && speed < 20.0);
+    }
+}
+
+#[test]
+fn stability_control_during_split_grip_braking() {
+    for hz in [30, 60, 120] {
+        let mut yaw_by_level = [0.0; 2];
+        for (level, esc) in [0.0, 1.0].into_iter().enumerate() {
+            let mut config = VehicleControllerConfig::default();
+            config.dynamics.esc_strength = esc;
+            config.dynamics.traction_control_strength = 0.0;
+            let mut scene = Scene::with_config(hz, 4, 0.0, 0.0, config);
+            for (index, wheel) in scene.vehicle.wheels_mut().iter_mut().enumerate() {
+                wheel.abs_slip_target = 0.11;
+                wheel.max_brake_force = 12_000.0;
+                wheel.friction_slip = if index % 2 == 0 { 0.55 } else { 1.0 };
+            }
+            scene.vehicle.wheels_mut()[2].suspension_preload = 0.6;
+            for _ in 0..hz {
+                scene.tick();
+            }
+            let chassis = scene.vehicle.chassis;
+            scene.bodies[chassis].set_linvel(Vector::z() * 20.0, true);
+            scene.vehicle.set_input(VehicleInput {
+                clutch: 1.0,
+                ..Default::default()
+            });
+            for _ in 0..hz / 4 {
+                scene.tick();
+            }
+            scene.bodies[chassis].set_angvel(Vector::y() * 0.9, true);
+            scene.vehicle.set_input(VehicleInput {
+                brake: 0.65,
+                clutch: 1.0,
+                ..Default::default()
+            });
+            let start = scene.position();
+            let mount = scene.vehicle.wheels()[0].chassis_connection_point_cs;
+            let mut peak_esc: f32 = 0.0;
+            let mut peak_abs: f32 = 0.0;
+            let mut yaw_travel = 0.0;
+            for step in 0..hz {
+                if step == hz / 10 {
+                    scene.vehicle.wheels_mut()[0].chassis_connection_point_cs.y += 0.5;
+                } else if step == hz / 5 {
+                    scene.vehicle.wheels_mut()[0].chassis_connection_point_cs = mount;
+                }
+                scene.tick();
+                if step == hz / 10 {
+                    assert!(!scene.vehicle.wheels()[0].raycast_info().is_in_contact);
+                } else if step == hz / 5 {
+                    assert!(scene.vehicle.wheels()[0].raycast_info().is_in_contact);
+                }
+                peak_esc = peak_esc.max(scene.vehicle.state().esc_activity);
+                peak_abs = peak_abs.max(scene.vehicle.state().abs_activity);
+                yaw_travel += scene.bodies[chassis].angvel().y.abs() * scene.params.dt;
+            }
+            let distance = (scene.position() - start).norm();
+            let speed = scene.bodies[chassis].linvel().norm();
+            eprintln!("ESC {hz} Hz level {esc}: yaw {yaw_travel:.4} rad, distance {distance:.3} m, speed {speed:.3} m/s, ESC {peak_esc:.3}, ABS {peak_abs:.3}");
+            yaw_by_level[level] = yaw_travel;
+            assert_eq!(peak_esc > 0.0, esc > 0.0);
+            assert!(yaw_travel.is_finite() && speed < 20.0);
+            assert!(peak_abs > 0.0);
+        }
+        assert!(
+            yaw_by_level[1] < yaw_by_level[0],
+            "{hz} Hz: ESC must reduce yaw during ABS braking, got {yaw_by_level:?}"
+        );
+    }
+}
+
+#[test]
+fn traction_control_split_grip_through_the_full_pipeline() {
+    for hz in [30, 60, 120] {
+        for torque in [220.0, 750.0] {
+            let mut means = [0.0; 2];
+            let mut eb_results = [0.0; 2];
+            for (index, strength) in [0.0, 1.0].into_iter().enumerate() {
+                let mut config = VehicleControllerConfig::default();
+                config.transmission.automatic = false;
+                config.transmission.auto_clutch = false;
+                config.transmission.auto_reverse = false;
+                config.transmission.shift_cooldown = 0.0;
+                config.engine.torque_curve = vec![(900.0, torque), (6_500.0, torque)];
+                config.dynamics.esc_strength = 0.0;
+                config.dynamics.traction_control_strength = strength;
+                config.differential.rear_accel_lock = 0.0;
+                let mut scene = Scene::with_config(hz, 4, 0.0, 0.0, config);
+                scene.vehicle.wheels_mut()[2].suspension_preload = 0.6;
+                for _ in 0..hz {
+                    scene.tick();
+                }
+                scene.vehicle.set_gear(2);
+                scene.bodies[scene.vehicle.chassis].set_linvel(Vector::z() * 14.0, true);
+                scene.vehicle.set_input(VehicleInput::default());
+                for _ in 0..hz / 2 {
+                    scene.tick();
+                }
+                scene.vehicle.wheels_mut()[2].friction_slip = 0.20;
+                scene.vehicle.wheels_mut()[3].friction_slip = 0.65;
+                scene.vehicle.set_input(VehicleInput {
+                    throttle: 1.0,
+                    ..Default::default()
+                });
+                let mut peak_cut: f32 = 0.0;
+                let mut samples = 0;
+                let mut load_difference: f32 = 0.0;
+                for step in 0..hz * 2 {
+                    scene.tick();
+                    peak_cut = peak_cut.max(scene.vehicle.state().traction_control_activity);
+                    let wheels = scene.vehicle.wheels();
+                    load_difference = load_difference.max(
+                        (wheels[2].wheel_suspension_force - wheels[3].wheel_suspension_force).abs(),
+                    );
+                    let chassis = &scene.bodies[scene.vehicle.chassis];
+                    let forward = chassis.rotation() * Vector::z();
+                    if step >= hz {
+                        let slip = wheels[2..]
+                            .iter()
+                            .map(|wheel| {
+                                let speed = chassis
+                                    .velocity_at_point(&wheel.raycast_info().contact_point_ws)
+                                    .dot(&forward);
+                                (wheel.radius * wheel.delta_rotation
+                                    / scene.params.dt
+                                    / speed.max(1.0)
+                                    - 1.0)
+                                    .max(0.0)
+                            })
+                            .fold(0.0, f32::max);
+                        means[index] += slip;
+                        samples += 1;
+                    }
+                }
+                means[index] /= samples as f32;
+                let speed_before_braking = scene.vehicle.state().vehicle_speed;
+                scene.vehicle.set_input(VehicleInput {
+                    brake: 0.35,
+                    ..Default::default()
+                });
+                for _ in 0..hz / 4 {
+                    scene.tick();
+                }
+                eb_results[index] = speed_before_braking - scene.vehicle.state().vehicle_speed;
+                assert!(load_difference > 10.0);
+                assert!(eb_results[index] > 0.0);
+                assert_eq!(scene.vehicle.state().traction_control_activity, 0.0);
+                eprintln!("TC {hz} Hz {torque} Nm strength {strength}: slip {:.3}, cut {peak_cut:.3}, brake {:.3} m/s", means[index], eb_results[index]);
+                if strength == 0.0 {
+                    assert_eq!(peak_cut, 0.0);
+                } else if torque > 500.0 {
+                    assert!(peak_cut > 0.0);
+                }
+                let mount = scene.vehicle.wheels()[2].chassis_connection_point_cs;
+                scene.vehicle.wheels_mut()[2].chassis_connection_point_cs.y += 0.5;
+                scene.tick();
+                assert!(!scene.vehicle.wheels()[2].raycast_info().is_in_contact);
+                assert!(scene.vehicle.wheels()[3].raycast_info().is_in_contact);
+                scene.vehicle.wheels_mut()[2].chassis_connection_point_cs = mount;
+                scene.tick();
+                assert!(scene.vehicle.wheels()[2].raycast_info().is_in_contact);
+            }
+            assert!(means[1] <= means[0] + 0.01);
+        }
     }
 }
 
@@ -737,7 +1061,7 @@ fn awd_scene(case: CenterCase) -> Scene {
     config.transmission.forward_ratios = vec![3.5];
     config.transmission.final_drive_ratio = 4.0;
     config.dynamics.traction_control_strength = case.tc;
-    config.dynamics.abs_strength = case.abs;
+    config.dynamics.abs_slip_target = case.abs * 0.11;
     config.dynamics.esc_strength = 0.0;
     config.differential = VehicleDifferentialConfig {
         front_accel_lock: case.axle_lock,
@@ -751,7 +1075,7 @@ fn awd_scene(case: CenterCase) -> Scene {
     for wheel in scene.vehicle.wheels_mut() {
         let front = wheel.role.axle == WheelAxle::Front;
         wheel.role = WheelRole::new(wheel.role.axle, true, front);
-        wheel.anti_lock_brake = case.abs;
+        wheel.abs_slip_target = case.abs * 0.11;
         if !front {
             wheel.friction_slip *= case.rear_grip;
         }
@@ -765,7 +1089,7 @@ fn planar_speed(scene: &Scene) -> f32 {
         .norm()
 }
 
-fn awd_launch_speed(case: CenterCase, steering: f32, seconds: u32) -> f32 {
+fn awd_launch(case: CenterCase, steering: f32) -> Scene {
     let mut scene = awd_scene(case);
     for _ in 0..case.hz {
         scene.tick();
@@ -777,6 +1101,11 @@ fn awd_launch_speed(case: CenterCase, steering: f32, seconds: u32) -> f32 {
         steering,
         ..Default::default()
     });
+    scene
+}
+
+fn awd_launch_speed(case: CenterCase, steering: f32, seconds: u32) -> f32 {
+    let mut scene = awd_launch(case, steering);
     for _ in 0..case.hz * seconds {
         scene.tick();
     }
@@ -829,24 +1158,30 @@ fn center_lock_lets_the_gripping_axle_pull_when_the_other_spins() {
 }
 
 #[test]
-fn center_lock_launches_with_full_tc_at_full_steering_lock() {
-    // Front and rear cannot roll at one speed through a tight turn. The shaft
-    // forces that scrub, so TC must not treat it as wheelspin at any lock.
+fn launch_below_tc_speed_is_unchanged_at_full_steering_lock() {
     for hz in [30, 60, 120] {
         for balance in [0.3, 0.5, 0.7] {
-            let case = CenterCase {
-                hz,
-                balance,
-                tc: 1.0,
-                ..Default::default()
-            };
-            let open = awd_launch_speed(case, 1.0, 3);
-            for center in [0.25, 0.5, 0.75, 1.0] {
-                let speed = awd_launch_speed(CenterCase { center, ..case }, 1.0, 3);
-                assert!(
-                    speed > open * 0.9,
-                    "{hz} Hz balance={balance} center={center}: {speed} vs open {open}"
-                );
+            for center in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let case = CenterCase {
+                    hz,
+                    balance,
+                    center,
+                    ..Default::default()
+                };
+                let mut off = awd_launch(case, 1.0);
+                let mut on = awd_launch(CenterCase { tc: 1.0, ..case }, 1.0);
+                for _ in 0..hz * 3 {
+                    let chassis = &off.bodies[off.vehicle.chassis];
+                    let speed = (chassis.position() * Vector::z()).dot(chassis.linvel());
+                    if speed.abs() > 30.0 / 3.6 {
+                        break;
+                    }
+                    off.tick();
+                    on.tick();
+                    assert_eq!(on.vehicle.state().traction_control_activity, 0.0);
+                    assert_eq!(on.position(), off.position());
+                    assert_eq!(planar_speed(&on), planar_speed(&off));
+                }
             }
         }
     }

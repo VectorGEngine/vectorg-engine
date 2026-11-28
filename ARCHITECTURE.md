@@ -34,9 +34,8 @@ The iteration uses a diagonal body-response majorizer and an energy line search:
 pure rolling demand does not seed canceling lateral forces that waste tire grip,
 and weakly coupled wheel-inertia corrections can take a full step.
 
-Drive torque and grip/assist history are immutable during a tick's previews.
-ABS/TC and grip-recovery predictions are rechecked against the other contacts'
-latest impulses; a bounded outer solve updates their limits. A contact velocity
+Drive torque, brake pressure, and grip history stay fixed during the contact solve.
+A bounded outer solve updates grip recovery from the latest contact impulses. A contact velocity
 residual controls convergence (including the wheel's angular response), not raw
 impulse differences. Each pass also stops when that residual improves by less
 than 10% over an 8-iteration window: saturated tires that oppose each other (toe,
@@ -142,17 +141,33 @@ slips; at full lock grip decides it. The handbrake scales the center lock by
 `1 - handbrake` and moves the rear share of torque to the front by the same
 amount, disconnecting the rear drive like a rally hydraulic handbrake.
 
-TC chooses a common cut of the incoming torque; axle reaction stays internal.
-Its decision is layered wheel -> axle -> center: parts that turn freely are
-limited by the weakest, while a holding clutch or rigid link is decided by its
-least-limited part, since a saturated tire's own preview freezes its partner.
-The player-facing TC strength is scaled to 90% before selecting the permitted
-wheel-surface speed gap. The player-facing ABS strength uses the same 90% scale
-before selecting permitted wheel underspeed.
-A clutch holds while its impulse is below capacity. Scrub that a slipping axle
-or center clutch forces on a wheel is credited by the clutch's share of that
-wheel's driving torque, capped by the rolling-speed difference it closes.
-ABS/TC previews use the coupled rotational response. Individual tire slip still
-drives the existing friction, grip recovery and skid calculations. Airborne
-wheels participate in axle/brake rotation but provide no road grip or assist
-sensing.
+TC uses measured wheel slip to request one engine torque cut. It selects the
+largest slip error in an open group and the smallest in a holding group. It makes
+this selection at the axle and then at the center differential.
+Each level has one slip target for straights and turns. A fast rise in measured
+wheel slip can increase the torque cut. When TC detects wheelspin, it estimates
+the grip available for acceleration from the last tire contact and compares it
+with the requested drive torque.
+
+ABS compares filtered braking slip with each wheel's configured target above
+20 km/h. Each wheel keeps its own pressure. The valves can release, hold, or
+reapply pressure. Reapply uses a shared 15 Hz cycle. The brake limit uses
+estimated tire grip and the difference from the target wheel speed. It includes
+engine braking and can limit drag torque when that torque prevents wheel
+recovery. The friction ellipse reserves grip for the steered turn. Contact
+lateral speed and tire response account for additional demand at the steered
+wheels during turn-in. The corner reserve applies to the driver request. Wheel
+lock control applies to the combined driver and ESC request.
+
+ESC limits its yaw target with tire grip from the current contacts and wheel
+loads. Its brake request starts at zero at 20 km/h and reaches the full request
+at 25 km/h. It skips the selected wheel when that wheel has no contact or the
+handbrake controls it. If the selected wheel cannot take its full request
+under ABS, the controller can release existing brake effort on the opposite
+side. TC cuts positive engine torque before the clutch. ESC applies its own
+cut at the driven wheels and can decrease engine drag during oversteer. ESC
+activity reports the larger of its added brake request or the wheel torque cut.
+
+Tire slip still controls friction, grip recovery, and skid calculations.
+Airborne wheels turn with the axle and brakes. They give no road grip or assist
+signal.
