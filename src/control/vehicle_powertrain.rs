@@ -51,6 +51,12 @@ const TURBO_BLOW_MIN_LOAD: Real = 0.2;
 // Time constants in seconds of boost pressure toward a spinning shaft, and of the valve dump.
 const TURBO_BOOST_BUILD_TIME: Real = 0.05;
 const TURBO_BOOST_DUMP_TIME: Real = 0.08;
+// Exponent of the boost target below the full-boost RPM.
+const TURBO_SPOOL_CURVE: Real = 2.0;
+// A first-order rise reaches 90% after ln(10) time constants.
+const TURBO_SPOOL_TIME_CONSTANTS: Real = 2.302_585_093;
+// The shaft slows down this many times slower than it speeds up.
+const TURBO_SPIN_DOWN_FACTOR: Real = 3.0;
 
 /// Engine parameters used by the vehicle powertrain.
 #[derive(Clone, Debug)]
@@ -152,10 +158,10 @@ impl Default for TransmissionConfig {
 
 /// Turbocharger spool and release parameters.
 ///
-/// The turbo shaft speed moves toward `throttle * (rpm / boost_rpm)^spool_curve`
-/// (at most 1), with `spool_time` while it speeds up and `spin_down_time` while
-/// it slows down. Boost pressure follows the shaft speed while the throttle is
-/// open and the blow-off valve dumps it when the throttle closes.
+/// The turbo shaft speed moves toward `throttle * (rpm / boost_rpm)^2` (at most 1).
+/// It reaches 90% of a step in `spool_time` while it speeds up, and slows down
+/// three times slower. Boost pressure follows the shaft speed while the throttle
+/// is open and the blow-off valve dumps it when the throttle closes.
 #[derive(Clone, Debug)]
 pub struct TurboConfig {
     /// Whether turbo boost is simulated.
@@ -164,12 +170,8 @@ pub struct TurboConfig {
     pub max_boost: Real,
     /// Engine RPM at which full throttle gives full boost.
     pub boost_rpm: Real,
-    /// Exponent of the boost target below `boost_rpm`.
-    pub spool_curve: Real,
-    /// Time constant in seconds of the shaft speed-up.
+    /// Seconds from opening the throttle to 90% boost at `boost_rpm`.
     pub spool_time: Real,
-    /// Time constant in seconds of the shaft spin-down.
-    pub spin_down_time: Real,
 }
 
 impl Default for TurboConfig {
@@ -178,9 +180,7 @@ impl Default for TurboConfig {
             enabled: false,
             max_boost: 1.0,
             boost_rpm: 4000.0,
-            spool_curve: 2.0,
-            spool_time: 0.5,
-            spin_down_time: 1.5,
+            spool_time: 1.15,
         }
     }
 }
@@ -1865,13 +1865,13 @@ impl VehiclePowertrain {
 
         // Exhaust energy grows with RPM and throttle; the rev limiter cuts it.
         let rpm_factor = (self.state.engine_rpm.max(0.0) / turbo.boost_rpm)
-            .powf(turbo.spool_curve)
+            .powf(TURBO_SPOOL_CURVE)
             .min(1.0);
         let speed_target = (throttle * rpm_factor * exhaust_factor).clamp(0.0, 1.0);
         let speed_time = if speed_target > self.turbo_speed {
-            turbo.spool_time
+            turbo.spool_time / TURBO_SPOOL_TIME_CONSTANTS
         } else {
-            turbo.spin_down_time
+            turbo.spool_time / TURBO_SPOOL_TIME_CONSTANTS * TURBO_SPIN_DOWN_FACTOR
         };
         self.turbo_speed = approach(self.turbo_speed, speed_target, dt, speed_time);
 
@@ -2009,9 +2009,7 @@ fn sanitize_config(config: &mut VehicleControllerConfig) {
     config.steering.minimum_speed_factor = config.steering.minimum_speed_factor.clamp(0.0, 1.0);
     config.steering.counter_steer_assist = config.steering.counter_steer_assist.clamp(0.0, 1.0);
     config.turbo.boost_rpm = positive_finite(config.turbo.boost_rpm, 1.0);
-    config.turbo.spool_curve = positive_finite(config.turbo.spool_curve, 1.0);
     config.turbo.spool_time = non_negative_finite(config.turbo.spool_time);
-    config.turbo.spin_down_time = non_negative_finite(config.turbo.spin_down_time);
 }
 
 fn positive_finite(value: Real, fallback: Real) -> Real {
@@ -3825,9 +3823,7 @@ mod tests {
         config.turbo.enabled = true;
         config.turbo.max_boost = 1.4;
         config.turbo.boost_rpm = 4000.0;
-        config.turbo.spool_curve = 2.0;
-        config.turbo.spool_time = 0.5;
-        config.turbo.spin_down_time = 1.5;
+        config.turbo.spool_time = 1.15;
         VehiclePowertrain::new(config)
     }
 
@@ -3852,7 +3848,7 @@ mod tests {
     #[test]
     fn turbo_boost_follows_rpm_with_lag_at_every_rate() {
         for hz in [30, 60, 120] {
-            // Below the boost RPM, full throttle gives (rpm / boost_rpm)^curve.
+            // Below the boost RPM, full throttle gives (rpm / boost_rpm)^2.
             let mut p = turbo_powertrain();
             run_turbo(&mut p, hz, 6.0, 2000.0, |_| 1.0);
             assert!(
@@ -3866,11 +3862,11 @@ mod tests {
                 p.turbo_load
             );
 
-            // From zero at the boost RPM, one spool time reaches 1 - 1/e of full speed.
+            // From zero at the boost RPM, the spool time reaches 90% of full speed.
             let mut p = turbo_powertrain();
-            run_turbo(&mut p, hz, 0.5, 4000.0, |_| 1.0);
+            run_turbo(&mut p, hz, 1.15, 4000.0, |_| 1.0);
             assert!(
-                (p.turbo_speed - 0.632).abs() < 0.01,
+                (p.turbo_speed - 0.9).abs() < 0.01,
                 "{hz}Hz {}",
                 p.turbo_speed
             );
@@ -3888,7 +3884,7 @@ mod tests {
             assert_eq!(released, 1);
             assert!(p.state.turbo_release_load > 0.95);
             assert!(p.turbo_load < 0.05, "{hz}Hz boost {}", p.turbo_load);
-            // exp(-0.3 / 1.5) of the shaft speed is left after a 0.3 s gear change.
+            // exp(-0.3 / (3 * 1.15 / ln 10)) of the shaft speed is left after a 0.3 s gear change.
             assert!(
                 (p.turbo_speed - 0.819).abs() < 0.02,
                 "{hz}Hz shaft {}",
