@@ -85,8 +85,8 @@ fn offsets(kind: &str, camber_deg: f32) -> Vec<f32> {
             0.2,
             &WheelTuning {
                 suspension_stiffness: 30.0,
-                suspension_compression: 3.0,
-                suspension_damping: 3.0,
+                suspension_bump_damping: 3.0,
+                suspension_rebound_damping: 3.0,
                 friction_slip: 1.2,
                 ..Default::default()
             },

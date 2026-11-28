@@ -276,11 +276,11 @@ pub struct WheelTuning {
     /// Increase this value if the suspension appears to not push the vehicle strong enough.
     pub suspension_stiffness: Real,
     /// The suspension’s damping when it is being compressed.
-    pub suspension_compression: Real,
+    pub suspension_bump_damping: Real,
     /// The suspension’s damping when it is being released.
     ///
     /// Increase this value if the suspension appears to overshoot.
-    pub suspension_damping: Real,
+    pub suspension_rebound_damping: Real,
     /// How far the suspension compresses from its rest length before the rigid
     /// bump stop.
     pub suspension_bump_travel: Real,
@@ -303,8 +303,8 @@ impl Default for WheelTuning {
     fn default() -> Self {
         Self {
             suspension_stiffness: 5.88,
-            suspension_compression: 0.83,
-            suspension_damping: 0.88,
+            suspension_bump_damping: 0.83,
+            suspension_rebound_damping: 0.88,
             suspension_bump_travel: 5.0,
             suspension_droop_travel: 0.0,
             suspension_preload: 0.0,
@@ -343,11 +343,11 @@ struct WheelDesc {
     /// Increase this value if the suspension appears to not push the vehicle strong enough.
     pub suspension_stiffness: Real,
     /// The suspension’s damping when it is being compressed.
-    pub damping_compression: Real,
+    pub damping_bump: Real,
     /// The suspension’s damping when it is being released.
     ///
     /// Increase this value if the suspension appears to overshoot.
-    pub damping_relaxation: Real,
+    pub damping_rebound: Real,
     /// Parameter controlling how much traction the tire has.
     ///
     /// The larger the value, the more instantaneous braking will happen (with the risk of
@@ -411,11 +411,11 @@ pub struct Wheel {
     /// Increase this value if the suspension appears to not push the vehicle strong enough.
     pub suspension_stiffness: Real,
     /// The suspension’s damping when it is being compressed.
-    pub damping_compression: Real,
+    pub damping_bump: Real,
     /// The suspension’s damping when it is being released.
     ///
     /// Increase this value if the suspension appears to overshoot.
-    pub damping_relaxation: Real,
+    pub damping_rebound: Real,
     /// Parameter controlling how much traction the tire has.
     ///
     /// The larger the value, the more instantaneous braking will happen (with the risk of
@@ -534,8 +534,8 @@ impl Wheel {
             radius: info.radius,
             width: info.width,
             suspension_stiffness: info.suspension_stiffness,
-            damping_compression: info.damping_compression,
-            damping_relaxation: info.damping_relaxation,
+            damping_bump: info.damping_bump,
+            damping_rebound: info.damping_rebound,
             chassis_connection_point_cs: info.chassis_connection_cs,
             center_offset_cs: Vector::zeros(),
             steering_axis_cs: None,
@@ -1884,8 +1884,8 @@ impl DynamicRayCastVehicleController {
             radius,
             width,
             suspension_stiffness: tuning.suspension_stiffness,
-            damping_compression: tuning.suspension_compression,
-            damping_relaxation: tuning.suspension_damping,
+            damping_bump: tuning.suspension_bump_damping,
+            damping_rebound: tuning.suspension_rebound_damping,
             friction_slip: tuning.friction_slip,
             suspension_bump_travel: tuning.suspension_bump_travel,
             suspension_droop_travel: tuning.suspension_droop_travel,
@@ -2901,7 +2901,7 @@ impl DynamicRayCastVehicleController {
             .iter()
             .filter(|wheel| wheel.raycast_info.is_in_contact)
             .map(|wheel| {
-                let damping = wheel.damping_compression.max(wheel.damping_relaxation);
+                let damping = wheel.damping_bump.max(wheel.damping_rebound);
                 let scale = (damping.max(0.0) * chassis.mass() * dt).sqrt()
                     * wheel.clipped_inv_contact_dot_suspension;
                 let linear = wheel.raycast_info.contact_normal_ws * scale;
@@ -2956,9 +2956,9 @@ impl DynamicRayCastVehicleController {
                     let projected_rel_vel = wheels.suspension_relative_velocity;
                     {
                         let susp_damping = if projected_rel_vel < 0.0 {
-                            wheels.damping_compression
+                            wheels.damping_bump
                         } else {
-                            wheels.damping_relaxation
+                            wheels.damping_rebound
                         };
                         force -= susp_damping * damping_scale * projected_rel_vel;
                     }
@@ -8991,8 +8991,8 @@ mod tests {
                     WheelRole::new(WheelAxle::Front, false, true),
                 );
                 wheel.suspension_stiffness = 20.0;
-                wheel.damping_compression = 2.0;
-                wheel.damping_relaxation = 3.0;
+                wheel.damping_bump = 2.0;
+                wheel.damping_rebound = 3.0;
                 let mut queries = QueryPipeline::new();
                 queries.update(&colliders);
                 controller.update_wheel_transform(&bodies[chassis], 0);
@@ -9263,8 +9263,8 @@ mod tests {
                         );
                         wheel.suspension_bump_travel = 0.3;
                         wheel.suspension_stiffness = 80.0;
-                        wheel.damping_compression = 2.0;
-                        wheel.damping_relaxation = 2.6;
+                        wheel.damping_bump = 2.0;
+                        wheel.damping_rebound = 2.6;
                         wheel.max_suspension_force = 31_000.0;
                     }
                 }
@@ -9573,8 +9573,8 @@ mod tests {
             );
             wheel.suspension_bump_travel = 0.15;
             wheel.suspension_stiffness = 0.0;
-            wheel.damping_compression = 0.0;
-            wheel.damping_relaxation = 0.0;
+            wheel.damping_bump = 0.0;
+            wheel.damping_rebound = 0.0;
         }
         let filter = QueryFilter::default().exclude_rigid_body(chassis);
         for i in 0..4 {
@@ -9618,8 +9618,8 @@ mod tests {
             radius: 0.35,
             width: 0.2,
             suspension_stiffness: 5.88,
-            damping_compression: 0.83,
-            damping_relaxation: 0.88,
+            damping_bump: 0.83,
+            damping_rebound: 0.88,
             friction_slip: 10.5,
             max_suspension_force: 6000.0,
             tire_type: "default".to_string(),

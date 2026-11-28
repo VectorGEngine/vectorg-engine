@@ -77,8 +77,8 @@ impl Scene {
                 0.2,
                 &WheelTuning {
                     suspension_stiffness: 30.0,
-                    suspension_compression: 3.0,
-                    suspension_damping: 3.0,
+                    suspension_bump_damping: 3.0,
+                    suspension_rebound_damping: 3.0,
                     friction_slip: 1.0,
                     ..Default::default()
                 },
@@ -155,8 +155,8 @@ fn suspension_loads_settle_after_a_roll_disturbance() {
     for hz in [30, 60, 120] {
         let mut scene = Scene::new(hz, 4, 0.0, 0.0);
         for wheel in scene.vehicle.wheels_mut() {
-            wheel.damping_compression = 18.0;
-            wheel.damping_relaxation = 18.0;
+            wheel.damping_bump = 18.0;
+            wheel.damping_rebound = 18.0;
         }
         for _ in 0..hz {
             scene.tick();

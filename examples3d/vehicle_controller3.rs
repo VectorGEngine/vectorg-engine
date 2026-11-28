@@ -36,7 +36,7 @@ pub fn init_world(testbed: &mut Testbed) {
 
     let tuning = WheelTuning {
         suspension_stiffness: 100.0,
-        suspension_damping: 10.0,
+        suspension_rebound_damping: 10.0,
         ..WheelTuning::default()
     };
     let mut config = VehicleControllerConfig::default();

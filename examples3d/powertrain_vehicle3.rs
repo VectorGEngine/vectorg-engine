@@ -83,8 +83,8 @@ pub fn init_world(testbed: &mut Testbed) {
 
     let tuning = WheelTuning {
         suspension_stiffness: 80.0,
-        suspension_compression: 2.0,
-        suspension_damping: 2.599_999_904_632_568_4,
+        suspension_bump_damping: 2.0,
+        suspension_rebound_damping: 2.599_999_904_632_568_4,
         suspension_bump_travel: 0.25,
         suspension_droop_travel: 0.0,
         suspension_preload: 0.0,

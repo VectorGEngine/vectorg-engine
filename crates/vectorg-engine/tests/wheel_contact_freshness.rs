@@ -71,8 +71,8 @@ impl Rig {
                 0.2,
                 &WheelTuning {
                     suspension_stiffness: 90.0,
-                    suspension_compression: 3.0,
-                    suspension_damping: 3.0,
+                    suspension_bump_damping: 3.0,
+                    suspension_rebound_damping: 3.0,
                     friction_slip: 1.0,
                     max_suspension_force: 37_635.0,
                     ..Default::default()
